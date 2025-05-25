@@ -1,0 +1,73 @@
+{
+    "script_name": "Engine Test Script",
+    "actions": [
+        {
+            "command": "load_track",
+            "deck_id": "deckA",
+            "parameters": {
+                "file_path": "starships.mp3"
+            }
+        },
+        {
+            "command": "load_track",
+            "deck_id": "deckB",
+            "parameters": {
+                "file_path": "starships.mp3"
+            }
+        },
+        {
+            "command": "play",
+            "deck_id": "deckA",
+            "parameters": {
+                "start_at_beat": 1
+            }
+        },
+        {
+            "command": "wait",
+            "parameters": {
+                "duration_seconds": 2
+            }
+        },
+        {
+            "command": "play",
+            "deck_id": "deckB",
+            "parameters": {
+                "start_at_cue_name": "drop1"
+            }
+        },
+        {
+            "command": "wait",
+            "parameters": {
+                "duration_seconds": 3
+            }
+        },
+        {
+            "command": "pause",
+            "deck_id": "deckA"
+        },
+        {
+            "command": "wait",
+            "parameters": {
+                "duration_seconds": 2
+            }
+        },
+        {
+            "command": "play",
+            "deck_id": "deckA"
+        },
+        {
+            "command": "wait",
+            "parameters": {
+                "duration_seconds": 3
+            }
+        },
+        {
+            "command": "stop",
+            "deck_id": "deckA"
+        },
+        {
+            "command": "stop",
+            "deck_id": "deckB"
+        }
+    ]
+}

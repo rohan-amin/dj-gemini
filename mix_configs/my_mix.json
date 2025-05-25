@@ -1,0 +1,25 @@
+{
+  "script_name": "My Simple Test Mix",
+  "actions": [
+    {
+      "command": "load_track",
+      "deck_id": "deckA",
+      "parameters": {
+        "file_path": "audio_tracks/starships.mp3" 
+      }
+    },
+    {
+      "command": "play",
+      "deck_id": "deckA",
+      "parameters": {"start_at_beat": 1}
+    },
+    {
+      "command": "wait",
+      "parameters": {"duration_seconds": 7}
+    },
+    {
+      "command": "stop",
+      "deck_id": "deckA"
+    }
+  ]
+}
