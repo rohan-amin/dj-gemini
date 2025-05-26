@@ -5,23 +5,20 @@ import time
 import sys
 import os
 
-# Ensure the project root is in sys.path for consistent imports
-# This assumes main.py is in the project's root directory.
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_ROOT_DIR)
 
 try:
-    import config as app_config # Expects config.py in the project root
+    import config as app_config 
     from audio_engine.engine import AudioEngine
-    # audio_analyzer and deck are used internally by AudioEngine
 except ImportError as e:
     print(f"ERROR: Main - Could not import necessary modules.")
     print(f"       Ensure 'config.py' is in the project root ({PROJECT_ROOT_DIR})")
     print(f"       and the 'audio_engine' package (with __init__.py and its modules) is present.")
     print(f"       Import error details: {e}")
     sys.exit(1)
-except Exception as e_general: # Catch any other exception during initial imports
+except Exception as e_general: 
     print(f"ERROR: Main - An unexpected error occurred during initial imports: {e_general}")
     import traceback
     traceback.print_exc()
@@ -33,17 +30,16 @@ def run_dj_gemini():
     parser.add_argument("json_script_path", type=str, 
                         help="Path to the JSON mix script file (e.g., mix_configs/my_mix.json or an absolute path).")
     parser.add_argument("--max_wait_after_script", type=int, default=3600, 
-                        help="Maximum seconds to wait for audio to finish after script actions complete (default: 3600s = 1hr). 0 for no wait.")
+                        help="Maximum seconds to wait for audio to finish after script actions complete (default: 3600s = 1hr). 0 for no wait if no audio playing.")
     args = parser.parse_args()
 
     print(f"INFO: Main - DJ Gemini starting with script: {args.json_script_path}")
     if args.max_wait_after_script > 0:
-        print(f"INFO: Main - Max wait time for audio after script actions: {args.max_wait_after_script}s")
+        print(f"INFO: Main - Max wait time for audio after script actions (if any audio playing): {args.max_wait_after_script}s")
     else:
-        print(f"INFO: Main - No extra wait time after script actions. Program will exit once actions are dispatched.")
+        print(f"INFO: Main - No extra wait time after script actions. Program will exit once actions dispatched (if no audio playing).")
 
 
-    # Ensure critical directories exist (AudioEngine's __init__ also does some checks)
     print("INFO: Main - Ensuring necessary directories exist...")
     try:
         app_config.ensure_dir_exists(app_config.ANALYSIS_DATA_DIR)
@@ -56,9 +52,8 @@ def run_dj_gemini():
         return
 
 
-    audio_engine = None # Define engine outside try block for finally
+    audio_engine = None 
     try:
-        # Pass the imported app_config module to AudioEngine
         audio_engine = AudioEngine(app_config_module=app_config)
     except Exception as e_engine_init:
         print(f"ERROR: Main - Failed to initialize AudioEngine: {e_engine_init}")
@@ -66,64 +61,73 @@ def run_dj_gemini():
         traceback.print_exc()
         return 
 
-    # Resolve the JSON script path
     script_path_to_load = args.json_script_path
     if not os.path.isabs(script_path_to_load):
-        # Try relative to MIX_CONFIGS_DIR first
         path_in_mix_configs = os.path.join(app_config.MIX_CONFIGS_DIR, script_path_to_load)
         if os.path.exists(path_in_mix_configs):
             script_path_to_load = path_in_mix_configs
         else:
-            # Fallback: try relative to project root (if it's not the same as MIX_CONFIGS_DIR)
             path_in_project_root = os.path.join(app_config.PROJECT_ROOT_DIR, script_path_to_load)
             if os.path.exists(path_in_project_root):
                 script_path_to_load = path_in_project_root
-            # If still not found as absolute, os.path.exists in load_script_from_file will handle it.
 
     if not audio_engine.load_script_from_file(script_path_to_load):
         print(f"ERROR: Main - Failed to load script '{script_path_to_load}'. Exiting.")
         return
 
     try:
-        audio_engine.run_script() # This processes all actions in the JSON
+        audio_engine.start_script_processing()
 
-        print("INFO: Main - Script action processing dispatched.")
+        print("INFO: Main - Script action processing initiated.")
         
-        if not audio_engine.decks and args.max_wait_after_script > 0: # No decks were even created
-            print("INFO: Main - No decks were initialized by the script. Exiting.")
-        elif args.max_wait_after_script > 0 :
-            print("INFO: Main - Monitoring active decks. Press Ctrl+C to exit early.")
-            wait_start_time = time.time()
-            while True:
-                # is_running_script becomes False when engine finishes dispatching actions
-                # any_deck_active checks if any deck's internal audio thread is still playing
-                if not audio_engine.is_running_script and not audio_engine.any_deck_active():
-                    print("INFO: Main - All decks idle and script actions finished. Mix has concluded.")
-                    break
-                
-                if (time.time() - wait_start_time) > args.max_wait_after_script:
-                    print(f"WARNING: Main - Max wait time of {args.max_wait_after_script}s reached. Forcing shutdown.")
-                    break
-                
-                if int(time.time() - wait_start_time) > 0 and int(time.time() - wait_start_time) % 10 == 0 : 
-                    active_deck_ids = [deck_id for deck_id, deck in audio_engine.decks.items() if deck.is_active()]
-                    if active_deck_ids:
-                        print(f"DEBUG: Main - Still waiting for active decks: {active_deck_ids} ... ({int(time.time() - wait_start_time)}s elapsed)")
-                    elif not audio_engine.is_running_script: # Should have been caught by the main break condition
-                        print(f"DEBUG: Main - Waiting, no decks seem active and script done... ({int(time.time() - wait_start_time)}s elapsed)")
+        wait_start_time = time.time() # Initialize before the loop
+        loop_count = 0
 
-                time.sleep(0.5) # Check every half second
+        # Enter monitoring loop if there were actions, or if user wants to wait regardless
+        # (max_wait_after_script > 0 implies waiting even if script was empty but somehow engine started)
+        # A more direct check is if the engine thread is expected to be running.
+        # Let's simplify: if start_script_processing was called, we monitor.
+        
+        print("INFO: Main - Monitoring. Press Ctrl+C to exit early.")
+        while True: 
+            loop_count += 1
+            engine_is_dispatching_actions = audio_engine.is_processing_script_actions 
+            decks_are_active = audio_engine.any_deck_active()
+            
+            if loop_count % 20 == 0 or not engine_is_dispatching_actions: # Print status every ~10s or when dispatching done
+                # Safely access _pending_on_beat_actions, which is an internal detail of AudioEngine
+                pending_triggers_count_for_log = len(getattr(audio_engine, '_pending_on_beat_actions', []))
+                print(f"DEBUG: Main - Status: EngineDispatchingActions={engine_is_dispatching_actions}, DecksActive={decks_are_active}, PendingOnBeatActions={pending_triggers_count_for_log} ({int(time.time() - wait_start_time)}s)")
+
+            # Exit condition: Engine has finished dispatching all its script actions 
+            # AND no decks are currently playing out audio.
+            if not engine_is_dispatching_actions and not decks_are_active:
+                # Further check: make sure engine's internal pending list is also empty
+                if not getattr(audio_engine, '_pending_on_beat_actions', True): # If attr exists and is empty
+                    print("INFO: Main - Engine done, no pending actions, and no decks active.")
+                    break 
+            
+            # Timeout check
+            if args.max_wait_after_script > 0 and (time.time() - wait_start_time) > args.max_wait_after_script:
+                print(f"WARNING: Main - Max wait time of {args.max_wait_after_script}s reached.")
+                if hasattr(audio_engine, '_pending_on_beat_actions') and audio_engine._pending_on_beat_actions:
+                    print(f"DEBUG: Main - Still {len(audio_engine._pending_on_beat_actions)} pending actions on timeout:")
+                    for pa_idx, pa in enumerate(audio_engine._pending_on_beat_actions):
+                        print(f"  Pending {pa_idx+1}: ID='{pa.get('id','N/A')}', CMD='{pa.get('command')}', Deck='{pa.get('deck_id','N/A')}', Trigger={pa.get('trigger')}")
+                break
+            time.sleep(0.5) 
+        print("INFO: Main - Monitoring loop finished.")
 
     except KeyboardInterrupt:
         print("\nINFO: Main - KeyboardInterrupt received. Shutting down...")
     except Exception as e:
-        print(f"ERROR: Main - An unexpected error occurred during script execution: {e}")
+        print(f"ERROR: Main - An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
     finally:
         print("INFO: Main - Initiating shutdown of audio engine and decks...")
         if audio_engine: 
-            audio_engine.shutdown_decks()
+            audio_engine.stop_script_processing() 
         print("INFO: Main - DJ Gemini finished.")
 
 if __name__ == "__main__":

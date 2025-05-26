@@ -4,7 +4,7 @@ import os
 import threading
 import time 
 import queue 
-import json # <--- FIX 1: Added json import
+import json 
 import essentia.standard as es
 import numpy as np
 import sounddevice as sd
@@ -15,6 +15,8 @@ DECK_CMD_PLAY = "PLAY"
 DECK_CMD_PAUSE = "PAUSE"
 DECK_CMD_STOP = "STOP"   
 DECK_CMD_SEEK = "SEEK" 
+DECK_CMD_ACTIVATE_LOOP = "ACTIVATE_LOOP"
+DECK_CMD_DEACTIVATE_LOOP = "DEACTIVATE_LOOP"
 DECK_CMD_SHUTDOWN = "SHUTDOWN"
 
 class Deck:
@@ -24,35 +26,48 @@ class Deck:
         print(f"DEBUG: Deck {self.deck_id} - Initializing...")
 
         self.filepath = None
-        self.sample_rate = 0
-        self.beat_timestamps = np.array([])
+        self.sample_rate = 0            # Sample rate of the loaded audio (from analysis)
+        self.beat_timestamps = np.array([]) # NumPy array of beat times in seconds
         self.bpm = 0.0
-        self.total_frames = 0 
+        self.total_frames = 0 # Total frames of the loaded audio_data (from load_track)
         self.cue_points = {} 
         
+        # Data for Audio Thread's direct use by its callback
         self.audio_thread_data = None
         self.audio_thread_sample_rate = 0
         self.audio_thread_total_samples = 0
+        # Frame counter for audio thread's playback logic, used by callback
         self.audio_thread_current_frame = 0 
+
 
         self.command_queue = queue.Queue()
         self.audio_thread_stop_event = threading.Event()
         self.audio_thread = threading.Thread(target=self._audio_management_loop, daemon=True)
 
         self._stream_lock = threading.Lock() 
+        # Shared frame for external components (Engine/GUI) to read the current progress
         self._current_playback_frame_for_display = 0 
+        # GUI/Engine's desired state for this deck (True if PLAY command was last sent and not PAUSE/STOP)
         self._user_wants_to_play = False 
+        # Actual state of the sounddevice stream (True if stream is active and playing)
         self._is_actually_playing_stream_state = False 
-        self.seek_in_progress_flag = False # <--- FIX 3: Initialize attribute
+        self.seek_in_progress_flag = False # Used by AudioEngine for _handle_stream_finished logic
 
-        self.playback_stream_obj = None 
+        # --- Loop state attributes ---
+        self._loop_active = False
+        self._loop_start_frame = 0
+        self._loop_end_frame = 0
+        self._loop_repetitions_total = None # None for infinite, or an integer
+        self._loop_repetitions_done = 0
+
+        self.playback_stream_obj = None # The sounddevice.OutputStream object
 
         self.audio_thread.start()
         print(f"DEBUG: Deck {self.deck_id} - Initialized and audio thread started.")
 
     def load_track(self, audio_filepath):
         print(f"DEBUG: Deck {self.deck_id} - load_track requested for: {audio_filepath}")
-        self.stop() 
+        self.stop() # Send CMD_STOP to ensure any previous playback is fully handled
 
         analysis_data = self.analyzer.analyze_track(audio_filepath)
         if not analysis_data:
@@ -71,6 +86,8 @@ class Deck:
         if self.sample_rate == 0:
             print(f"ERROR: Deck {self.deck_id} - Invalid sample rate from analysis for {audio_filepath}")
             return False
+        if self.bpm <= 0: 
+            print(f"WARNING: Deck {self.deck_id} - BPM is {self.bpm}. Beat-length loops require a positive BPM.")
 
         try:
             print(f"DEBUG: Deck {self.deck_id} - Loading audio samples with MonoLoader...")
@@ -81,6 +98,7 @@ class Deck:
                 print(f"ERROR: Deck {self.deck_id} - Loaded audio data is empty for {audio_filepath}")
                 return False
             
+            # This total_frames is for the currently loaded track, used by get_frame_from_beat
             self.total_frames = current_total_frames 
             
             self.command_queue.put((DECK_CMD_LOAD_AUDIO, {
@@ -96,36 +114,67 @@ class Deck:
         with self._stream_lock:
             self._current_playback_frame_for_display = 0 
             self._user_wants_to_play = False 
+            self._loop_active = False # Reset loop state on new track
         print(f"DEBUG: Deck {self.deck_id} - Track '{os.path.basename(audio_filepath)}' data sent to audio thread. BPM: {self.bpm:.2f}")
         return True
 
     def get_frame_from_beat(self, beat_number):
+        # This method uses self.total_frames, self.sample_rate, self.beat_timestamps
+        # which are set by load_track from the main analysis_data.
         if self.sample_rate == 0 or len(self.beat_timestamps) == 0 or self.total_frames == 0: return 0
-        if beat_number <= 0: return 0
+        try:
+            beat_number_int = int(round(float(beat_number)))
+        except (ValueError, TypeError):
+            print(f"WARNING: Deck {self.deck_id} - Invalid beat_number type for get_frame_from_beat: {beat_number}")
+            return 0
+        if beat_number_int <= 0: return 0 
         
-        actual_beat_index = min(beat_number - 1, len(self.beat_timestamps) - 1)
+        actual_beat_index = min(beat_number_int - 1, len(self.beat_timestamps) - 1)
+        if actual_beat_index < 0 : actual_beat_index = 0 
+            
         beat_time = self.beat_timestamps[actual_beat_index]
         frame = int(beat_time * self.sample_rate)
-        return max(0, min(frame, self.total_frames - 1))
+        return max(0, min(frame, self.total_frames - 1)) # Ensure frame is within bounds
 
     def get_frame_from_cue(self, cue_name):
         if not self.cue_points or cue_name not in self.cue_points:
             print(f"WARNING: Deck {self.deck_id} - Cue point '{cue_name}' not found.")
             return None
-
         cue_info = self.cue_points[cue_name]
         start_beat = cue_info.get("start_beat")
-
         if start_beat is None:
             print(f"WARNING: Deck {self.deck_id} - Cue point '{cue_name}' has no 'start_beat'.")
             return None
-        
         return self.get_frame_from_beat(start_beat)
 
+    def get_current_beat_count(self): # <<< METHOD ADDED/CONFIRMED
+        """
+        Calculates the current beat number based on the shared display frame.
+        Returns an integer (1-indexed beat count if on/after first beat, else 0).
+        """
+        with self._stream_lock:
+            # Uses self.sample_rate (from loaded track metadata)
+            # and self._current_playback_frame_for_display (updated by callback)
+            # Also checks self.beat_timestamps (from loaded track metadata)
+            if self.audio_thread_data is None or self.sample_rate == 0 or len(self.beat_timestamps) == 0:
+                # Print a debug if called when not ready, but this can be normal before play
+                # print(f"DEBUG: Deck {self.deck_id} - get_current_beat_count: Not ready for beat count.")
+                return 0 
+            
+            current_time_seconds = self._current_playback_frame_for_display / float(self.sample_rate)
+            
+            # np.searchsorted returns the index at which current_time_seconds would be inserted
+            # into self.beat_timestamps to maintain sorted order.
+            # 'right' means if current_time_seconds is equal to a beat_timestamp,
+            # it's considered as that beat having started/passed.
+            # Result is number of beats that have started/passed. (Effectively 1-indexed if first beat passed)
+            beat_count = np.searchsorted(self.beat_timestamps, current_time_seconds, side='right')
+            # Optional: Add the debug print here if issues persist with beat triggers
+            # print(f"DEBUG: Deck {self.deck_id} - get_current_beat_count: frame={self._current_playback_frame_for_display}, time={current_time_seconds:.2f}s, beat_count={beat_count}")
+            return beat_count
 
     def play(self, start_at_beat=None, start_at_cue_name=None):
         print(f"DEBUG: Deck {self.deck_id} - Engine requests PLAY. Cue: '{start_at_cue_name}', Beat: {start_at_beat}")
-        
         target_start_frame = None
         operation_description = "resuming/starting from current position"
 
@@ -135,7 +184,7 @@ class Deck:
                 target_start_frame = frame_from_cue
                 operation_description = f"starting from cue '{start_at_cue_name}' (frame {target_start_frame})"
             else:
-                print(f"WARNING: Deck {self.deck_id} - Cue '{start_at_cue_name}' not found or invalid. Checking other options.")
+                print(f"WARNING: Deck {self.deck_id} - Cue '{start_at_cue_name}' not found/invalid. Checking other options.")
         
         if target_start_frame is None and start_at_beat is not None: 
             target_start_frame = self.get_frame_from_beat(start_at_beat)
@@ -149,17 +198,14 @@ class Deck:
                 final_start_frame_for_command = target_start_frame
             else: 
                 current_display_frame = self._current_playback_frame_for_display
-                # If total_frames is 0 (no track loaded yet), this prevents error.
-                # The audio thread will catch if audio_thread_data is None.
+                # Use self.total_frames (set from main loaded audio)
                 is_at_end = self.total_frames > 0 and current_display_frame >= self.total_frames
                 if is_at_end:
                     final_start_frame_for_command = 0 
                     self._current_playback_frame_for_display = 0
                 else:
                     final_start_frame_for_command = current_display_frame
-            
             print(f"DEBUG: Deck {self.deck_id} - Finalizing PLAY from frame {final_start_frame_for_command} ({operation_description})")
-        
         self.command_queue.put((DECK_CMD_PLAY, {'start_frame': final_start_frame_for_command}))
 
     def pause(self):
@@ -173,34 +219,70 @@ class Deck:
         with self._stream_lock:
             self._user_wants_to_play = False
             self._current_playback_frame_for_display = 0 
+            self._loop_active = False 
         self.command_queue.put((DECK_CMD_STOP, None))
 
     def seek(self, target_frame): 
         print(f"DEBUG: Deck {self.deck_id} - Engine requests SEEK to frame: {target_frame}")
         was_playing_intent = False
-        # Ensure target_frame is valid before setting display frame
+        # Use self.total_frames for bounds checking
         valid_target_frame = max(0, min(target_frame, self.total_frames -1 if self.total_frames > 0 else 0))
 
         with self._stream_lock:
             was_playing_intent = self._user_wants_to_play 
             self._current_playback_frame_for_display = valid_target_frame
-            if was_playing_intent: # If seeking while intending to play, set the flag
+            if was_playing_intent: 
                 self.seek_in_progress_flag = True
+            self._loop_active = False 
         self.command_queue.put((DECK_CMD_SEEK, {'frame': valid_target_frame, 
                                                'was_playing_intent': was_playing_intent}))
+
+    def activate_loop(self, start_beat, length_beats, repetitions=None):
+        print(f"DEBUG: Deck {self.deck_id} - Engine requests ACTIVATE_LOOP. Start Beat: {start_beat}, Length: {length_beats} beats, Reps: {repetitions}")
+        if self.total_frames == 0: 
+            print(f"ERROR: Deck {self.deck_id} - Cannot activate loop: track not loaded or has no length.")
+            return
+        if self.bpm <= 0:
+            print(f"ERROR: Deck {self.deck_id} - Invalid BPM ({self.bpm}) for loop calculation.")
+            return
+        if self.sample_rate <= 0:
+            print(f"ERROR: Deck {self.deck_id} - Invalid sample rate ({self.sample_rate}) for loop calculation.")
+            return
+
+        loop_start_frame = self.get_frame_from_beat(start_beat)
+        frames_per_beat = (60.0 / self.bpm) * self.sample_rate
+        loop_length_frames = int(length_beats * frames_per_beat)
+        loop_end_frame = loop_start_frame + loop_length_frames
+        
+        # Use self.total_frames for capping loop_end_frame
+        loop_end_frame = min(loop_end_frame, self.total_frames) 
+        if loop_start_frame >= loop_end_frame : 
+            print(f"ERROR: Deck {self.deck_id} - Invalid loop parameters (start_frame {loop_start_frame} >= end_frame {loop_end_frame}).")
+            return
+
+        print(f"DEBUG: Deck {self.deck_id} - Calculated loop frames: [{loop_start_frame} - {loop_end_frame}]")
+        self.command_queue.put((DECK_CMD_ACTIVATE_LOOP, {
+            'start_frame': loop_start_frame,
+            'end_frame': loop_end_frame,
+            'repetitions': repetitions 
+        }))
+
+    def deactivate_loop(self):
+        print(f"DEBUG: Deck {self.deck_id} - Engine requests DEACTIVATE_LOOP.")
+        self.command_queue.put((DECK_CMD_DEACTIVATE_LOOP, None))
 
     # --- Audio Management Thread ---
     def _audio_management_loop(self):
         print(f"DEBUG: Deck {self.deck_id} AudioThread - Started")
-        
         _current_stream_in_thread = None 
-        # Instance variables self.audio_thread_data etc. are used by _sd_callback
+        # Instance variables self.audio_thread_... are used by _sd_callback
 
         while not self.audio_thread_stop_event.is_set():
             try:
                 command, data = self.command_queue.get(timeout=0.1)
                 print(f"DEBUG: Deck {self.deck_id} AudioThread - Received command: {command}")
 
+                # Pre-command stream cleanup (same as before)
                 if command in [DECK_CMD_LOAD_AUDIO, DECK_CMD_PLAY, DECK_CMD_SEEK, DECK_CMD_STOP, DECK_CMD_SHUTDOWN]:
                     if _current_stream_in_thread:
                         print(f"DEBUG: Deck {self.deck_id} AudioThread - Command {command} clearing existing stream.")
@@ -209,15 +291,19 @@ class Deck:
                         _current_stream_in_thread = None
                         with self._stream_lock: self._is_actually_playing_stream_state = False
                 
+                # Command processing (largely same as before)
                 if command == DECK_CMD_LOAD_AUDIO:
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing LOAD_AUDIO")
                     with self._stream_lock: 
                         self.audio_thread_data = data['audio_data']
                         self.audio_thread_sample_rate = data['sample_rate']
-                        self.audio_thread_total_samples = data['total_frames']
+                        self.audio_thread_total_samples = data['total_frames'] 
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0
-                    print(f"DEBUG: Deck {self.deck_id} AudioThread - Audio data set internally.")
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
+                    print(f"DEBUG: Deck {self.deck_id} AudioThread - Audio data set internally for playback.")
 
                 elif command == DECK_CMD_PLAY:
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing PLAY")
@@ -241,6 +327,7 @@ class Deck:
                             callback=self._sd_callback, 
                             finished_callback=self._on_stream_finished_from_audio_thread 
                         )
+                        # self.playback_stream_obj is now the instance variable for the stream
                         self.playback_stream_obj = _current_stream_in_thread 
                         _current_stream_in_thread.start()
                         self._is_actually_playing_stream_state = True
@@ -248,7 +335,6 @@ class Deck:
                     
                 elif command == DECK_CMD_PAUSE:
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing PAUSE")
-                    # _user_wants_to_play is already False
                     if _current_stream_in_thread and _current_stream_in_thread.active:
                         print(f"DEBUG: Deck {self.deck_id} AudioThread - Calling stream.stop() for PAUSE.")
                         _current_stream_in_thread.stop(ignore_errors=True) 
@@ -258,31 +344,54 @@ class Deck:
 
                 elif command == DECK_CMD_STOP:
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing STOP")
-                    # Stream already stopped/closed by pre-command cleanup
                     with self._stream_lock: 
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0 
                         self._is_actually_playing_stream_state = False
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - State reset for STOP.")
 
                 elif command == DECK_CMD_SEEK:
                     new_frame = data['frame']
                     was_playing_intent = data['was_playing_intent']
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
-
-                    # Stream already aborted/closed by pre-command cleanup
                     with self._stream_lock:
                         self.audio_thread_current_frame = new_frame
                         self._current_playback_frame_for_display = new_frame 
                         self._user_wants_to_play = was_playing_intent 
-                        # seek_in_progress_flag is managed by GUI thread, audio thread doesn't need it directly
-
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
                     if was_playing_intent: 
                         print(f"DEBUG: Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
                         self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
                     else: 
                         with self._stream_lock: self._is_actually_playing_stream_state = False
                         print(f"DEBUG: Deck {self.deck_id} AudioThread - SEEK: Was paused, position updated.")
+                
+                elif command == DECK_CMD_ACTIVATE_LOOP:
+                    print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing ACTIVATE_LOOP")
+                    with self._stream_lock:
+                        self._loop_start_frame = data['start_frame']
+                        self._loop_end_frame = data['end_frame']
+                        self._loop_repetitions_total = data.get('repetitions') 
+                        self._loop_repetitions_done = 0
+                        self._loop_active = True
+                        if self._is_actually_playing_stream_state and self.audio_thread_data is not None:
+                            if self.audio_thread_current_frame > self._loop_end_frame or \
+                               self.audio_thread_current_frame < self._loop_start_frame: 
+                                print(f"DEBUG: Deck {self.deck_id} AudioThread - Loop activated, playhead outside. Snapping to loop start.")
+                                self.audio_thread_current_frame = self._loop_start_frame
+                                self._current_playback_frame_for_display = self._loop_start_frame
+                        print(f"DEBUG: Deck {self.deck_id} AudioThread - Loop activated: Frames [{self._loop_start_frame} - {self._loop_end_frame}], Reps: {self._loop_repetitions_total}")
+
+                elif command == DECK_CMD_DEACTIVATE_LOOP:
+                    print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing DEACTIVATE_LOOP")
+                    with self._stream_lock:
+                        self._loop_active = False
+                        print(f"DEBUG: Deck {self.deck_id} AudioThread - Loop deactivated.")
 
                 elif command == DECK_CMD_SHUTDOWN:
                     print(f"DEBUG: Deck {self.deck_id} AudioThread - Processing SHUTDOWN")
@@ -293,7 +402,9 @@ class Deck:
                 with self._stream_lock:
                     stream_obj_ref = self.playback_stream_obj 
                     user_wants_play_check = self._user_wants_to_play
-                    is_active_check = self._is_actually_playing_stream_state if stream_obj_ref else False 
+                    # is_active_check = self._is_actually_playing_stream_state if stream_obj_ref else False
+                    # More direct check for active stream:
+                    is_active_check = (stream_obj_ref is not None and stream_obj_ref.active)
 
                 if stream_obj_ref and not is_active_check and not user_wants_play_check:
                     if not stream_obj_ref.closed:
@@ -302,7 +413,7 @@ class Deck:
                         with self._stream_lock: 
                             if self.playback_stream_obj == stream_obj_ref: 
                                 self.playback_stream_obj = None
-                # Update local _current_stream_in_thread if instance one changed
+                # Sync local _current_stream_in_thread with instance one in case it was nulled
                 with self._stream_lock: _current_stream_in_thread = self.playback_stream_obj
                 continue
             except Exception as e_loop:
@@ -323,6 +434,7 @@ class Deck:
         print(f"DEBUG: Deck {self.deck_id} AudioThread - Loop finished, thread ending.")
 
     def _sd_callback(self, outdata, frames, time_info, status_obj):
+        # (Same as previous version with loop repetition logic)
         if status_obj:
             if status_obj.output_underflow: print(f"Warning: Deck {self.deck_id} CB - Output underflow")
 
@@ -333,6 +445,18 @@ class Deck:
                     raise sd.CallbackStop 
                 return 
             
+            if self._loop_active and self.audio_thread_current_frame >= self._loop_end_frame:
+                self._loop_repetitions_done += 1
+                should_continue_looping = True
+                if self._loop_repetitions_total is not None: 
+                    if self._loop_repetitions_done >= self._loop_repetitions_total:
+                        should_continue_looping = False
+                        self._loop_active = False 
+                        print(f"DEBUG: Deck {self.deck_id} CB - Loop finished {self._loop_repetitions_total} reps. Deactivating.")
+                
+                if should_continue_looping:
+                    self.audio_thread_current_frame = self._loop_start_frame 
+            
             current_frame_for_chunk = self.audio_thread_current_frame
             remaining_frames_in_track = self.audio_thread_total_samples - current_frame_for_chunk
 
@@ -341,14 +465,25 @@ class Deck:
                 raise sd.CallbackStop 
             
             valid_frames_to_play = min(frames, remaining_frames_in_track)
+            
+            if self._loop_active: 
+                frames_to_loop_end = self._loop_end_frame - current_frame_for_chunk
+                if frames_to_loop_end < 0: frames_to_loop_end = 0 
+                valid_frames_to_play = min(valid_frames_to_play, frames_to_loop_end)
+                if valid_frames_to_play <= 0 and current_frame_for_chunk < self._loop_end_frame:
+                     valid_frames_to_play = 0 
+
             try:
-                if current_frame_for_chunk < 0 or \
-                   (current_frame_for_chunk + valid_frames_to_play > self.audio_thread_total_samples):
-                     outdata[:] = 0; print(f"ERROR: Deck {self.deck_id} CB - Invalid frame range.")
-                     raise sd.CallbackStop
-                
-                chunk = self.audio_thread_data[current_frame_for_chunk : current_frame_for_chunk + valid_frames_to_play]
-                outdata[:valid_frames_to_play] = chunk.reshape(-1,1)
+                if valid_frames_to_play > 0:
+                    if current_frame_for_chunk < 0 or \
+                       (current_frame_for_chunk + valid_frames_to_play > self.audio_thread_total_samples):
+                         outdata[:] = 0; print(f"ERROR: Deck {self.deck_id} CB - Invalid frame range before slice."); 
+                         raise sd.CallbackStop
+                    
+                    chunk = self.audio_thread_data[current_frame_for_chunk : current_frame_for_chunk + valid_frames_to_play]
+                    outdata[:valid_frames_to_play] = chunk.reshape(-1,1)
+                else: 
+                    outdata[:] = 0
 
             except Exception as e:
                 print(f"ERROR: Deck {self.deck_id} CB - Slicing error: {e}"); outdata[:] = 0; 
@@ -356,40 +491,35 @@ class Deck:
             
             if valid_frames_to_play < frames: outdata[valid_frames_to_play:] = 0
             
-            self.audio_thread_current_frame += valid_frames_to_play
+            if valid_frames_to_play > 0 : 
+                self.audio_thread_current_frame += valid_frames_to_play
             self._current_playback_frame_for_display = self.audio_thread_current_frame
 
 
     def _on_stream_finished_from_audio_thread(self):
+        # (Same as previous version)
         print(f"DEBUG: Deck {self.deck_id} AudioThread - Stream finished_callback triggered.")
-        
-        was_seek_in_progress_flag = False # Local copy of the flag
+        was_seek = False 
         with self._stream_lock:
             self._is_actually_playing_stream_state = False 
-            # The audio thread's _current_stream_in_thread will be set to None by its own logic
-            # or if this finished callback corresponds to the stream it was managing.
-            # We nullify the main instance playback_stream_obj to reflect the stream is done.
-            self.playback_stream_obj = None 
+            if self.playback_stream_obj and (self.playback_stream_obj.stopped or self.playback_stream_obj.closed):
+                self.playback_stream_obj = None
 
-            was_seek_in_progress_flag = self.seek_in_progress_flag
-            self.seek_in_progress_flag = False # Reset flag
+            was_seek = self.seek_in_progress_flag 
+            self.seek_in_progress_flag = False    
 
-            # Only set user_wants_to_play to False if this wasn't a stop due to an ongoing seek
-            # that intends to immediately restart playback.
-            if not was_seek_in_progress_flag:
-                print(f"DEBUG: Deck {self.deck_id} finished_callback: Not a seek, setting user_wants_to_play=False.")
+            if not was_seek: 
                 self._user_wants_to_play = False
-            else:
-                print(f"DEBUG: Deck {self.deck_id} finished_callback: Seek was in progress, user_wants_to_play not changed here by finished_callback.")
             
-            # If it was a natural end of track (and not a seek that will restart)
-            if not was_seek_in_progress_flag and \
-               self.audio_thread_data is not None and \
-               self.audio_thread_current_frame >= self.audio_thread_total_samples:
+            natural_end_condition = (
+                self.audio_thread_data is not None and
+                self.audio_thread_current_frame >= self.audio_thread_total_samples and
+                not self._loop_active 
+            )
+            if not was_seek and natural_end_condition :
                 print(f"DEBUG: Deck {self.deck_id} finished_callback - Track ended naturally. Resetting frames.")
                 self.audio_thread_current_frame = 0 
                 self._current_playback_frame_for_display = 0
-        
         print(f"DEBUG: Deck {self.deck_id} AudioThread - Stream finished_callback processed. User wants play: {self._user_wants_to_play}")
 
 
@@ -402,6 +532,7 @@ class Deck:
             return self._current_playback_frame_for_display
 
     def shutdown(self): 
+        # (Same as previous version)
         print(f"DEBUG: Deck {self.deck_id} - Shutdown requested from external.")
         self.audio_thread_stop_event.set()
         try:
@@ -414,9 +545,9 @@ class Deck:
         if self.audio_thread.is_alive():
             print(f"WARNING: Deck {self.deck_id} - Audio thread did not join cleanly during shutdown.")
             with self._stream_lock: stream = self.playback_stream_obj 
-            if stream: # This is self.playback_stream_obj which audio thread updates
+            if stream:
                 try: 
-                    print(f"WARNING: Deck {self.deck_id} - Forcing abort/close on lingering stream during unresponsive shutdown.")
+                    print(f"WARNING: Deck {self.deck_id} - Forcing abort/close on lingering stream.")
                     stream.abort(ignore_errors=True)
                     stream.close(ignore_errors=True)
                 except Exception as e_close:
@@ -424,10 +555,9 @@ class Deck:
         print(f"DEBUG: Deck {self.deck_id} - Shutdown complete.")
 
 
-# ... (rest of the Deck class code above) ...
-
 if __name__ == '__main__':
-    print("--- Deck Class Standalone Test ---")
+    # (Test block from previous version is suitable, ensure it uses the updated Deck)
+    print("--- Deck Class Standalone Test (with Looping and Cue Points) ---")
     
     import sys
     CURRENT_DIR_OF_DECK_PY = os.path.dirname(os.path.abspath(__file__))
@@ -457,77 +587,87 @@ if __name__ == '__main__':
     test_file_name = "starships.mp3" 
     test_audio_file = os.path.join(app_config.AUDIO_TRACKS_DIR, test_file_name)
 
-    # --- Create a dummy .cue file for starships.mp3 for this Deck test ---
-    # This allows testing Deck's cue functionality without relying on AudioAnalyzer's test to run first.
-    dummy_cue_filepath_for_deck_test = test_audio_file + ".cue" 
-    dummy_cue_data_for_deck_test = {
-        "intro_start": {"start_beat": 1},
-        "drop1": {"start_beat": 65, "comment": "First drop"},
-        "main_break_loop": {"start_beat": 97, "end_beat": 105}
-    }
+    dummy_cue_filepath = test_audio_file + ".cue" 
+    dummy_cue_data = { 
+        "intro_start": {"start_beat": 1}, # For initial play
+        "drop1": {"start_beat": 65}, # For testing cue play
+        "loop_point_beat_5": {"start_beat": 5} # For loop testing
+    } 
     try:
-        with open(dummy_cue_filepath_for_deck_test, 'w') as f:
-            json.dump(dummy_cue_data_for_deck_test, f, indent=4)
-        print(f"DEBUG: Deck Test - Created/Replaced dummy cue file: {dummy_cue_filepath_for_deck_test}")
+        with open(dummy_cue_filepath, 'w') as f: json.dump(dummy_cue_data, f, indent=4)
+        print(f"DEBUG: Test - Created/Updated dummy cue file: {dummy_cue_filepath}")
     except Exception as e_cue_write:
-        print(f"ERROR: Deck Test - Could not create dummy cue file {dummy_cue_filepath_for_deck_test}: {e_cue_write}")
+        print(f"ERROR: Test - Could not create dummy cue file {dummy_cue_filepath}: {e_cue_write}")
 
     
     if not os.path.exists(test_audio_file):
-        print(f"WARNING: Test audio file not found at {test_audio_file}. Test will be limited.")
+        print(f"WARNING: Test audio file not found at {test_audio_file}.")
     else:
-        if deck.load_track(test_audio_file): # This will use the dummy cue file just created
-            print(f"\nTrack loaded successfully onto {deck.deck_id}")
-            
-            print("\nPlaying from CUE 'drop1' for 3 seconds...")
-            deck.play(start_at_cue_name="drop1")
-            time.sleep(3.1) 
-            print(f"After 3s, DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
+        if deck.load_track(test_audio_file):
+            print(f"\nTrack loaded successfully onto {deck.deck_id}. BPM: {deck.bpm}, SR: {deck.sample_rate}")
+            if deck.bpm == 0:
+                print("WARNING: BPM is 0, loop length calculation will be incorrect.")
 
-            print("\nPausing for 2 seconds...")
-            deck.pause() 
-            time.sleep(0.5) 
-            print(f"After pause, DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
-
-            print("\nSeeking to beat 10 (while paused)...")
-            seek_frame_10 = deck.get_frame_from_beat(10)
-            deck.seek(seek_frame_10)
+            print("\nPlaying from CUE 'intro_start'...")
+            deck.play(start_at_cue_name="intro_start")
             time.sleep(0.2) 
-            print(f"After seek to beat 10 (paused), DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
+            print("Playing for ~2.0 seconds to reach near beat 5...")
+            time.sleep(2.0) 
+            
+            start_loop_beat = 5 # Corresponds to "loop_point_beat_5" if you want to use cue
+            loop_len_beats = 4 
+            num_reps = 3
+            print(f"\nActivating {loop_len_beats}-beat loop starting at beat {start_loop_beat} for {num_reps} repetitions...")
+            deck.activate_loop(start_beat=start_loop_beat, length_beats=loop_len_beats, repetitions=num_reps)
+            
+            loop_single_duration = (60.0 / deck.bpm * loop_len_beats if deck.bpm > 0 else 1.0) # Approx duration
+            wait_for_loop_and_post = (loop_single_duration * num_reps) + 2.5 
+            print(f"Waiting for loop ({num_reps} reps of ~{loop_single_duration:.2f}s) and ~2s post-loop play (total ~{wait_for_loop_and_post:.2f}s)...")
+            time.sleep(wait_for_loop_and_post) 
 
+            print(f"\nAfter finite loop, DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
 
-            print("\nResuming play (from beat 10) for 3 seconds...")
-            deck.play() 
-            time.sleep(3.1)
-            print(f"After resume, DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
-
-            print("\nSeeking to CUE 'main_break_loop' while playing for 2 seconds...")
-            seek_frame_loop = deck.get_frame_from_cue("main_break_loop") 
-            if seek_frame_loop is not None:
-                deck.seek(seek_frame_loop) 
-                time.sleep(2.1) 
-                print(f"After seek to cue 'main_break_loop' (playing), DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
+            next_loop_start_beat = 0
+            if deck.bpm > 0 and deck.sample_rate > 0 and len(deck.beat_timestamps) > 0:
+                current_time_after_loop = deck.get_current_display_frame() / float(deck.sample_rate)
+                current_beat_index_after_loop = np.searchsorted(deck.beat_timestamps, current_time_after_loop, side='right')
+                next_loop_start_beat = current_beat_index_after_loop + 4 
+                next_loop_start_beat = min(next_loop_start_beat, len(deck.beat_timestamps)) 
+                if next_loop_start_beat <= 0 and len(deck.beat_timestamps) > 0 : next_loop_start_beat = len(deck.beat_timestamps) // 2 
             else:
-                print("ERROR: Test - Could not find cue 'main_break_loop' to seek to.")
+                next_loop_start_beat = 25 
 
+            print(f"\nActivating infinite loop at calculated beat {next_loop_start_beat} for {loop_len_beats} beats (will play for 5 seconds)...")
+            if next_loop_start_beat > 0: 
+                deck.activate_loop(start_beat=next_loop_start_beat, length_beats=loop_len_beats) 
+                print(f"Waiting for infinite loop to play for 5 seconds... (Loop starts at beat {next_loop_start_beat})")
+                time.sleep(5)
+
+                print(f"\nDeactivating loop and playing for 2 more seconds...")
+                deck.deactivate_loop()
+                time.sleep(0.1) 
+                if deck.is_active():
+                     print(f"DEBUG: Test - Continuing playback after loop deactivation. Frame: {deck.get_current_display_frame()}")
+                     time.sleep(2)
+                else: 
+                    print("DEBUG: Test - Playback not active after loop deactivation. Re-requesting play.")
+                    deck.play() 
+                    time.sleep(2)
+            else:
+                print("WARNING: Test - Could not determine a valid start beat for the infinite loop test. Skipping.")
 
             print("\nStopping playback...")
             deck.stop()
             time.sleep(0.5) 
-            print(f"After stop, DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
             
-            print("\nTest finished.")
+            print(f"\nFinal DisplayFrame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, StreamActive: {deck.is_active()}")
+            print("\nLooping Test finished.")
         else:
             print(f"Failed to load track onto {deck.deck_id}")
     
     deck.shutdown() 
-    
-    # REMOVED/COMMENTED OUT the .cue file deletion for persistence across tests
-    # if os.path.exists(dummy_cue_filepath_for_deck_test):
-    #     try:
-    #         os.remove(dummy_cue_filepath_for_deck_test)
-    #         print(f"DEBUG: Test - Removed dummy cue file: {dummy_cue_filepath_for_deck_test}")
-    #     except Exception as e_remove:
-    #         print(f"ERROR: Test - Could not remove dummy_cue_file: {e_remove}")
+    if os.path.exists(dummy_cue_filepath):
+        try: os.remove(dummy_cue_filepath)
+        except Exception: pass
             
     print("--- Deck Test Complete ---")
