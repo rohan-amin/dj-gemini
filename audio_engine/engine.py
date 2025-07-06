@@ -84,7 +84,7 @@ class AudioEngine:
             print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track"]
+        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat"]
         engine_level_commands = [] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -321,6 +321,21 @@ class AudioEngine:
                 deck = self._get_or_create_deck(deck_id)
                 deck.stop()
             
+            elif command == "stop_at_beat":
+                if not deck_id: print("WARNING: AudioEngine - 'stop_at_beat' missing deck_id. Skipping."); return
+                if "beat_number" not in parameters: print("WARNING: AudioEngine - 'stop_at_beat' missing 'beat_number' in parameters. Skipping."); return
+                
+                try:
+                    beat_number = float(parameters["beat_number"])
+                    if beat_number <= 0:
+                        print("WARNING: AudioEngine - 'beat_number' for 'stop_at_beat' must be positive. Skipping.")
+                        return
+                    
+                    deck = self._get_or_create_deck(deck_id)
+                    deck.stop_at_beat(beat_number)
+                except ValueError:
+                    print(f"WARNING: AudioEngine - Invalid 'beat_number' value for 'stop_at_beat': {parameters['beat_number']}. Skipping.")
+
             elif command == "activate_loop":
                 if not deck_id: print("WARNING: AudioEngine - 'activate_loop' missing deck_id. Skipping."); return
                 
