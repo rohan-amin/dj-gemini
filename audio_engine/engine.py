@@ -84,7 +84,7 @@ class AudioEngine:
             print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat"]
+        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo"]
         engine_level_commands = [] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -104,6 +104,19 @@ class AudioEngine:
                         int(params["repetitions"])
             except (ValueError, TypeError):
                 print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' parameters not valid numbers/type. Params: {params}")
+                return False
+        elif command == "set_tempo":
+            params = action.get("parameters", {})
+            if params.get("target_bpm") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_tempo' missing 'target_bpm' in parameters. Params: {params}")
+                return False
+            try:
+                target_bpm = float(params["target_bpm"])
+                if target_bpm <= 0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' must be positive. Value: {target_bpm}")
+                    return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' not a valid number. Params: {params}")
                 return False
         # print(f"DEBUG: Validation OK for action {action_index+1} (ID: {action_id_for_log})")
         return True
@@ -381,6 +394,17 @@ class AudioEngine:
                 if not deck_id: print("WARNING: AudioEngine - 'deactivate_loop' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.deactivate_loop()
+            
+            elif command == "set_tempo":
+                deck = self.decks.get(deck_id)
+                if not deck:
+                    print(f"ERROR: AudioEngine - Deck '{deck_id}' not found for set_tempo command.")
+                    return
+                target_bpm = parameters.get("target_bpm")
+                if target_bpm is None:
+                    print(f"ERROR: AudioEngine - set_tempo command missing 'target_bpm' parameter.")
+                    return
+                deck.set_tempo(target_bpm)
             
             else: print(f"WARNING: AudioEngine - Unknown command '{command}'. Skipping.")
         except Exception as e_action:

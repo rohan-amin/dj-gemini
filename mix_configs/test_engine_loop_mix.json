@@ -1,0 +1,23 @@
+{
+  "script_name": "Deck Looping Test via Main v2",
+  "actions": [
+    { "id": "loadA", "command": "load_track", "deck_id": "deckA", "parameters": { "file_path": "starships.mp3" }},
+    { "id": "playA", "command": "play", "deck_id": "deckA", "parameters": { "start_at_beat": 1 }},
+    {
+      "id": "loopA_at_b5",
+      "command": "activate_loop", "deck_id": "deckA",
+      "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 5 },
+      "parameters": {"start_at_beat": 5, "length_beats": 4, "repetitions": 3 }
+    },
+    {
+      "id": "deact_loopA_at_b20",
+      "command": "deactivate_loop", "deck_id": "deckA",
+      "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 20 }
+    },
+    {
+      "id": "stopA_at_b28",
+      "command": "stop", "deck_id": "deckA",
+      "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 28}
+    }
+  ]
+}

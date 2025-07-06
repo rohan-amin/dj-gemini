@@ -1,0 +1,84 @@
+{
+    "script_name": "Engine Pure Event Final Test",
+    "actions": [
+        {
+            "command": "load_track",
+            "deck_id": "deckA",
+            "parameters": {
+                "file_path": "starships.mp3"
+            }
+        },
+        {
+            "command": "load_track",
+            "deck_id": "deckB",
+            "parameters": {
+                "file_path": "starships.mp3"
+            }
+        },
+        {
+            "command": "play",
+            "deck_id": "deckA",
+            "parameters": {
+                "start_at_cue_name": "intro_start"
+            }
+        },
+        {
+            "id": "play_deck_b_triggered",
+            "command": "play",
+            "deck_id": "deckB",
+            "parameters": {
+                "start_at_cue_name": "drop1"
+            },
+            "trigger": {
+                "type": "on_deck_beat",
+                "source_deck_id": "deckA",
+                "beat_number": 17
+            }
+        },
+        {
+            "id": "loop_A_at_33",
+            "command": "activate_loop",
+            "deck_id": "deckA",
+            "parameters": {
+                "start_at_beat": 33,
+                "length_beats": 8,
+                "repetitions": 4
+            },
+            "trigger": {
+                "type": "on_deck_beat",
+                "source_deck_id": "deckA",
+                "beat_number": 33
+            }
+        },
+        {
+            "id": "deactivate_loop_A_after_reps",
+            "command": "deactivate_loop",
+            "deck_id": "deckA",
+            "trigger": {
+                "type": "on_deck_beat",
+                "source_deck_id": "deckA",
+                "beat_number": 66
+            }
+        },
+        {
+            "id": "stop_A_later",
+            "command": "stop",
+            "deck_id": "deckA",
+            "trigger": {
+                "type": "on_deck_beat",
+                "source_deck_id": "deckA",
+                "beat_number": 97
+            }
+        },
+        {
+            "id": "stop_B_much_later",
+            "command": "stop",
+            "deck_id": "deckB",
+            "trigger": {
+                "type": "on_deck_beat",
+                "source_deck_id": "deckB",
+                "beat_number": 64
+            }
+        }
+    ]
+}
