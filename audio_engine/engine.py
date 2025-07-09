@@ -5,12 +5,14 @@ import time
 import os
 import sys 
 import threading
+import logging
+logger = logging.getLogger(__name__)
 
 try:
     import config as app_config
 except ImportError:
     app_config = None 
-    print("WARNING: engine.py - Initial 'import config' failed. Ensure config.py is in project root or PYTHONPATH.")
+    logger.warning("engine.py - Initial 'import config' failed. Ensure config.py is in project root or PYTHONPATH.")
 
 from .audio_analyzer import AudioAnalyzer
 from .deck import Deck
@@ -19,7 +21,7 @@ ENGINE_TICK_INTERVAL = 0.05
 
 class AudioEngine:
     def __init__(self, app_config_module): 
-        print("DEBUG: AudioEngine - Initializing...")
+        logger.debug("AudioEngine - Initializing...")
         self.app_config = app_config_module 
         if self.app_config is None:
             raise ValueError("CRITICAL: AudioEngine requires a valid config module.")
@@ -44,11 +46,11 @@ class AudioEngine:
         
         self._script_start_time = 0 
         
-        print("DEBUG: AudioEngine - Initialized.")
+        logger.debug("AudioEngine - Initialized.")
 
     def _get_or_create_deck(self, deck_id):
         if deck_id not in self.decks:
-            print(f"DEBUG: AudioEngine - Creating new Deck: {deck_id}")
+            logger.debug(f"AudioEngine - Creating new Deck: {deck_id}")
             self.decks[deck_id] = Deck(deck_id, self.analyzer) 
         return self.decks[deck_id]
 
@@ -58,17 +60,17 @@ class AudioEngine:
         # print(f"DEBUG: Validating action {action_index+1} (ID: {action_id_for_log}): CMD='{command}'") 
 
         if not command:
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Missing 'command'.")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Missing 'command'.")
             return False
 
         trigger = action.get("trigger")
         
         if not trigger: 
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Trigger object missing entirely (should have been defaulted).")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Trigger object missing entirely (should have been defaulted).")
             return False 
             
         if not isinstance(trigger, dict) or "type" not in trigger:
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Malformed 'trigger' or missing 'type'. Trigger: {trigger}")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Malformed 'trigger' or missing 'type'. Trigger: {trigger}")
             return False
         
         trigger_type = trigger.get("type")
@@ -76,30 +78,30 @@ class AudioEngine:
             source_deck_id_val = trigger.get("source_deck_id")
             beat_number_val = trigger.get("beat_number")
             if not source_deck_id_val or not isinstance(beat_number_val, (int, float)):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
                 return False
         elif trigger_type == "on_loop_complete":
             source_deck_id_val = trigger.get("source_deck_id")
             if not source_deck_id_val:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' ('{source_deck_id_val}').")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' ('{source_deck_id_val}').")
                 return False
         elif trigger_type == "script_start":
             pass 
         else:
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
         deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "ramp_tempo"]
         engine_level_commands = ["crossfade", "beatmatch"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Command '{command}' is missing 'deck_id'.")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Command '{command}' is missing 'deck_id'.")
             return False
         
         if command == "activate_loop":
             params = action.get("parameters", {})
             if params.get("start_at_beat") is None or params.get("length_beats") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' missing 'start_at_beat' or 'length_beats' in parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' missing 'start_at_beat' or 'length_beats' in parameters. Params: {params}")
                 return False
             try: 
                 float(params["start_at_beat"])
@@ -108,90 +110,90 @@ class AudioEngine:
                     if not (isinstance(params["repetitions"], str) and params["repetitions"].lower() == "infinite"):
                         int(params["repetitions"])
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' parameters not valid numbers/type. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' parameters not valid numbers/type. Params: {params}")
                 return False
         elif command == "set_tempo":
             params = action.get("parameters", {})
             if params.get("target_bpm") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_tempo' missing 'target_bpm' in parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_tempo' missing 'target_bpm' in parameters. Params: {params}")
                 return False
             try:
                 target_bpm = float(params["target_bpm"])
                 if target_bpm <= 0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' must be positive. Value: {target_bpm}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' must be positive. Value: {target_bpm}")
                     return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' not a valid number. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' not a valid number. Params: {params}")
                 return False
         elif command == "set_volume":
             params = action.get("parameters", {})
             if params.get("volume") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_volume' missing 'volume' in parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_volume' missing 'volume' in parameters. Params: {params}")
                 return False
             try:
                 volume = float(params["volume"])
                 if volume < 0.0 or volume > 1.0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' must be between 0.0 and 1.0. Value: {volume}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' must be between 0.0 and 1.0. Value: {volume}")
                     return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' not a valid number. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' not a valid number. Params: {params}")
                 return False
         elif command == "fade_volume":
             params = action.get("parameters", {})
             if params.get("target_volume") is None or params.get("duration_seconds") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' missing 'target_volume' or 'duration_seconds' in parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' missing 'target_volume' or 'duration_seconds' in parameters. Params: {params}")
                 return False
             try:
                 target_volume = float(params["target_volume"])
                 duration_seconds = float(params["duration_seconds"])
                 if target_volume < 0.0 or target_volume > 1.0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_volume' must be between 0.0 and 1.0. Value: {target_volume}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_volume' must be between 0.0 and 1.0. Value: {target_volume}")
                     return False
                 if duration_seconds < 0.0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
                     return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' parameters not valid numbers. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' parameters not valid numbers. Params: {params}")
                 return False
         elif command == "crossfade":
             params = action.get("parameters", {})
             if params.get("from_deck") is None or params.get("to_deck") is None or params.get("duration_seconds") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' missing required parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' missing required parameters. Params: {params}")
                 return False
             try:
                 duration_seconds = float(params["duration_seconds"])
                 if duration_seconds < 0.0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
                     return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' duration not a valid number. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' duration not a valid number. Params: {params}")
                 return False
         elif command == "beatmatch":
             params = action.get("parameters", {})
             if params.get("reference_deck") is None or params.get("follow_deck") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'beatmatch' missing 'reference_deck' or 'follow_deck' in parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'beatmatch' missing 'reference_deck' or 'follow_deck' in parameters. Params: {params}")
                 return False
             sync_method = params.get("sync_method", "auto")
             if sync_method not in ["auto", "manual", "grid"]:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'sync_method' must be 'auto', 'manual', or 'grid'. Value: {sync_method}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'sync_method' must be 'auto', 'manual', or 'grid'. Value: {sync_method}")
                 return False
             if sync_method == "manual" and params.get("target_beat") is None:
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'manual' sync_method requires 'target_beat' parameter. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'manual' sync_method requires 'target_beat' parameter. Params: {params}")
                 return False
             try:
                 if sync_method == "manual" and params.get("target_beat") is not None:
                     target_beat = float(params["target_beat"])
                     if target_beat <= 0:
-                        print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' must be positive. Value: {target_beat}")
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' must be positive. Value: {target_beat}")
                         return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' not a valid number. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' not a valid number. Params: {params}")
                 return False
         elif command == "ramp_tempo":
             params = action.get("parameters", {})
             if (params.get("start_beat") is None or params.get("end_beat") is None or 
                 params.get("start_bpm") is None or params.get("end_bpm") is None):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' missing required parameters. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' missing required parameters. Params: {params}")
                 return False
             try:
                 start_beat = float(params["start_beat"])
@@ -201,66 +203,72 @@ class AudioEngine:
                 curve = params.get("curve", "linear")
                 
                 if start_beat >= end_beat:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_beat' must be less than 'end_beat'. Values: {start_beat}, {end_beat}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_beat' must be less than 'end_beat'. Values: {start_beat}, {end_beat}")
                     return False
                 if start_bpm <= 0 or end_bpm <= 0:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): BPM values must be positive. Values: {start_bpm}, {end_bpm}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): BPM values must be positive. Values: {start_bpm}, {end_bpm}")
                     return False
                 if curve not in ["linear", "exponential", "smooth", "step"]:
-                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'curve' must be 'linear', 'exponential', 'smooth', or 'step'. Value: {curve}")
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'curve' must be 'linear', 'exponential', 'smooth', or 'step'. Value: {curve}")
                     return False
             except (ValueError, TypeError):
-                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' parameters not valid numbers. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' parameters not valid numbers. Params: {params}")
                 return False
         # print(f"DEBUG: Validation OK for action {action_index+1} (ID: {action_id_for_log})")
         return True
 
 
     def load_script_from_file(self, json_filepath):
-        print(f"DEBUG: AudioEngine - Loading script from: {json_filepath}")
+        logger.debug(f"AudioEngine - Loading script from: {json_filepath}")
+        
         path_to_load = json_filepath
-        if self.app_config and not os.path.isabs(path_to_load):
-            abs_json_filepath_mix_config = os.path.join(self.app_config.MIX_CONFIGS_DIR, path_to_load)
-            abs_json_filepath_project_root = os.path.join(self.app_config.PROJECT_ROOT_DIR, path_to_load)
-            if os.path.exists(abs_json_filepath_mix_config): path_to_load = abs_json_filepath_mix_config
-            elif os.path.exists(abs_json_filepath_project_root): path_to_load = abs_json_filepath_project_root
-
+        if self.app_config and not os.path.isabs(json_filepath):
+            constructed_path = os.path.join(self.app_config.MIX_CONFIGS_DIR, json_filepath)
+            if os.path.exists(constructed_path): path_to_load = constructed_path
+            else: 
+                constructed_path_alt = os.path.join(self.app_config.PROJECT_ROOT_DIR, json_filepath)
+                if os.path.exists(constructed_path_alt): path_to_load = constructed_path_alt
+                else: logger.warning(f"Script file '{json_filepath}' not found in expected locations. Trying as is.")
+        
         if not os.path.exists(path_to_load):
-            print(f"ERROR: AudioEngine - Script file not found: {path_to_load}")
+            logger.error(f"AudioEngine - Script file not found: {path_to_load}")
             return False
+        
         try:
-            with open(path_to_load, 'r') as f: script_data = json.load(f)
-            self.script_name = script_data.get("script_name", "Untitled Mix")
-            raw_actions = script_data.get("actions", [])
-            if not isinstance(raw_actions, list):
-                print("ERROR: AudioEngine - 'actions' in script must be a list."); return False
+            with open(path_to_load, 'r') as f:
+                script_data = json.load(f)
             
-            self._all_actions_from_script = [] 
-            for i, action in enumerate(raw_actions):
-                if "trigger" not in action:
-                    print(f"DEBUG: AudioEngine - Action {i+1} ('{action.get('command')}') missing trigger, defaulting to 'script_start'.")
+            if not isinstance(script_data.get("actions"), list):
+                logger.error("AudioEngine - 'actions' in script must be a list."); return False
+            
+            self._all_actions_from_script = []
+            for i, action in enumerate(script_data["actions"]):
+                if not action.get("trigger"):
+                    logger.debug(f"AudioEngine - Action {i+1} ('{action.get('command')}') missing trigger, defaulting to 'script_start'.")
                     action["trigger"] = {"type": "script_start"}
                 
-                if not self._validate_action(action, i): 
-                    print(f"ERROR: AudioEngine - Invalid action at index {i} (Command: {action.get('command')}). Aborting script load.")
-                    self._all_actions_from_script = [] 
-                    return False 
-                
+                if not self._validate_action(action, i):
+                    logger.error(f"AudioEngine - Invalid action at index {i} (Command: {action.get('command')}). Aborting script load.")
+                    return False
                 self._all_actions_from_script.append(action)
             
-            print(f"DEBUG: AudioEngine - Script '{self.script_name}' loaded and validated with {len(self._all_actions_from_script)} actions.")
+            self.script_name = script_data.get("name", "Untitled Mix")
+            logger.debug(f"AudioEngine - Script '{self.script_name}' loaded and validated with {len(self._all_actions_from_script)} actions.")
             return True
+            
         except Exception as e:
-            print(f"ERROR: AudioEngine - Failed to load/parse script {path_to_load}: {e}"); return False
+            logger.error(f"AudioEngine - Failed to load/parse script {path_to_load}: {e}"); return False
 
 
     def start_script_processing(self): 
         if self.is_processing_script_actions:
-            print("WARNING: AudioEngine - Script processing already running."); return
+            logger.warning("Script processing already running.")
+            return
         if not self._all_actions_from_script : 
-            print("INFO: AudioEngine - No actions loaded to process."); return
+            logger.info("No actions loaded to process.")
+            return
 
-        print(f"INFO: AudioEngine - Starting script processing: '{self.script_name}'")
+        logger.info(f"Starting script processing: '{self.script_name}'")
         self._engine_stop_event.clear()
         self.is_processing_script_actions = True 
         self._script_start_time = time.time() 
@@ -274,21 +282,21 @@ class AudioEngine:
             else: 
                 self._pending_on_beat_actions.append(action)
         
-        print(f"DEBUG: AudioEngine - Executing {len(initial_actions_to_execute)} initial 'script_start' actions...")
+        logger.debug(f"AudioEngine - Initial 'script_start' actions dispatched. Pending on_beat: {len(self._pending_on_beat_actions)}")
         for action in initial_actions_to_execute:
             action_command = action.get('command', 'N/A')
             action_deck_id = action.get('deck_id', 'Engine-Level')
             action_id_for_log = action.get('id', 'N/A_script_start')
-            print(f"\nINFO: AudioEngine (Initial) - Executing: CMD='{action_command}', Deck='{action_deck_id}', ActionID='{action_id_for_log}'")
+            logger.info(f"AudioEngine (Initial) - Executing: CMD='{action_command}', Deck='{action_deck_id}', ActionID='{action_id_for_log}'")
             self._execute_action(action) 
             if self._engine_stop_event.is_set(): 
-                print("ERROR: AudioEngine - Stop event set during initial action execution.")
+                logger.error("AudioEngine - Stop event set during initial action execution.")
                 self.is_processing_script_actions = False
                 return
-        print(f"DEBUG: AudioEngine - Initial 'script_start' actions dispatched. Pending on_beat: {len(self._pending_on_beat_actions)}")
+        logger.debug(f"AudioEngine - Initial 'script_start' actions dispatched. Pending on_beat: {len(self._pending_on_beat_actions)}")
 
         if not self._pending_on_beat_actions and not self.any_deck_active():
-            print("INFO: AudioEngine - No future-triggered actions and no decks active after initial. Script complete.")
+            logger.info("AudioEngine - No future-triggered actions and no decks active after initial. Script complete.")
             self.is_processing_script_actions = False
             self.shutdown_decks() 
             return
@@ -297,34 +305,33 @@ class AudioEngine:
         self._engine_thread.start()
 
     def stop_script_processing(self): 
-        # (Same as before)
-        print("INFO: AudioEngine - Stop script processing requested externally.")
+        logger.info("Stop script processing requested externally.")
         if not self.is_processing_script_actions and (self._engine_thread is None or not self._engine_thread.is_alive()):
-            print("INFO: AudioEngine - Engine loop was not running or already finished.")
+            logger.info("Engine loop was not running or already finished.")
             self.is_processing_script_actions = False 
             self.shutdown_decks()
             return
 
         self._engine_stop_event.set() 
         if self._engine_thread and self._engine_thread.is_alive():
-            print("INFO: AudioEngine - Waiting for engine thread to complete...")
+            logger.info("Waiting for engine thread to complete...")
             self._engine_thread.join(timeout=1.0) 
             if self._engine_thread.is_alive(): 
-                print("WARNING: AudioEngine - Engine thread did not stop cleanly via event.")
+                logger.warning("Engine thread did not stop cleanly via event.")
         
         self.is_processing_script_actions = False 
-        print("INFO: AudioEngine - Engine processing loop signaled to stop/completed.")
+        logger.info("Engine processing loop signaled to stop/completed.")
         self.shutdown_decks() 
 
 
     def _engine_loop(self):
-        print(f"DEBUG: AudioEngine - Engine loop started (monitoring {len(self._pending_on_beat_actions)} initial on_deck_beat actions).")
+        logger.info(f"Engine loop started (monitoring {len(self._pending_on_beat_actions)} actions)")
 
         while not self._engine_stop_event.is_set():
             if not self._pending_on_beat_actions:
                 self.is_processing_script_actions = False 
                 if not self.any_deck_active():
-                    print("INFO: AudioEngine - All actions dispatched and no decks active. Engine loop self-terminating.")
+                    logger.info("All actions dispatched and no decks active. Engine loop self-terminating.")
                     break 
                 time.sleep(ENGINE_TICK_INTERVAL)
                 continue
@@ -342,7 +349,7 @@ class AudioEngine:
                             # Check if we need a specific loop action ID
                             required_action_id = trigger.get("loop_action_id")
                             if required_action_id is None or required_action_id == completed_action_id:
-                                print(f"DEBUG: AudioEngine - Trigger MET: on_loop_complete for action '{action.get('id')}' (loop: {completed_action_id})")
+                                logger.info(f"Trigger MET: on_loop_complete for action '{action.get('id')}' (loop: {completed_action_id})")
                                 self._pending_on_beat_actions.remove(action)
                                 self._execute_action(action)
                     
@@ -367,22 +374,22 @@ class AudioEngine:
                     
                     if deck and target_beat_str is not None:
                         if not hasattr(deck, 'get_current_beat_count'):
-                            print(f"CRITICAL ERROR: Deck {source_deck_id} missing get_current_beat_count! Action ID: {action_id_for_log}")
+                            logger.error(f"Deck {source_deck_id} missing get_current_beat_count! Action ID: {action_id_for_log}")
                             next_round_pending_actions.append(action) 
                             continue
                         try:
                             target_beat = float(target_beat_str)
                             current_beat = deck.get_current_beat_count()
-                            print(f"DEBUG: AudioEngine - LOOP CHECK: Action='{action_id_for_log}', Deck='{source_deck_id}', CurrentBeat={current_beat}, TargetBeat={target_beat}")
+                            logger.debug(f"AudioEngine - Beat check: Deck='{source_deck_id}', Current={current_beat}, Target={target_beat}")
                             if current_beat >= target_beat: 
-                                print(f"DEBUG: AudioEngine - Trigger MET: on_deck_beat for action '{action_id_for_log}'")
+                                logger.info(f"Trigger MET: on_deck_beat for action '{action_id_for_log}'")
                                 triggered_this_tick = True
                         except ValueError:
-                             print(f"ERROR: AudioEngine - Invalid 'beat_number' format ('{target_beat_str}') for action '{action_id_for_log}'.")
+                             logger.error(f"Invalid 'beat_number' format ('{target_beat_str}') for action '{action_id_for_log}'.")
                         except Exception as e_beat_check:
-                             print(f"ERROR: AudioEngine - Error checking beat count for deck {source_deck_id} (action '{action_id_for_log}'): {e_beat_check}")
+                             logger.error(f"Error checking beat count for deck {source_deck_id} (action '{action_id_for_log}'): {e_beat_check}")
                     else:
-                        print(f"WARNING: AudioEngine - Invalid trigger data for on_deck_beat action '{action_id_for_log}': Deck={source_deck_id}, BeatNum={target_beat_str}")
+                        logger.warning(f"Invalid trigger data for on_deck_beat action '{action_id_for_log}': Deck={source_deck_id}, BeatNum={target_beat_str}")
                 elif trigger_type == "on_loop_complete":
                     source_deck_id = trigger.get("source_deck_id")
                     loop_action_id = trigger.get("loop_action_id")  # Optional: specific loop action ID
@@ -393,13 +400,13 @@ class AudioEngine:
                         
                         # Check if we need a specific loop action ID
                         if loop_action_id is None or loop_action_id == completed_action_id:
-                            print(f"DEBUG: AudioEngine - Trigger MET: on_loop_complete for action '{action_id_for_log}' (loop: {completed_action_id})")
+                            logger.info(f"Trigger MET: on_loop_complete for action '{action_id_for_log}' (loop: {completed_action_id})")
                             triggered_this_tick = True
                             # Reset the flag
                             deck._loop_just_completed = False
                             deck._completed_loop_action_id = None
                 else: 
-                    print(f"WARNING: AudioEngine - Action '{action_id_for_log}' in _pending_on_beat_actions has unexpected trigger type: '{trigger_type}'. Removing.")
+                    logger.warning(f"Action '{action_id_for_log}' in _pending_on_beat_actions has unexpected trigger type: '{trigger_type}'. Removing.")
                     triggered_this_tick = True 
                 
                 if triggered_this_tick:
@@ -413,7 +420,7 @@ class AudioEngine:
                 for exec_action in actions_executed_this_tick: 
                     action_command = exec_action.get('command', 'N/A')
                     action_deck_id = exec_action.get('deck_id', 'Engine-Level')
-                    print(f"\nINFO: AudioEngine Loop (Triggered) - Executing: CMD='{action_command}', Deck='{action_deck_id}' for action ID '{exec_action.get('id', 'N/A')}'")
+                    logger.info(f"Executing: CMD='{action_command}', Deck='{action_deck_id}' for action '{exec_action.get('id', 'N/A')}'")
                     self._execute_action(exec_action) 
                     if self._engine_stop_event.is_set(): break 
                 if self._engine_stop_event.is_set(): break 
@@ -421,7 +428,7 @@ class AudioEngine:
             time.sleep(ENGINE_TICK_INTERVAL) 
         
         self.is_processing_script_actions = False 
-        print(f"DEBUG: AudioEngine - Engine loop finished (stop_event: {self._engine_stop_event.is_set()}). Pending on_deck_beat actions: {len(self._pending_on_beat_actions)}")
+        logger.debug(f"Engine loop finished. Pending actions: {len(self._pending_on_beat_actions)}")
 
 
     def _execute_action(self, action_dict):
@@ -429,12 +436,12 @@ class AudioEngine:
         deck_id = action_dict.get("deck_id")
         parameters = action_dict.get("parameters", {})
 
-        if not command: print("WARNING: AudioEngine - Action missing 'command'. Skipping."); return
-        print(f"DEBUG: AudioEngine Executing - cmd='{command}', deck='{deck_id}', params='{parameters}'")
+        if not command: logger.warning("Action missing 'command'. Skipping."); return
+        logger.debug(f"Executing action: {action_dict}")
 
         try:
             if command == "load_track":
-                if not deck_id or "file_path" not in parameters: print(f"WARNING: AudioEngine - 'load_track' missing deck_id or file_path. Skipping."); return
+                if not deck_id or "file_path" not in parameters: logger.warning("'load_track' missing deck_id or file_path. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 file_path_param = parameters["file_path"]
                 track_path = file_path_param 
@@ -444,43 +451,43 @@ class AudioEngine:
                     else: 
                         constructed_path_alt = os.path.join(self.app_config.PROJECT_ROOT_DIR, file_path_param)
                         if os.path.exists(constructed_path_alt): track_path = constructed_path_alt
-                        else: print(f"WARNING: AudioEngine - Track file '{file_path_param}' not found. Trying as is.")
-                print(f"DEBUG: AudioEngine - Attempting to load track from resolved path: {track_path}")
+                        else: logger.warning(f"Track file '{file_path_param}' not found. Trying as is.")
+                logger.debug(f"Attempting to load track from resolved path: {track_path}")
                 deck.load_track(track_path)
 
             elif command == "play":
-                if not deck_id: print("WARNING: AudioEngine - 'play' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'play' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.play(start_at_beat=parameters.get("start_at_beat"), 
                           start_at_cue_name=parameters.get("start_at_cue_name"))
 
             elif command == "pause":
-                if not deck_id: print("WARNING: AudioEngine - 'pause' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'pause' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.pause()
                 
             elif command == "stop":
-                if not deck_id: print("WARNING: AudioEngine - 'stop' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.stop()
             
             elif command == "stop_at_beat":
-                if not deck_id: print("WARNING: AudioEngine - 'stop_at_beat' missing deck_id. Skipping."); return
-                if "beat_number" not in parameters: print("WARNING: AudioEngine - 'stop_at_beat' missing 'beat_number' in parameters. Skipping."); return
+                if not deck_id: logger.warning("'stop_at_beat' missing deck_id. Skipping."); return
+                if "beat_number" not in parameters: logger.warning("'stop_at_beat' missing 'beat_number' in parameters. Skipping."); return
                 
                 try:
                     beat_number = float(parameters["beat_number"])
                     if beat_number <= 0:
-                        print("WARNING: AudioEngine - 'beat_number' for 'stop_at_beat' must be positive. Skipping.")
+                        logger.warning("'beat_number' for 'stop_at_beat' must be positive. Skipping.")
                         return
                     
                     deck = self._get_or_create_deck(deck_id)
                     deck.stop_at_beat(beat_number)
                 except ValueError:
-                    print(f"WARNING: AudioEngine - Invalid 'beat_number' value for 'stop_at_beat': {parameters['beat_number']}. Skipping.")
+                    logger.warning(f"Invalid 'beat_number' value for 'stop_at_beat': {parameters['beat_number']}. Skipping.")
 
             elif command == "activate_loop":
-                if not deck_id: print("WARNING: AudioEngine - 'activate_loop' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'activate_loop' missing deck_id. Skipping."); return
                 
                 # Parameters from JSON (using .get for safety)
                 start_beat_from_json = parameters.get("start_at_beat")
@@ -488,7 +495,7 @@ class AudioEngine:
                 repetitions_param_from_json = parameters.get("repetitions") 
 
                 if start_beat_from_json is None or length_beats_from_json is None: 
-                    print("WARNING: AudioEngine - 'activate_loop' requires 'start_at_beat' and 'length_beats' in parameters. Skipping.")
+                    logger.warning("'activate_loop' requires 'start_at_beat' and 'length_beats' in parameters. Skipping.")
                     return
                 try:
                     start_beat_val = float(start_beat_from_json)
@@ -502,14 +509,14 @@ class AudioEngine:
                             try: 
                                 repetitions_val = int(repetitions_param_from_json)
                                 if repetitions_val <= 0: 
-                                    print("WARNING: AudioEngine - 'repetitions' for 'activate_loop' must be positive int or 'infinite'. Defaulting to infinite.")
+                                    logger.warning("'repetitions' for 'activate_loop' must be positive int or 'infinite'. Defaulting to infinite.")
                                     repetitions_val = None
                             except ValueError: 
-                                print("WARNING: AudioEngine - Invalid 'repetitions' value for 'activate_loop'. Must be int or 'infinite'. Defaulting to infinite.")
+                                logger.warning("Invalid 'repetitions' value for 'activate_loop'. Must be int or 'infinite'. Defaulting to infinite.")
                                 repetitions_val = None
                     
                     if length_beats_val <= 0:
-                        print("WARNING: AudioEngine - 'length_beats' for 'activate_loop' must be positive. Skipping.")
+                        logger.warning("'length_beats' for 'activate_loop' must be positive. Skipping.")
                         return
                         
                     deck = self._get_or_create_deck(deck_id)
@@ -519,10 +526,10 @@ class AudioEngine:
                                        repetitions=repetitions_val,
                                        action_id=action_dict.get('id'))
                 except ValueError: 
-                    print(f"WARNING: AudioEngine - Invalid numeric values for loop parameters: start_beat='{start_beat_from_json}', length_beats='{length_beats_from_json}'. Skipping.")
+                    logger.warning(f"Invalid numeric values for loop parameters: start_beat='{start_beat_from_json}', length_beats='{length_beats_from_json}'. Skipping.")
 
             elif command == "deactivate_loop":
-                if not deck_id: print("WARNING: AudioEngine - 'deactivate_loop' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'deactivate_loop' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.deactivate_loop()
             
@@ -559,7 +566,7 @@ class AudioEngine:
                 from_deck.fade_volume(0.0, duration_seconds)
                 to_deck.fade_volume(1.0, duration_seconds)
                 
-                print(f"DEBUG: AudioEngine - Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s")
+                logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s")
             
             elif command == "beatmatch":
                 params = action_dict.get("parameters", {})
@@ -574,17 +581,17 @@ class AudioEngine:
                 reference_bpm = reference_deck.bpm
                 follow_bpm = follow_deck.bpm
                 
-                print(f"DEBUG: AudioEngine - Beatmatching {follow_deck_id} to reference {reference_deck_id}")
-                print(f"DEBUG: AudioEngine - Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
+                logger.debug(f"Beatmatching {follow_deck_id} to reference {reference_deck_id}")
+                logger.debug(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
                 
                 if reference_bpm <= 0 or follow_bpm <= 0:
-                    print(f"ERROR: AudioEngine - Invalid BPM for beatmatching")
+                    logger.error(f"Invalid BPM for beatmatching")
                     return
                 
                 # Step 1: Match tempo
                 tempo_ratio = reference_bpm / follow_bpm
                 follow_deck.set_tempo(reference_bpm)
-                print(f"DEBUG: AudioEngine - Tempo matched: ratio {tempo_ratio:.3f}")
+                logger.debug(f"Tempo matched: ratio {tempo_ratio:.3f}")
                 
                 # Step 2: Phase alignment
                 if sync_method == "auto":
@@ -599,13 +606,13 @@ class AudioEngine:
                         
                         if 0 <= new_frame < follow_deck.total_frames:
                             follow_deck.seek(new_frame)
-                            print(f"DEBUG: AudioEngine - Auto-aligned: offset {beat_difference:.1f} beats")
+                            logger.debug(f"Auto-aligned: offset {beat_difference:.1f} beats")
                 
                 elif sync_method == "manual" and target_beat is not None:
                     target_frame = follow_deck.get_frame_from_beat(int(target_beat))
                     if target_frame is not None:
                         follow_deck.seek(target_frame)
-                        print(f"DEBUG: AudioEngine - Manual alignment to beat {target_beat}")
+                        logger.debug(f"Manual alignment to beat {target_beat}")
                 
                 elif sync_method == "grid":
                     current_beat = follow_deck.get_current_beat_count()
@@ -613,9 +620,9 @@ class AudioEngine:
                     grid_frame = follow_deck.get_frame_from_beat(grid_beat)
                     if grid_frame is not None:
                         follow_deck.seek(grid_frame)
-                        print(f"DEBUG: AudioEngine - Grid alignment to beat {grid_beat}")
+                        logger.debug(f"Grid alignment to beat {grid_beat}")
                 
-                print(f"DEBUG: AudioEngine - Beatmatch complete: {follow_deck_id} synchronized")
+                logger.debug(f"Beatmatch complete: {follow_deck_id} synchronized")
             
             elif command == "ramp_tempo":
                 deck_id = action_dict.get("deck_id")
@@ -628,21 +635,23 @@ class AudioEngine:
                 curve = params.get("curve", "linear")
                 deck.ramp_tempo(start_beat, end_beat, start_bpm, end_bpm, curve)
             
-            else: print(f"WARNING: AudioEngine - Unknown command '{command}'. Skipping.")
+            else: logger.warning(f"Unknown command '{command}'. Skipping.")
         except Exception as e_action:
-            print(f"ERROR: AudioEngine - Failed to execute action {action_dict}: {e_action}")
+            logger.error(f"Failed to execute action {action_dict}: {e_action}")
             import traceback
             traceback.print_exc()
 
     def shutdown_decks(self):
-        print("INFO: AudioEngine - Shutting down all decks...")
-        if not self.decks: print("INFO: AudioEngine - No decks to shut down."); return
-        for deck_id, deck_instance in list(self.decks.items()): 
-            print(f"INFO: AudioEngine - Requesting shutdown for {deck_id}...")
-            deck_instance.shutdown() 
-        print("INFO: AudioEngine - All decks have been requested to shut down.")
-        self.decks.clear() 
-        print("INFO: AudioEngine - Deck shutdown process complete.")
+        logger.info("AudioEngine - Shutting down all decks...")
+        if not self.decks: logger.info("AudioEngine - No decks to shut down."); return
+        
+        for deck_id in list(self.decks.keys()):
+            logger.info(f"AudioEngine - Requesting shutdown for {deck_id}...")
+            self.decks[deck_id].shutdown()
+        
+        logger.info("AudioEngine - All decks have been requested to shut down.")
+        self.decks.clear()
+        logger.info("AudioEngine - Deck shutdown process complete.")
 
     def any_deck_active(self):
         if not self.decks: return False
@@ -652,7 +661,7 @@ class AudioEngine:
 
 
 if __name__ == '__main__':
-    print("--- AudioEngine Standalone Test (v5.1 - Corrected activate_loop call) ---")
+    logger.info("--- AudioEngine Standalone Test (v5.1 - Corrected activate_loop call) ---")
     
     CURRENT_DIR_OF_ENGINE_PY = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT_FOR_ENGINE_TEST = os.path.dirname(CURRENT_DIR_OF_ENGINE_PY) 
@@ -663,7 +672,7 @@ if __name__ == '__main__':
     try:
         import config as main_test_app_config 
     except ImportError:
-        print("CRITICAL ERROR: engine.py __main__ - config.py not found in project root. Cannot run test.")
+        logger.critical("engine.py __main__ - config.py not found in project root. Cannot run test.")
         sys.exit(1)
 
     main_test_app_config.ensure_dir_exists(main_test_app_config.MIX_CONFIGS_DIR)
@@ -680,7 +689,7 @@ if __name__ == '__main__':
 
     full_test_audio_path = os.path.join(main_test_app_config.AUDIO_TRACKS_DIR, test_audio_filename)
     if not os.path.exists(full_test_audio_path):
-        print(f"WARNING: Test audio file '{full_test_audio_path}' not found for engine test.")
+        logger.warning(f"Test audio file '{full_test_audio_path}' not found for engine test.")
     
     dummy_cue_filepath = os.path.join(main_test_app_config.AUDIO_TRACKS_DIR, test_audio_filename + ".cue")
     test_cues = {"drop1": {"start_beat": 65}, "intro_start": {"start_beat":1}, 
@@ -690,8 +699,8 @@ if __name__ == '__main__':
                  "beat_66":{"start_beat":66}, "beat_97":{"start_beat":97}}
     try:
         with open(dummy_cue_filepath, 'w') as f: json.dump(test_cues, f, indent=4)
-        print(f"Created/Updated placeholder cue file: {dummy_cue_filepath}")
-    except Exception as e_cue_create: print(f"Could not create placeholder cue file: {e_cue_create}")
+        logger.info(f"Created/Updated placeholder cue file: {dummy_cue_filepath}")
+    except Exception as e_cue_create: logger.error(f"Could not create placeholder cue file: {e_cue_create}")
 
     # Using the simplified test JSON that worked for deck.py to isolate engine logic
     test_json_content = {
@@ -713,13 +722,13 @@ if __name__ == '__main__':
     
     try:
         with open(dummy_json_path, 'w') as f: json.dump(test_json_content, f, indent=4)
-        print(f"Created dummy JSON script for testing: {dummy_json_path}")
-    except Exception as e_json_write: print(f"Error creating dummy JSON: {e_json_write}"); sys.exit(1)
+        logger.info(f"Created dummy JSON script for testing: {dummy_json_path}")
+    except Exception as e_json_write: logger.error(f"Error creating dummy JSON: {e_json_write}"); sys.exit(1)
 
     if engine.load_script_from_file(dummy_json_path): 
         engine.start_script_processing() 
         
-        print("INFO: Engine Test - Script processing started. Monitoring. Press Ctrl+C to stop.")
+        logger.info("Engine Test - Script processing started. Monitoring. Press Ctrl+C to stop.")
         start_wait_time = time.time()
         max_script_duration_estimate = 25 # Adjusted for the shorter test
         
@@ -730,21 +739,21 @@ if __name__ == '__main__':
 
                 if not engine_is_processing and not decks_are_active:
                     if not engine._pending_on_beat_actions : 
-                        print("INFO: Engine Test - Engine done, no pending actions, and no decks active.")
+                        logger.info("Engine Test - Engine done, no pending actions, and no decks active.")
                         break 
                 
                 if (time.time() - start_wait_time) > max_script_duration_estimate:
-                    print(f"WARNING: Engine Test - Max wait time of {max_script_duration_estimate}s reached.")
+                    logger.warning(f"Engine Test - Max wait time of {max_script_duration_estimate}s reached.")
                     if engine._pending_on_beat_actions:
-                        print(f"DEBUG: Engine Test - Still {len(engine._pending_on_beat_actions)} pending actions on timeout:")
+                        logger.debug(f"Engine Test - Still {len(engine._pending_on_beat_actions)} pending actions on timeout:")
                         for pa_idx, pa in enumerate(engine._pending_on_beat_actions):
-                            print(f"  Pending {pa_idx+1}: ID='{pa.get('id','N/A')}', CMD='{pa.get('command')}', Deck='{pa.get('deck_id','N/A')}', Trigger={pa.get('trigger')}")
+                            logger.debug(f"  Pending {pa_idx+1}: ID='{pa.get('id','N/A')}', CMD='{pa.get('command')}', Deck='{pa.get('deck_id','N/A')}', Trigger={pa.get('trigger')}")
                     break
                 time.sleep(0.5)
-            print("INFO: Engine Test - Monitoring loop finished or timed out.")
+            logger.info("Engine Test - Monitoring loop finished or timed out.")
         except KeyboardInterrupt:
-            print("\nINFO: Engine Test - KeyboardInterrupt received by test runner.")
+            logger.info("Engine Test - KeyboardInterrupt received by test runner.")
         finally:
             engine.stop_script_processing() 
     
-    print("--- AudioEngine Standalone Test Finished ---")
+    logger.info("--- AudioEngine Standalone Test Finished ---")

@@ -12,6 +12,9 @@ import essentia.standard as es
 import numpy as np
 import sounddevice as sd
 
+import logging
+logger = logging.getLogger(__name__)
+
 UPDATE_INTERVAL_MS = 100
 
 CMD_LOAD_FILE = "LOAD_FILE"
@@ -58,7 +61,7 @@ class BeatViewerApp:
 
         if initial_filepath:
             self.master.after(10, lambda: self._process_load_file_request(initial_filepath))
-        print("DEBUG: BeatViewerApp initialized")
+        logger.debug("DEBUG: BeatViewerApp initialized")
 
     def _create_widgets(self):
         load_frame = tk.Frame(self.master, padx=10, pady=10)
@@ -93,7 +96,7 @@ class BeatViewerApp:
         self.seek_slider.bind("<B1-Motion>", self._gui_on_slider_drag_update_display_only)
 
     def _gui_select_file_and_load(self):
-        print("DEBUG: GUI - _gui_select_file_and_load called")
+        logger.debug("DEBUG: GUI - _gui_select_file_and_load called")
         self._send_audio_command(CMD_STOP_STREAM_FORCED, None, "GUI - Requesting stop before file load dialog")
         with self.stream_lock: self.is_playing_desired_state = False
         if self.master.winfo_exists(): self.play_pause_button.config(text="Play")
@@ -106,13 +109,13 @@ class BeatViewerApp:
             filetypes=(("Audio Files", "*.wav *.mp3 *.aac *.flac"), ("All files", "*.*"))
         )
         if filepath:
-            print(f"DEBUG: GUI - File selected: {filepath}")
+            logger.debug(f"DEBUG: GUI - File selected: {filepath}")
             self._process_load_file_request(filepath)
         else:
-            print("DEBUG: GUI - File selection cancelled")
+            logger.debug("DEBUG: GUI - File selection cancelled")
 
     def _process_load_file_request(self, filepath):
-        print(f"DEBUG: GUI - _process_load_file_request for {filepath}")
+        logger.debug(f"DEBUG: GUI - _process_load_file_request for {filepath}")
         if self.master.winfo_exists():
             self.filepath_label.config(text=f"Loading: {os.path.basename(filepath)}...")
             self.master.update_idletasks()
@@ -131,7 +134,7 @@ class BeatViewerApp:
 
             beat_tracker = es.BeatTrackerDegara()
             self.beat_timestamps_gui = beat_tracker(self.audio_data_gui)
-            print(f"DEBUG: GUI - Loaded {filepath}, SR: {self.sample_rate_gui}, Duration: {self.total_duration_seconds_gui:.2f}s, Beats: {len(self.beat_timestamps_gui)}")
+            logger.debug(f"DEBUG: GUI - Loaded {filepath}, SR: {self.sample_rate_gui}, Duration: {self.total_duration_seconds_gui:.2f}s, Beats: {len(self.beat_timestamps_gui)}")
 
             with self.stream_lock:
                 self.current_playback_frame_shared = 0
@@ -153,12 +156,12 @@ class BeatViewerApp:
         except Exception as e:
             error_msg = f"Error: {str(e)[:100]}"
             if self.master.winfo_exists(): self.filepath_label.config(text=error_msg)
-            print(f"ERROR in GUI - _process_load_file_request: {e}")
+            logger.error(f"ERROR in GUI - _process_load_file_request: {e}")
             self.audio_data_gui = None
             with self.stream_lock: self.audio_file_loaded = False; self.is_playing_desired_state = False
     
     def _gui_toggle_play_pause(self):
-        print("DEBUG: GUI - _gui_toggle_play_pause called")
+        logger.debug("DEBUG: GUI - _gui_toggle_play_pause called")
         if not self.audio_file_loaded: return
 
         should_play_now = False
@@ -185,14 +188,14 @@ class BeatViewerApp:
         self._update_beat_label(current_time_sec)
 
     def _gui_on_slider_release(self, event=None):
-        print("DEBUG: GUI - _gui_on_slider_release called")
+        logger.debug("DEBUG: GUI - _gui_on_slider_release called")
         if not self.audio_file_loaded: return
 
         seek_time_seconds = self.seek_slider_var.get()
         new_frame = int(seek_time_seconds * self.sample_rate_gui) 
         new_frame = max(0, min(new_frame, self.total_duration_samples_gui)) 
         
-        print(f"DEBUG: GUI - Seek to time: {seek_time_seconds:.2f}s, frame: {new_frame}")
+        logger.debug(f"DEBUG: GUI - Seek to time: {seek_time_seconds:.2f}s, frame: {new_frame}")
 
         # Immediately update GUI display to reflect the seek target
         self._update_time_display(seek_time_seconds, self.total_duration_seconds_gui)
@@ -220,12 +223,12 @@ class BeatViewerApp:
     def _send_audio_command(self, command, data, debug_msg=""):
         data_summary = type(data).__name__ if data is not None else 'None'
         if isinstance(data, dict): data_summary = f"dict_keys({list(data.keys())})"
-        print(f"DEBUG: {debug_msg if debug_msg else 'GUI - Sending command:'} {command}, Data: {data_summary}")
+        logger.debug(f"DEBUG: {debug_msg if debug_msg else 'GUI - Sending command:'} {command}, Data: {data_summary}")
         self.audio_command_queue.put((command, data))
 
     # --- Audio Management Thread ---
     def _audio_management_loop(self):
-        print("DEBUG: AudioThread - Started")
+        logger.debug("DEBUG: AudioThread - Started")
         current_managed_stream = None # Stream object managed by this thread
         
         # These are instance variables, set by CMD_LOAD_FILE, used by _sd_callback via self
@@ -234,10 +237,10 @@ class BeatViewerApp:
         while not self.audio_thread_stop_event.is_set():
             try:
                 command, data = self.audio_command_queue.get(timeout=0.05)
-                print(f"DEBUG: AudioThread - Received command: {command}")
+                logger.debug(f"DEBUG: AudioThread - Received command: {command}")
 
                 if command == CMD_LOAD_FILE:
-                    print("DEBUG: AudioThread - Processing LOAD_FILE")
+                    logger.debug("DEBUG: AudioThread - Processing LOAD_FILE")
                     with self.stream_lock: 
                         if current_managed_stream: 
                             current_managed_stream.abort(ignore_errors=True)
@@ -249,13 +252,13 @@ class BeatViewerApp:
                         self.audio_thread_total_samples = data['total_samples']
                         self.audio_thread_current_frame = 0 
                         self.current_playback_frame_shared = 0 
-                    print("DEBUG: AudioThread - New audio data processed for LOAD_FILE")
+                    logger.debug("DEBUG: AudioThread - New audio data processed for LOAD_FILE")
 
                 elif command == CMD_PLAY:
-                    print("DEBUG: AudioThread - Processing PLAY")
+                    logger.debug("DEBUG: AudioThread - Processing PLAY")
                     with self.stream_lock: 
                         if self.audio_thread_data is None: 
-                            print("DEBUG: AudioThread - No audio to play for PLAY command")
+                            logger.debug("DEBUG: AudioThread - No audio to play for PLAY command")
                             self.is_playing_desired_state = False 
                             self.master.after(0, lambda: self.play_pause_button.config(text="Play") if self.master.winfo_exists() else None)
                             continue 
@@ -267,12 +270,12 @@ class BeatViewerApp:
                             self.audio_thread_current_frame = 0
                         
                         if current_managed_stream: # Clean up if not None
-                            print("DEBUG: AudioThread - PLAY: Cleaning up old stream.")
+                            logger.debug("DEBUG: AudioThread - PLAY: Cleaning up old stream.")
                             current_managed_stream.abort(ignore_errors=True)
                             current_managed_stream.close(ignore_errors=True)
                             current_managed_stream = None
 
-                        print(f"DEBUG: AudioThread - Creating new stream for PLAY. SR: {self.audio_thread_sample_rate}, Frame: {self.audio_thread_current_frame}")
+                        logger.debug(f"DEBUG: AudioThread - Creating new stream for PLAY. SR: {self.audio_thread_sample_rate}, Frame: {self.audio_thread_current_frame}")
                         current_managed_stream = sd.OutputStream(
                             samplerate=self.audio_thread_sample_rate, channels=1,
                             callback=self._sd_callback, 
@@ -281,17 +284,17 @@ class BeatViewerApp:
                         # Store this stream reference on the instance for the audio thread to manage
                         self.playback_stream_obj = current_managed_stream
                         current_managed_stream.start()
-                        print("DEBUG: AudioThread - New stream started for PLAY.")
+                        logger.debug("DEBUG: AudioThread - New stream started for PLAY.")
                     
                     self.master.after(0, self._schedule_display_update) 
                     
                 elif command == CMD_PAUSE:
-                    print("DEBUG: AudioThread - Processing PAUSE")
+                    logger.debug("DEBUG: AudioThread - Processing PAUSE")
                     # is_playing_desired_state already set to False by GUI thread
                     if current_managed_stream and current_managed_stream.active:
-                        print("DEBUG: AudioThread - Stopping stream for PAUSE.")
+                        logger.debug("DEBUG: AudioThread - Stopping stream for PAUSE.")
                         current_managed_stream.stop(ignore_errors=True) 
-                        print("DEBUG: AudioThread - Stream stopped for PAUSE.")
+                        logger.debug("DEBUG: AudioThread - Stream stopped for PAUSE.")
                     # finished_callback might be triggered by stop(). 
                     # _handle_stream_finished will check seek_flag.
 
@@ -300,21 +303,21 @@ class BeatViewerApp:
                     new_seek_frame = seek_info['frame']
                     gui_wants_to_continue_playing = seek_info['was_playing']
                     
-                    print(f"DEBUG: AudioThread - Processing SEEK to frame {new_seek_frame}, gui_wants_to_continue_playing: {gui_wants_to_continue_playing}")
+                    logger.debug(f"DEBUG: AudioThread - Processing SEEK to frame {new_seek_frame}, gui_wants_to_continue_playing: {gui_wants_to_continue_playing}")
                     
                     if current_managed_stream:
-                        print("DEBUG: AudioThread - SEEK: Aborting and closing existing stream.")
+                        logger.debug("DEBUG: AudioThread - SEEK: Aborting and closing existing stream.")
                         current_managed_stream.abort(ignore_errors=True) 
                         current_managed_stream.close(ignore_errors=True)
                         current_managed_stream = None 
-                        print("DEBUG: AudioThread - SEEK: Existing stream aborted and closed.")
+                        logger.debug("DEBUG: AudioThread - SEEK: Existing stream aborted and closed.")
                     
                     with self.stream_lock:
                         self.audio_thread_current_frame = new_seek_frame
                         self.current_playback_frame_shared = new_seek_frame
                     
                     if gui_wants_to_continue_playing: 
-                        print("DEBUG: AudioThread - SEEK: Was playing, queueing internal PLAY cmd to restart.")
+                        logger.debug("DEBUG: AudioThread - SEEK: Was playing, queueing internal PLAY cmd to restart.")
                         with self.stream_lock: # Ensure desired state is Play before queueing PLAY
                             self.is_playing_desired_state = True 
                         self.audio_command_queue.put((CMD_PLAY, None)) 
@@ -323,11 +326,11 @@ class BeatViewerApp:
                             self.is_playing_desired_state = False
                         # GUI button text should be handled by _gui_on_slider_release if it wasn't playing
 
-                    print("DEBUG: AudioThread - SEEK processed.")
+                    logger.debug("DEBUG: AudioThread - SEEK processed.")
 
 
                 elif command == CMD_STOP_STREAM_FORCED: 
-                    print("DEBUG: AudioThread - Processing CMD_STOP_STREAM_FORCED")
+                    logger.debug("DEBUG: AudioThread - Processing CMD_STOP_STREAM_FORCED")
                     if current_managed_stream:
                         current_managed_stream.abort(ignore_errors=True)
                         current_managed_stream.close(ignore_errors=True)
@@ -339,7 +342,7 @@ class BeatViewerApp:
 
 
                 elif command == CMD_SHUTDOWN:
-                    print("DEBUG: AudioThread - Processing SHUTDOWN")
+                    logger.debug("DEBUG: AudioThread - Processing SHUTDOWN")
                     if current_managed_stream:
                         current_managed_stream.abort(ignore_errors=True)
                         current_managed_stream.close(ignore_errors=True)
@@ -355,12 +358,12 @@ class BeatViewerApp:
                     with self.stream_lock: is_desired_playing_now = self.is_playing_desired_state
                     
                     if not is_desired_playing_now and not current_managed_stream.closed : 
-                        print("DEBUG: AudioThread - Stream inactive, desired state not playing, closing stream.")
+                        logger.debug("DEBUG: AudioThread - Stream inactive, desired state not playing, closing stream.")
                         current_managed_stream.close(ignore_errors=True)
                         current_managed_stream = None 
                 continue
             except Exception as e:
-                print(f"ERROR in _audio_management_loop: {e}")
+                logger.error(f"ERROR in _audio_management_loop: {e}")
                 import traceback
                 traceback.print_exc()
                 if current_managed_stream:
@@ -371,17 +374,17 @@ class BeatViewerApp:
 
         with self.stream_lock: # Update the instance ref on thread exit
             self.playback_stream_obj = current_managed_stream # This thread's stream
-        print("DEBUG: AudioThread - Loop finished, thread ending.")
+        logger.debug("DEBUG: AudioThread - Loop finished, thread ending.")
 
     def _sd_callback(self, outdata, frames, time_info, status_obj):
         if status_obj:
-            if status_obj.output_underflow: print("Warning: AT_CB - Output underflow")
+            if status_obj.output_underflow: logger.warning("WARNING: AT_CB - Output underflow")
 
         with self.stream_lock: 
             if not self.is_playing_desired_state or self.audio_thread_data is None:
                 outdata[:] = 0
                 if not self.is_playing_desired_state and self.audio_thread_data is not None:
-                    # print("DEBUG: AT_CB - is_playing_desired_state is False. Raising CallbackStop.")
+                    # logger.debug("DEBUG: AT_CB - is_playing_desired_state is False. Raising CallbackStop.")
                     raise sd.CallbackStop 
                 return 
             
@@ -390,7 +393,7 @@ class BeatViewerApp:
 
             if remaining_frames_in_track <= 0: 
                 outdata[:] = 0
-                # print("DEBUG: AT_CB - End of track reached.")
+                # logger.debug("DEBUG: AT_CB - End of track reached.")
                 self.master.after(0, self._handle_stream_finished) 
                 raise sd.CallbackStop 
             
@@ -398,12 +401,12 @@ class BeatViewerApp:
             try:
                 if current_frame_for_chunk < 0 or \
                    (current_frame_for_chunk + valid_frames_to_play > self.audio_thread_total_samples):
-                     outdata[:] = 0; print(f"ERROR: AT_CB - Invalid frame range."); 
+                     outdata[:] = 0; logger.error(f"ERROR: AT_CB - Invalid frame range."); 
                      self.master.after(0, self._handle_stream_finished)
                      raise sd.CallbackStop
                 outdata[:valid_frames_to_play] = self.audio_thread_data[current_frame_for_chunk : current_frame_for_chunk + valid_frames_to_play].reshape(-1, 1)
             except Exception as e:
-                print(f"ERROR: AT_CB - Slicing error: {e}"); outdata[:] = 0; 
+                logger.error(f"ERROR: AT_CB - Slicing error: {e}"); outdata[:] = 0; 
                 self.master.after(0, self._handle_stream_finished)
                 raise sd.CallbackStop
             
@@ -414,7 +417,7 @@ class BeatViewerApp:
 
 
     def _handle_stream_finished(self): 
-        print("DEBUG: GUI - _handle_stream_finished called")
+        logger.debug("DEBUG: GUI - _handle_stream_finished called")
         
         was_seek_in_progress = False
         with self.stream_lock:
@@ -424,10 +427,10 @@ class BeatViewerApp:
             # Only change desired state to False if it wasn't a seek that intends to continue.
             # If it was a seek, the audio thread's CMD_PLAY will set is_playing_desired_state=True.
             if not was_seek_in_progress:
-                print("DEBUG: GUI - _handle_stream_finished: Not a seek, setting desired_state=False.")
+                logger.debug("DEBUG: GUI - _handle_stream_finished: Not a seek, setting desired_state=False.")
                 self.is_playing_desired_state = False
             else:
-                print("DEBUG: GUI - _handle_stream_finished: Seek was in progress. is_playing_desired_state not changed here.")
+                logger.debug("DEBUG: GUI - _handle_stream_finished: Seek was in progress. is_playing_desired_state not changed here.")
             
             # The audio thread is responsible for setting its current_managed_stream to None.
             # This callback just handles GUI side of stream finishing.
@@ -459,11 +462,11 @@ class BeatViewerApp:
             except tk.TclError: pass
             self._update_time_display(current_time_sec, self.total_duration_seconds_gui if self.audio_file_loaded else 0)
             self._update_beat_label(current_time_sec)
-        print("DEBUG: GUI - _handle_stream_finished finished")
+        logger.debug("DEBUG: GUI - _handle_stream_finished finished")
 
 
     def _schedule_display_update(self):
-        # print("DEBUG: GUI - _schedule_display_update called") # Can be very verbose
+        # logger.debug("DEBUG: GUI - _schedule_display_update called") # Can be very verbose
         is_playing_for_update = False
         with self.stream_lock: is_playing_for_update = self.is_playing_desired_state
         
@@ -523,31 +526,31 @@ class BeatViewerApp:
         except tk.TclError: pass
 
     def on_closing(self):
-        print("DEBUG: GUI - on_closing called")
+        logger.debug("DEBUG: GUI - on_closing called")
         self.audio_thread_stop_event.set() 
         self._send_audio_command(CMD_SHUTDOWN, None, "GUI - Sending SHUTDOWN to audio thread")
         
-        print("DEBUG: GUI - Waiting for audio thread to join...")
+        logger.debug("DEBUG: GUI - Waiting for audio thread to join...")
         self.audio_thread.join(timeout=2.0) 
         if self.audio_thread.is_alive():
-            print("WARNING: GUI - Audio thread did not join in time.")
+            logger.warning("WARNING: GUI - Audio thread did not join in time.")
             # If thread is stuck, self.playback_stream_obj might be the audio thread's last stream
             with self.stream_lock:
                 stream_to_kill = self.playback_stream_obj 
             if stream_to_kill:
                 try:
-                    print("WARNING: GUI - Forcing abort/close on lingering stream during unresponsive shutdown.")
+                    logger.warning("WARNING: GUI - Forcing abort/close on lingering stream during unresponsive shutdown.")
                     stream_to_kill.abort(ignore_errors=True)
                     stream_to_kill.close(ignore_errors=True)
                 except Exception as e_close:
-                    print(f"ERROR: GUI - Exception during forced stream close: {e_close}")
+                    logger.error(f"ERROR: GUI - Exception during forced stream close: {e_close}")
         
         if self.update_job_id: 
             if self.master.winfo_exists(): self.master.after_cancel(self.update_job_id)
         
         if self.master.winfo_exists():
             self.master.destroy()
-        print("DEBUG: GUI - on_closing finished")
+        logger.debug("DEBUG: GUI - on_closing finished")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive Beat Viewer for audio files.")
@@ -559,4 +562,4 @@ if __name__ == "__main__":
     app = BeatViewerApp(root, initial_filepath=args.filepath)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
-    print("DEBUG: Mainloop exited.")
+    logger.debug("DEBUG: Mainloop exited.")

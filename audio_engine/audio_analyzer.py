@@ -5,6 +5,8 @@ import json
 import essentia.standard as es
 import numpy as np
 import time # Keep for the test block
+import logging
+logger = logging.getLogger(__name__)
 
 # Assuming config.py is in the project root for the __main__ block.
 # The class itself receives config values via __init__.
@@ -20,9 +22,9 @@ class AudioAnalyzer:
         if not os.path.exists(self.cache_dir):
             try:
                 os.makedirs(self.cache_dir, exist_ok=True)
-                print(f"DEBUG: AudioAnalyzer - Created cache directory: {self.cache_dir}")
+                logger.debug(f"AudioAnalyzer - Created cache directory: {self.cache_dir}")
             except OSError as e:
-                print(f"ERROR: AudioAnalyzer - Could not create cache directory {self.cache_dir}: {e}")
+                logger.error(f"AudioAnalyzer - Could not create cache directory {self.cache_dir}: {e}")
 
     def _get_beats_cache_filepath(self, audio_filepath):
         """Generates a cache filepath for beat/bpm analysis data."""
@@ -42,27 +44,27 @@ class AudioAnalyzer:
         """Loads cue points from a .cue JSON file if it exists."""
         cue_filepath = self._get_cue_filepath(audio_filepath)
         if os.path.exists(cue_filepath):
-            print(f"DEBUG: AudioAnalyzer - Found cue file: {cue_filepath}")
+            logger.debug(f"AudioAnalyzer - Found cue file: {cue_filepath}")
             try:
                 with open(cue_filepath, 'r') as f:
                     cue_data = json.load(f)
                 if isinstance(cue_data, dict):
-                    print(f"DEBUG: AudioAnalyzer - Successfully loaded {len(cue_data)} cue points from {os.path.basename(cue_filepath)}.")
+                    logger.debug(f"AudioAnalyzer - Successfully loaded {len(cue_data)} cue points from {os.path.basename(cue_filepath)}.")
                     return cue_data
                 else:
-                    print(f"WARNING: AudioAnalyzer - Cue file {cue_filepath} does not contain a valid JSON object (dictionary).")
+                    logger.warning(f"AudioAnalyzer - Cue file {cue_filepath} does not contain a valid JSON object (dictionary).")
             except json.JSONDecodeError:
-                print(f"ERROR: AudioAnalyzer - Error decoding JSON from cue file: {cue_filepath}")
+                logger.error(f"AudioAnalyzer - Error decoding JSON from cue file: {cue_filepath}")
             except Exception as e:
-                print(f"ERROR: AudioAnalyzer - Could not load or parse cue file {cue_filepath}: {e}")
+                logger.error(f"AudioAnalyzer - Could not load or parse cue file {cue_filepath}: {e}")
         else:
-            print(f"DEBUG: AudioAnalyzer - No cue file found at: {cue_filepath}")
+            logger.debug(f"AudioAnalyzer - No cue file found at: {cue_filepath}")
         return {} 
 
     def analyze_track(self, audio_filepath):
-        print(f"DEBUG: AudioAnalyzer - Analyzing track: {audio_filepath}")
+        logger.debug(f"AudioAnalyzer - Analyzing track: {audio_filepath}")
         if not os.path.exists(audio_filepath):
-            print(f"ERROR: AudioAnalyzer - Audio file not found: {audio_filepath}")
+            logger.error(f"AudioAnalyzer - Audio file not found: {audio_filepath}")
             return None
             
         beats_cache_filepath = self._get_beats_cache_filepath(audio_filepath)
@@ -70,39 +72,39 @@ class AudioAnalyzer:
 
         # 1. Check beats/bpm cache first
         if os.path.exists(beats_cache_filepath):
-            print(f"DEBUG: AudioAnalyzer - Attempting to load analysis from beats cache: {beats_cache_filepath}")
+            logger.debug(f"AudioAnalyzer - Attempting to load analysis from beats cache: {beats_cache_filepath}")
             try:
                 with open(beats_cache_filepath, 'r') as f:
                     analysis_data = json.load(f)
                 if not all(k in analysis_data for k in ['beat_timestamps', 'bpm', 'sample_rate', 'file_path_original_for_beats']):
-                    print(f"WARNING: AudioAnalyzer - Beats cache file {beats_cache_filepath} is missing keys. Re-analyzing.")
+                    logger.warning(f"AudioAnalyzer - Beats cache file {beats_cache_filepath} is missing keys. Re-analyzing.")
                     analysis_data = None 
                 else:
-                    print(f"DEBUG: AudioAnalyzer - Loaded from beats cache: BPM {analysis_data.get('bpm')}, Beats: {len(analysis_data.get('beat_timestamps', []))}")
+                    logger.debug(f"AudioAnalyzer - Loaded from beats cache: BPM {analysis_data.get('bpm')}, Beats: {len(analysis_data.get('beat_timestamps', []))}")
             except Exception as e:
-                print(f"ERROR: AudioAnalyzer - Could not load/parse beats cache {beats_cache_filepath}: {e}. Re-analyzing.")
+                logger.error(f"AudioAnalyzer - Could not load/parse beats cache {beats_cache_filepath}: {e}. Re-analyzing.")
                 analysis_data = None
         
         if analysis_data is None: 
-            print(f"DEBUG: AudioAnalyzer - No valid beats cache for {os.path.basename(audio_filepath)}. Performing new beat/bpm analysis.")
+            logger.debug(f"AudioAnalyzer - No valid beats cache for {os.path.basename(audio_filepath)}. Performing new beat/bpm analysis.")
             try:
-                print("DEBUG: AudioAnalyzer - Loading audio with Essentia's MonoLoader...")
+                logger.debug("AudioAnalyzer - Loading audio with Essentia's MonoLoader...")
                 loader = es.MonoLoader(filename=audio_filepath)
                 audio = loader()
                 sample_rate = int(loader.paramValue('sampleRate'))
 
-                if sample_rate == 0: print("ERROR: AudioAnalyzer - Sample rate is 0."); return None
-                if len(audio) == 0: print("ERROR: AudioAnalyzer - Audio data empty."); return None
+                if sample_rate == 0: logger.error("AudioAnalyzer - Sample rate is 0."); return None
+                if len(audio) == 0: logger.error("AudioAnalyzer - Audio data empty."); return None
                 
-                print(f"DEBUG: AudioAnalyzer - Audio loaded. SR: {sample_rate}, Duration: {len(audio)/sample_rate:.2f}s")
+                logger.debug(f"AudioAnalyzer - Audio loaded. SR: {sample_rate}, Duration: {len(audio)/sample_rate:.2f}s")
 
-                print(f"DEBUG: AudioAnalyzer - Performing beat detection ({self.beat_tracker_algo_name})...")
+                logger.debug(f"AudioAnalyzer - Performing beat detection ({self.beat_tracker_algo_name})...")
                 beat_tracker_class = getattr(es, self.beat_tracker_algo_name)
                 beat_tracker = beat_tracker_class()
                 beat_timestamps_essentia = beat_tracker(audio)
-                print(f"DEBUG: AudioAnalyzer - Beats: {len(beat_timestamps_essentia)}.")
+                logger.debug(f"AudioAnalyzer - Beats: {len(beat_timestamps_essentia)}.")
 
-                print(f"DEBUG: AudioAnalyzer - Performing BPM estimation ({self.bpm_estimator_algo_name})...")
+                logger.debug(f"AudioAnalyzer - Performing BPM estimation ({self.bpm_estimator_algo_name})...")
                 bpm_estimator_class = getattr(es, self.bpm_estimator_algo_name)
                 bpm_estimator = bpm_estimator_class()
                 
@@ -115,7 +117,7 @@ class AudioAnalyzer:
                 else: 
                     bpm_result = bpm_estimator(audio)
                     bpm = float(bpm_result[0] if isinstance(bpm_result, (tuple, list, np.ndarray)) and len(bpm_result)>0 else bpm_result)
-                print(f"DEBUG: AudioAnalyzer - BPM: {bpm:.2f}")
+                logger.debug(f"AudioAnalyzer - BPM: {bpm:.2f}")
 
                 analysis_data = {
                     'file_path_original_for_beats': audio_filepath, 
@@ -125,14 +127,14 @@ class AudioAnalyzer:
                 }
                 try:
                     if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir, exist_ok=True)
-                    print(f"DEBUG: AudioAnalyzer - Saving analysis to beats cache: {beats_cache_filepath}")
+                    logger.debug(f"AudioAnalyzer - Saving analysis to beats cache: {beats_cache_filepath}")
                     with open(beats_cache_filepath, 'w') as f:
                         json.dump(analysis_data, f, indent=4)
-                    print("DEBUG: AudioAnalyzer - Beats cache saved.")
+                    logger.debug("AudioAnalyzer - Beats cache saved.")
                 except Exception as e:
-                    print(f"ERROR: AudioAnalyzer - Could not save beats cache {beats_cache_filepath}: {e}")
+                    logger.error(f"AudioAnalyzer - Could not save beats cache {beats_cache_filepath}: {e}")
             except Exception as e:
-                print(f"ERROR: AudioAnalyzer - Essentia analysis failed for {audio_filepath}: {e}")
+                logger.error(f"AudioAnalyzer - Essentia analysis failed for {audio_filepath}: {e}")
                 import traceback
                 traceback.print_exc() 
                 return None
@@ -145,7 +147,7 @@ class AudioAnalyzer:
         return analysis_data
 
 if __name__ == '__main__':
-    print("--- Running AudioAnalyzer Standalone Test (with Cue Point Loading) ---")
+    logger.info("--- Running AudioAnalyzer Standalone Test (with Cue Point Loading) ---")
     import sys
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(CURRENT_DIR) 
@@ -155,7 +157,7 @@ if __name__ == '__main__':
     try:
         import config as app_config
     except ImportError:
-        print("ERROR: Could not import config.py. Make sure it's in the project root.")
+        logger.error("Could not import config.py. Make sure it's in the project root.")
         sys.exit(1)
 
     app_config.ensure_dir_exists(app_config.BEATS_CACHE_DIR)
@@ -185,24 +187,24 @@ if __name__ == '__main__':
     try:
         with open(dummy_cue_filepath, 'w') as f:
             json.dump(dummy_cue_data, f, indent=4)
-        print(f"DEBUG: Test - Created dummy cue file: {dummy_cue_filepath}")
+        logger.debug(f"Test - Created dummy cue file: {dummy_cue_filepath}")
     except Exception as e:
-        print(f"ERROR: Test - Could not create dummy cue file {dummy_cue_filepath}: {e}")
+        logger.error(f"Test - Could not create dummy cue file {dummy_cue_filepath}: {e}")
 
     if not os.path.exists(test_audio_path):
-        print(f"WARNING: Test audio file {test_audio_path} not found.")
+        logger.warning(f"Test audio file {test_audio_path} not found.")
     else:
-        print(f"\n--- Analyzing: {test_audio_path} (will try to load its .cue file) ---")
+        logger.info(f"\n--- Analyzing: {test_audio_path} (will try to load its .cue file) ---")
         analysis_result = analyzer.analyze_track(test_audio_path)
         if analysis_result:
-            print("\n--- Analysis Result ---")
-            print(f"File Path: {analysis_result.get('file_path')}")
-            print(f"Sample Rate: {analysis_result.get('sample_rate')}")
-            print(f"BPM: {analysis_result.get('bpm')}")
-            print(f"Beat Timestamps (first 5): {analysis_result.get('beat_timestamps', [])[:5]}")
-            print(f"Cue Points Loaded: {json.dumps(analysis_result.get('cue_points'), indent=2)}")
+            logger.info("--- Analysis Result ---")
+            logger.info(f"File Path: {analysis_result.get('file_path')}")
+            logger.info(f"Sample Rate: {analysis_result.get('sample_rate')}")
+            logger.info(f"BPM: {analysis_result.get('bpm')}")
+            logger.info(f"Beat Timestamps (first 5): {analysis_result.get('beat_timestamps', [])[:5]}")
+            logger.info(f"Cue Points Loaded: {json.dumps(analysis_result.get('cue_points'), indent=2)}")
         else:
-            print("Analysis failed.")
+            logger.error("Analysis failed.")
 
         # Clean up dummy cue file if you want
         if os.path.exists(dummy_cue_filepath):

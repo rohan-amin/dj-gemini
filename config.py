@@ -1,6 +1,8 @@
 # dj-gemini/config.py
 
 import os
+import logging
+logger = logging.getLogger(__name__)
 
 # --- Project Root Directory ---
 # This assumes config.py is in the project's root directory (e.g., dj-gemini/)
@@ -40,11 +42,11 @@ def ensure_dir_exists(dir_path):
     if not os.path.exists(dir_path):
         try:
             os.makedirs(dir_path, exist_ok=True) 
-            print(f"CONFIG: Created directory: {dir_path}")
+            logger.info(f"CONFIG: Created directory: {dir_path}")
         except OSError as e:
-            print(f"ERROR: CONFIG - Could not create directory {dir_path}: {e}")
+            logger.error(f"CONFIG - Could not create directory {dir_path}: {e}")
     # else:
-    #     print(f"DEBUG: CONFIG - Directory already exists: {dir_path}")
+    #     logger.debug(f"DEBUG: CONFIG - Directory already exists: {dir_path}")
 
 # --- Optional: Automatically ensure critical directories exist upon import ---
 # print("DEBUG: CONFIG - Ensuring critical directories exist...")
@@ -55,14 +57,14 @@ def ensure_dir_exists(dir_path):
 # print("DEBUG: CONFIG - Directory check complete.")
 
 if __name__ == '__main__':
-    print(f"Project Root Directory: {PROJECT_ROOT_DIR}")
-    print(f"Audio Tracks Directory: {AUDIO_TRACKS_DIR}")
-    print(f"Mix Configs Directory: {MIX_CONFIGS_DIR}")
-    print(f"Analysis Data Directory: {ANALYSIS_DATA_DIR}")
-    print(f"Beats Cache Directory: {BEATS_CACHE_DIR} (Files will use {BEATS_CACHE_FILE_EXTENSION})")
-    print(f"Utilities Directory: {UTILITIES_DIR}")
+    logger.info(f"Project Root Directory: {PROJECT_ROOT_DIR}")
+    logger.info(f"Audio Tracks Directory: {AUDIO_TRACKS_DIR}")
+    logger.info(f"Mix Configs Directory: {MIX_CONFIGS_DIR}")
+    logger.info(f"Analysis Data Directory: {ANALYSIS_DATA_DIR}")
+    logger.info(f"Beats Cache Directory: {BEATS_CACHE_DIR} (Files will use {BEATS_CACHE_FILE_EXTENSION})")
+    logger.info(f"Utilities Directory: {UTILITIES_DIR}")
 
-    print("\nEnsuring directories exist (example calls):")
+    logger.info("\nEnsuring directories exist (example calls):")
     ensure_dir_exists(AUDIO_TRACKS_DIR)
     ensure_dir_exists(MIX_CONFIGS_DIR)
     ensure_dir_exists(BEATS_CACHE_DIR)
