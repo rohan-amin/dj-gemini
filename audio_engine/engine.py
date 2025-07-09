@@ -78,14 +78,19 @@ class AudioEngine:
             if not source_deck_id_val or not isinstance(beat_number_val, (int, float)):
                 print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
                 return False
+        elif trigger_type == "on_loop_complete":
+            source_deck_id_val = trigger.get("source_deck_id")
+            if not source_deck_id_val:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' ('{source_deck_id_val}').")
+                return False
         elif trigger_type == "script_start":
             pass 
         else:
-            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
+            print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo"]
-        engine_level_commands = [] 
+        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "ramp_tempo"]
+        engine_level_commands = ["crossfade", "beatmatch"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
             print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Command '{command}' is missing 'deck_id'.")
@@ -117,6 +122,95 @@ class AudioEngine:
                     return False
             except (ValueError, TypeError):
                 print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_bpm' not a valid number. Params: {params}")
+                return False
+        elif command == "set_volume":
+            params = action.get("parameters", {})
+            if params.get("volume") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_volume' missing 'volume' in parameters. Params: {params}")
+                return False
+            try:
+                volume = float(params["volume"])
+                if volume < 0.0 or volume > 1.0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' must be between 0.0 and 1.0. Value: {volume}")
+                    return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' not a valid number. Params: {params}")
+                return False
+        elif command == "fade_volume":
+            params = action.get("parameters", {})
+            if params.get("target_volume") is None or params.get("duration_seconds") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' missing 'target_volume' or 'duration_seconds' in parameters. Params: {params}")
+                return False
+            try:
+                target_volume = float(params["target_volume"])
+                duration_seconds = float(params["duration_seconds"])
+                if target_volume < 0.0 or target_volume > 1.0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_volume' must be between 0.0 and 1.0. Value: {target_volume}")
+                    return False
+                if duration_seconds < 0.0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
+                    return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' parameters not valid numbers. Params: {params}")
+                return False
+        elif command == "crossfade":
+            params = action.get("parameters", {})
+            if params.get("from_deck") is None or params.get("to_deck") is None or params.get("duration_seconds") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' missing required parameters. Params: {params}")
+                return False
+            try:
+                duration_seconds = float(params["duration_seconds"])
+                if duration_seconds < 0.0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration_seconds}")
+                    return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' duration not a valid number. Params: {params}")
+                return False
+        elif command == "beatmatch":
+            params = action.get("parameters", {})
+            if params.get("reference_deck") is None or params.get("follow_deck") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'beatmatch' missing 'reference_deck' or 'follow_deck' in parameters. Params: {params}")
+                return False
+            sync_method = params.get("sync_method", "auto")
+            if sync_method not in ["auto", "manual", "grid"]:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'sync_method' must be 'auto', 'manual', or 'grid'. Value: {sync_method}")
+                return False
+            if sync_method == "manual" and params.get("target_beat") is None:
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'manual' sync_method requires 'target_beat' parameter. Params: {params}")
+                return False
+            try:
+                if sync_method == "manual" and params.get("target_beat") is not None:
+                    target_beat = float(params["target_beat"])
+                    if target_beat <= 0:
+                        print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' must be positive. Value: {target_beat}")
+                        return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' not a valid number. Params: {params}")
+                return False
+        elif command == "ramp_tempo":
+            params = action.get("parameters", {})
+            if (params.get("start_beat") is None or params.get("end_beat") is None or 
+                params.get("start_bpm") is None or params.get("end_bpm") is None):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' missing required parameters. Params: {params}")
+                return False
+            try:
+                start_beat = float(params["start_beat"])
+                end_beat = float(params["end_beat"])
+                start_bpm = float(params["start_bpm"])
+                end_bpm = float(params["end_bpm"])
+                curve = params.get("curve", "linear")
+                
+                if start_beat >= end_beat:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_beat' must be less than 'end_beat'. Values: {start_beat}, {end_beat}")
+                    return False
+                if start_bpm <= 0 or end_bpm <= 0:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): BPM values must be positive. Values: {start_bpm}, {end_bpm}")
+                    return False
+                if curve not in ["linear", "exponential", "smooth", "step"]:
+                    print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'curve' must be 'linear', 'exponential', 'smooth', or 'step'. Value: {curve}")
+                    return False
+            except (ValueError, TypeError):
+                print(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'ramp_tempo' parameters not valid numbers. Params: {params}")
                 return False
         # print(f"DEBUG: Validation OK for action {action_index+1} (ID: {action_id_for_log})")
         return True
@@ -235,6 +329,27 @@ class AudioEngine:
                 time.sleep(ENGINE_TICK_INTERVAL)
                 continue
 
+            # Check for on_loop_complete triggers
+            for deck_id, deck in self.decks.items():
+                if hasattr(deck, '_loop_just_completed') and deck._loop_just_completed:
+                    completed_action_id = getattr(deck, '_completed_loop_action_id', None)
+                    # Loop just completed all repetitions
+                    for action in self._pending_on_beat_actions[:]:
+                        trigger = action.get("trigger", {})
+                        if (trigger.get("type") == "on_loop_complete" and 
+                            trigger.get("source_deck_id") == deck_id):
+                            
+                            # Check if we need a specific loop action ID
+                            required_action_id = trigger.get("loop_action_id")
+                            if required_action_id is None or required_action_id == completed_action_id:
+                                print(f"DEBUG: AudioEngine - Trigger MET: on_loop_complete for action '{action.get('id')}' (loop: {completed_action_id})")
+                                self._pending_on_beat_actions.remove(action)
+                                self._execute_action(action)
+                    
+                    # Reset the flag
+                    deck._loop_just_completed = False
+                    deck._completed_loop_action_id = None
+
             actions_executed_this_tick = []
             next_round_pending_actions = [] 
 
@@ -268,6 +383,21 @@ class AudioEngine:
                              print(f"ERROR: AudioEngine - Error checking beat count for deck {source_deck_id} (action '{action_id_for_log}'): {e_beat_check}")
                     else:
                         print(f"WARNING: AudioEngine - Invalid trigger data for on_deck_beat action '{action_id_for_log}': Deck={source_deck_id}, BeatNum={target_beat_str}")
+                elif trigger_type == "on_loop_complete":
+                    source_deck_id = trigger.get("source_deck_id")
+                    loop_action_id = trigger.get("loop_action_id")  # Optional: specific loop action ID
+                    deck = self.decks.get(source_deck_id)
+                    
+                    if deck and hasattr(deck, '_loop_just_completed') and deck._loop_just_completed:
+                        completed_action_id = getattr(deck, '_completed_loop_action_id', None)
+                        
+                        # Check if we need a specific loop action ID
+                        if loop_action_id is None or loop_action_id == completed_action_id:
+                            print(f"DEBUG: AudioEngine - Trigger MET: on_loop_complete for action '{action_id_for_log}' (loop: {completed_action_id})")
+                            triggered_this_tick = True
+                            # Reset the flag
+                            deck._loop_just_completed = False
+                            deck._completed_loop_action_id = None
                 else: 
                     print(f"WARNING: AudioEngine - Action '{action_id_for_log}' in _pending_on_beat_actions has unexpected trigger type: '{trigger_type}'. Removing.")
                     triggered_this_tick = True 
@@ -383,10 +513,11 @@ class AudioEngine:
                         return
                         
                     deck = self._get_or_create_deck(deck_id)
-                    # Call Deck method with correct keyword arguments matching its definition
+                    # Pass the action ID to the deck
                     deck.activate_loop(start_beat=start_beat_val, 
                                        length_beats=length_beats_val, 
-                                       repetitions=repetitions_val)
+                                       repetitions=repetitions_val,
+                                       action_id=action_dict.get('id'))
                 except ValueError: 
                     print(f"WARNING: AudioEngine - Invalid numeric values for loop parameters: start_beat='{start_beat_from_json}', length_beats='{length_beats_from_json}'. Skipping.")
 
@@ -396,15 +527,106 @@ class AudioEngine:
                 deck.deactivate_loop()
             
             elif command == "set_tempo":
-                deck = self.decks.get(deck_id)
-                if not deck:
-                    print(f"ERROR: AudioEngine - Deck '{deck_id}' not found for set_tempo command.")
-                    return
-                target_bpm = parameters.get("target_bpm")
-                if target_bpm is None:
-                    print(f"ERROR: AudioEngine - set_tempo command missing 'target_bpm' parameter.")
-                    return
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                target_bpm = float(action_dict.get("parameters", {}).get("target_bpm"))
                 deck.set_tempo(target_bpm)
+            
+            elif command == "set_volume":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                volume = float(action_dict.get("parameters", {}).get("volume"))
+                deck.set_volume(volume)
+            
+            elif command == "fade_volume":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                target_volume = float(params.get("target_volume"))
+                duration_seconds = float(params.get("duration_seconds"))
+                deck.fade_volume(target_volume, duration_seconds)
+            
+            elif command == "crossfade":
+                params = action_dict.get("parameters", {})
+                from_deck_id = params.get("from_deck")
+                to_deck_id = params.get("to_deck")
+                duration_seconds = float(params.get("duration_seconds"))
+                
+                from_deck = self._get_or_create_deck(from_deck_id)
+                to_deck = self._get_or_create_deck(to_deck_id)
+                
+                # Start crossfade
+                from_deck.fade_volume(0.0, duration_seconds)
+                to_deck.fade_volume(1.0, duration_seconds)
+                
+                print(f"DEBUG: AudioEngine - Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s")
+            
+            elif command == "beatmatch":
+                params = action_dict.get("parameters", {})
+                reference_deck_id = params.get("reference_deck")
+                follow_deck_id = params.get("follow_deck")
+                sync_method = params.get("sync_method", "auto")
+                target_beat = params.get("target_beat", None)
+                
+                reference_deck = self._get_or_create_deck(reference_deck_id)
+                follow_deck = self._get_or_create_deck(follow_deck_id)
+                
+                reference_bpm = reference_deck.bpm
+                follow_bpm = follow_deck.bpm
+                
+                print(f"DEBUG: AudioEngine - Beatmatching {follow_deck_id} to reference {reference_deck_id}")
+                print(f"DEBUG: AudioEngine - Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
+                
+                if reference_bpm <= 0 or follow_bpm <= 0:
+                    print(f"ERROR: AudioEngine - Invalid BPM for beatmatching")
+                    return
+                
+                # Step 1: Match tempo
+                tempo_ratio = reference_bpm / follow_bpm
+                follow_deck.set_tempo(reference_bpm)
+                print(f"DEBUG: AudioEngine - Tempo matched: ratio {tempo_ratio:.3f}")
+                
+                # Step 2: Phase alignment
+                if sync_method == "auto":
+                    reference_beat = reference_deck.get_current_beat_count()
+                    follow_beat = follow_deck.get_current_beat_count()
+                    beat_difference = reference_beat - follow_beat
+                    
+                    if abs(beat_difference) > 0.5:
+                        frames_per_beat = (60.0 / reference_bpm) * follow_deck.sample_rate
+                        offset_frames = int(beat_difference * frames_per_beat)
+                        new_frame = follow_deck.get_current_display_frame() + offset_frames
+                        
+                        if 0 <= new_frame < follow_deck.total_frames:
+                            follow_deck.seek(new_frame)
+                            print(f"DEBUG: AudioEngine - Auto-aligned: offset {beat_difference:.1f} beats")
+                
+                elif sync_method == "manual" and target_beat is not None:
+                    target_frame = follow_deck.get_frame_from_beat(int(target_beat))
+                    if target_frame is not None:
+                        follow_deck.seek(target_frame)
+                        print(f"DEBUG: AudioEngine - Manual alignment to beat {target_beat}")
+                
+                elif sync_method == "grid":
+                    current_beat = follow_deck.get_current_beat_count()
+                    grid_beat = ((current_beat - 1) // 4) * 4 + 1
+                    grid_frame = follow_deck.get_frame_from_beat(grid_beat)
+                    if grid_frame is not None:
+                        follow_deck.seek(grid_frame)
+                        print(f"DEBUG: AudioEngine - Grid alignment to beat {grid_beat}")
+                
+                print(f"DEBUG: AudioEngine - Beatmatch complete: {follow_deck_id} synchronized")
+            
+            elif command == "ramp_tempo":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                start_beat = float(params.get("start_beat"))
+                end_beat = float(params.get("end_beat"))
+                start_bpm = float(params.get("start_bpm"))
+                end_bpm = float(params.get("end_bpm"))
+                curve = params.get("curve", "linear")
+                deck.ramp_tempo(start_beat, end_beat, start_bpm, end_bpm, curve)
             
             else: print(f"WARNING: AudioEngine - Unknown command '{command}'. Skipping.")
         except Exception as e_action:

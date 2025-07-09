@@ -7,8 +7,10 @@ An automated DJ mixing system that creates synchronized audio performances using
 - **Beat-accurate timing** - All actions synchronized to detected beats
 - **Multi-deck mixing** - Manage multiple audio tracks simultaneously
 - **Professional tempo control** - Pitch-preserving tempo changes using Rubber Band
+- **Tempo ramping** - Smooth BPM transitions over specified beat ranges
 - **Loop system** - Create precise beat-synchronized loops with repetitions
 - **Stop at beat** - Clean stopping at specific beat positions
+- **Volume control** - Per-deck volume adjustment and crossfading
 - **Cue point support** - Use predefined cue points in audio files
 - **JSON-based scripting** - Define complex mix sequences in JSON format
 - **Real-time monitoring** - Track deck status and script execution progress
@@ -83,37 +85,53 @@ Create a JSON file in the `mix_configs/` directory:
       "parameters": {"file_path": "song1.mp3"}
     },
     {
-      "id": "set_tempo",
-      "command": "set_tempo",
-      "deck_id": "deckA",
-      "parameters": {"target_bpm": 140}
-    },
-    {
       "id": "play_song1",
       "command": "play",
       "deck_id": "deckA",
       "parameters": {"start_at_beat": 1}
     },
     {
-      "id": "loop_at_beat_32",
+      "id": "start_ramp",
+      "command": "ramp_tempo",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 64
+      },
+      "parameters": {
+        "start_beat": 64,
+        "end_beat": 96,
+        "start_bpm": 128,
+        "end_bpm": 135,
+        "curve": "linear"
+      }
+    },
+    {
+      "id": "trigger_during_ramp",
       "command": "activate_loop",
       "deck_id": "deckA",
       "trigger": {
         "type": "on_deck_beat",
         "source_deck_id": "deckA",
-        "beat_number": 32
+        "beat_number": 80
       },
       "parameters": {
-        "start_at_beat": 32,
-        "length_beats": 8,
+        "start_at_beat": 80,
+        "length_beats": 4,
         "repetitions": 3
       }
     },
     {
-      "id": "stop_at_beat_64",
-      "command": "stop_at_beat",
+      "id": "trigger_after_ramp",
+      "command": "set_volume",
       "deck_id": "deckA",
-      "parameters": {"beat_number": 64}
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 96
+      },
+      "parameters": {"volume": 0.3}
     }
   ]
 }
@@ -188,6 +206,67 @@ Change playback tempo with pitch preservation.
 - Beat positions, cue points, and loops scale correctly
 - Works with both faster and slower tempo changes
 
+#### `ramp_tempo`
+Smoothly transition BPM over a specified beat range.
+```json
+{
+  "command": "ramp_tempo",
+  "deck_id": "deckA",
+  "parameters": {
+    "start_beat": 64,
+    "end_beat": 96,
+    "start_bpm": 128,
+    "end_bpm": 135,
+    "curve": "linear"
+  }
+}
+```
+
+**Features:**
+- Smooth BPM transitions from start_beat to end_beat
+- Audio speed changes in real-time to match BPM
+- Supports linear and exponential curves
+- Triggers and loops work correctly during ramps
+- Beat positions remain accurate throughout the ramp
+
+### Volume Control
+
+#### `set_volume`
+Set deck volume (0.0 to 1.0).
+```json
+{
+  "command": "set_volume",
+  "deck_id": "deckA",
+  "parameters": {"volume": 0.8}
+}
+```
+
+#### `fade_volume`
+Fade volume over a specified duration.
+```json
+{
+  "command": "fade_volume",
+  "deck_id": "deckA",
+  "parameters": {
+    "target_volume": 0.0,
+    "duration_beats": 8
+  }
+}
+```
+
+#### `crossfade`
+Crossfade between two decks.
+```json
+{
+  "command": "crossfade",
+  "deck_id": "deckA",
+  "parameters": {
+    "target_deck": "deckB",
+    "duration_beats": 4
+  }
+}
+```
+
 ### Loop System
 
 #### `activate_loop`
@@ -218,6 +297,7 @@ Create a beat-synchronized loop.
 - Multiple loops are queued sequentially
 - No race conditions between overlapping loops
 - Each loop completes all repetitions before the next activates
+- Works correctly during tempo ramps
 
 #### `deactivate_loop`
 Stop the current loop and continue normal playback.
@@ -286,6 +366,69 @@ Then use them in play commands:
 
 ## Advanced Usage
 
+### Tempo Ramping with Loops
+```json
+{
+  "actions": [
+    {
+      "id": "load_track",
+      "command": "load_track",
+      "deck_id": "deckA",
+      "parameters": {"file_path": "song.mp3"}
+    },
+    {
+      "id": "play",
+      "command": "play",
+      "deck_id": "deckA",
+      "parameters": {"start_at_beat": 1}
+    },
+    {
+      "id": "start_ramp",
+      "command": "ramp_tempo",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 64
+      },
+      "parameters": {
+        "start_beat": 64,
+        "end_beat": 96,
+        "start_bpm": 128,
+        "end_bpm": 135,
+        "curve": "linear"
+      }
+    },
+    {
+      "id": "loop_during_ramp",
+      "command": "activate_loop",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 80
+      },
+      "parameters": {
+        "start_at_beat": 80,
+        "length_beats": 4,
+        "repetitions": 3
+      }
+    },
+    {
+      "id": "volume_after_ramp",
+      "command": "set_volume",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 96
+      },
+      "parameters": {"volume": 0.3}
+    }
+  ]
+}
+```
+
 ### Multiple Decks
 ```json
 {
@@ -351,45 +494,6 @@ Then use them in play commands:
 }
 ```
 
-### Tempo Changes with Loops
-```json
-{
-  "actions": [
-    {
-      "id": "load_track",
-      "command": "load_track",
-      "deck_id": "deckA",
-      "parameters": {"file_path": "song.mp3"}
-    },
-    {
-      "id": "set_tempo_faster",
-      "command": "set_tempo",
-      "deck_id": "deckA",
-      "parameters": {"target_bpm": 140}
-    },
-    {
-      "id": "play",
-      "command": "play",
-      "deck_id": "deckA",
-      "parameters": {"start_at_beat": 100}
-    },
-    {
-      "id": "loop_at_beat_108",
-      "command": "activate_loop",
-      "deck_id": "deckA",
-      "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 108},
-      "parameters": {"start_at_beat": 108, "length_beats": 4, "repetitions": 3}
-    },
-    {
-      "id": "stop_at_beat_120",
-      "command": "stop_at_beat",
-      "deck_id": "deckA",
-      "parameters": {"beat_number": 120}
-    }
-  ]
-}
-```
-
 ## Troubleshooting
 
 ### Common Issues
@@ -413,6 +517,11 @@ Then use them in play commands:
 5. **Tempo change issues**
    - Ensure Rubber Band is properly installed
    - Check that target BPM is reasonable (e.g., 80-200 BPM)
+
+6. **Tempo ramp issues**
+   - Ensure start_bpm and end_bpm are reasonable values
+   - Check that start_beat < end_beat
+   - Verify that ramp duration is sufficient for smooth transitions
 
 ### Debug Mode
 
@@ -446,41 +555,3 @@ python main.py mix_configs/my_mix.json --max_wait_after_script 3600
 - **Audio**: Working audio output device
 - **Memory**: 2GB+ RAM recommended for large audio files
 - **Storage**: Additional space for audio caching (varies by usage)
-
-## Recent Changes
-
-### v2.0 - Professional Tempo Control
-- **Added Rubber Band integration** for pitch-preserving tempo changes
-- **Implemented audio caching** for instant tempo changes
-- **Fixed beat position scaling** for accurate timing at all tempos
-- **Enhanced loop system** with queue-based execution
-- **Added comprehensive tempo change support** for both faster and slower BPM
-- **Improved race condition handling** in loop system
-
-### v1.0 - Core Features
-- Beat-accurate timing system
-- Multi-deck mixing capabilities
-- Loop system with repetitions
-- Stop at beat functionality
-- Cue point support
-- JSON-based scripting
-
-## License
-
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-### Dependencies
-- **essentia**: GPL v3 (https://github.com/MTG/essentia)
-- **numpy**: BSD-3-Clause (https://numpy.org/)
-- **sounddevice**: MIT (https://python-sounddevice.readthedocs.io/)
-- **pyrubberband**: GPL v3 (https://github.com/bmcfee/pyrubberband)
-- **librosa**: ISC License (https://librosa.org/)
-- **tqdm**: MIT (https://tqdm.github.io/)
-- **Python**: PSF License (https://www.python.org/)
-
-### License Compliance
-This project uses essentia and pyrubberband which are licensed under GPL v3. As a derivative work, this project is also licensed under GPL v3 to ensure compliance and maintain open source principles.
-
-## Contributing
-
-[Add contribution guidelines here]
