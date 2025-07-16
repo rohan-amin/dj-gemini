@@ -98,9 +98,12 @@ class Deck:
         # Add to Deck class initialization
         self._tempo_cache = {}  # Cache processed audio for different tempos
 
-        # Phase offset storage for beatmatch
+        # Phase offset storage for bpm_match
         self._pending_phase_offset_beats = 0.0
         self._phase_offset_applied = False
+
+        self.enable_hard_seek_on_loop = True  # PATCH: Toggle for hard seek buffer zeroing on loop activation
+        self._just_activated_loop_flush_count = 0  # PATCH: For double-flush after loop activation
 
         self.audio_thread.start()
         logger.debug(f"Deck {self.deck_id} - Initialized and audio thread started.")
@@ -163,49 +166,34 @@ class Deck:
             self._current_playback_frame_for_display = 0 
             self._user_wants_to_play = False 
             self._loop_active = False 
-        logger.debug(f"Deck {self.deck_id} - Track '{os.path.basename(audio_filepath)}' data sent to audio thread. BPM: {self.bpm:.2f}")
+        logger.info(f"Deck {self.deck_id} - Track '{os.path.basename(audio_filepath)}' data sent to audio thread. BPM: {self.bpm:.2f}")
         return True
 
     def get_frame_from_beat(self, beat_number):
         """Get frame number for a specific (possibly fractional) beat, accounting for ramp adjustments"""
-        # If beat_number is integer and exists, use direct lookup
-        if isinstance(beat_number, float) and not beat_number.is_integer():
-            lower_beat = int(np.floor(beat_number))
-            upper_beat = int(np.ceil(beat_number))
-            # Clamp to valid range
-            lower_beat = max(1, lower_beat)
-            upper_beat = max(1, upper_beat)
-            # If both beats exist, interpolate
-            if lower_beat in self.original_beat_positions and upper_beat in self.original_beat_positions:
-                lower_frame = self.original_beat_positions[lower_beat]
-                upper_frame = self.original_beat_positions[upper_beat]
-                frac = beat_number - lower_beat
-                interp_frame = int(lower_frame + frac * (upper_frame - lower_frame))
-                # If in tempo ramp, scale
-                if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
-                    interp_frame = int(interp_frame / self._current_tempo_ratio)
-                return interp_frame
-            # Fallback: use nearest
-            elif lower_beat in self.original_beat_positions:
-                return self.original_beat_positions[lower_beat]
-            elif upper_beat in self.original_beat_positions:
-                return self.original_beat_positions[upper_beat]
+        beat_int = int(beat_number)
+        beat_frac = beat_number - beat_int
+        
+        # Check if we have the integer beat position
+        if beat_int in self.original_beat_positions:
+            original_frame = self.original_beat_positions[beat_int]
+            
+            # If we have fractional beats and the next beat exists, interpolate
+            if beat_frac > 0 and (beat_int + 1) in self.original_beat_positions:
+                next_frame = self.original_beat_positions[beat_int + 1]
+                # Linear interpolation between beats
+                interpolated_frame = original_frame + (next_frame - original_frame) * beat_frac
+                original_frame = int(interpolated_frame)
+            
+            if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
+                scaled_frame = int(original_frame / self._current_tempo_ratio)
+                logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ratio: {self._current_tempo_ratio:.3f})")
+                return scaled_frame
             else:
-                logger.warning(f"Deck {self.deck_id} - Fractional beat {beat_number} not found in original positions")
-                return 0
+                return original_frame
         else:
-            beat_number = int(round(beat_number))
-            if beat_number in self.original_beat_positions:
-                original_frame = self.original_beat_positions[beat_number]
-                if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
-                    scaled_frame = int(original_frame / self._current_tempo_ratio)
-                    logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ratio: {self._current_tempo_ratio:.3f})")
-                    return scaled_frame
-                else:
-                    return original_frame
-            else:
-                logger.warning(f"Deck {self.deck_id} - Beat {beat_number} not found in original positions")
-                return 0
+            logger.warning(f"Deck {self.deck_id} - Beat {beat_number} not found in original positions")
+            return 0
 
     def get_frame_from_cue(self, cue_name):
         if not self.cue_points or cue_name not in self.cue_points:
@@ -306,7 +294,7 @@ class Deck:
             logger.warning(f"Deck {self.deck_id} - Phase offset would seek beyond track bounds: {new_frame}")
 
     def play(self, start_at_beat=None, start_at_cue_name=None):
-        logger.debug(f"Deck {self.deck_id} - Engine requests PLAY. Cue: '{start_at_cue_name}', Beat: {start_at_beat}")
+        logger.info(f"Deck {self.deck_id} - Engine requests PLAY. Cue: '{start_at_cue_name}', Beat: {start_at_beat}, BPM: {self.bpm:.2f}")
         target_start_frame = None
         operation_description = "resuming/starting from current position"
 
@@ -329,7 +317,7 @@ class Deck:
                 self._current_playback_frame_for_display = target_start_frame
                 final_start_frame_for_command = target_start_frame
             else: 
-                # Use current position (which may have been set by beatmatch)
+                # Use current position (which may have been set by bpm_match)
                 current_display_frame = self._current_playback_frame_for_display
                 is_at_end = self.total_frames > 0 and current_display_frame >= self.total_frames
                 if is_at_end:
@@ -393,13 +381,46 @@ class Deck:
             # Fallback to get_frame_from_beat
             start_frame = self.get_frame_from_beat(start_beat)
         
+        # REMOVED: Pre-roll logic that was causing the artifact
+        # The loop should start exactly at the specified beat, not before it
+        
+        with self._stream_lock:
+            current_playback_frame = self._current_playback_frame_for_display
+        
+        logger.info(f"[LOOP ACTIVATION] Start frame: {start_frame}, Current pointer: {current_playback_frame}")
+        
+        # REMOVED: Crossfade logic that was masking the real issue
+        
         # Calculate loop end frame
         end_frame = start_frame + loop_length_frames
+        
+        # DEBUG: Log the exact beat positions for loop start and end
+        end_beat = start_beat + length_beats
+        logger.debug(f"[LOOP FRAME CALC] Start beat: {start_beat}, End beat: {end_beat}, Length beats: {length_beats}")
+        logger.debug(f"[LOOP FRAME CALC] Start frame: {start_frame}, End frame: {end_frame}, Length frames: {loop_length_frames}")
+        logger.debug(f"[LOOP FRAME CALC] Frames per beat: {frames_per_beat:.2f}")
+        
+        # LOG: Current playback frame at loop activation
+        with self._stream_lock:
+            current_playback_frame = self._current_playback_frame_for_display
+        logger.info(f"[LOOP ACTIVATION TIMING] At loop activation: current playback frame = {current_playback_frame}, loop start frame = {start_frame}, delta = {current_playback_frame - start_frame}")
         
         logger.debug(f"Deck {self.deck_id} - Activating loop: {length_beats} beats ({loop_length_frames} frames), {repetitions} reps, Action ID: {action_id}")
         logger.debug(f"Deck {self.deck_id} - Loop frames: {start_frame} to {end_frame}")
         
-        # Send to audio thread
+        # DISABLED: Predictive buffer to see the actual timing gap
+        # IMMEDIATE LOOP STATE UPDATE: Set loop state immediately to avoid race condition
+        with self._stream_lock:
+            self._loop_start_frame = start_frame  # Use exact start frame
+            self._loop_end_frame = end_frame
+            self._loop_repetitions_total = repetitions
+            self._loop_repetitions_done = 0
+            self._loop_active = True
+            self._current_loop_action_id = action_id
+            # Don't set playback pointer here - let audio thread handle it
+            logger.debug(f"Deck {self.deck_id} - IMMEDIATE loop state set: {action_id} (exact start: {start_frame})")
+        
+        # Send to audio thread for playback pointer update
         self.command_queue.put((DECK_CMD_ACTIVATE_LOOP, {
             'start_frame': start_frame,
             'end_frame': end_frame,
@@ -446,7 +467,7 @@ class Deck:
 
     def set_tempo(self, target_bpm):
         """Set playback tempo to exact BPM target using Rubber Band"""
-        logger.debug(f"Deck {self.deck_id} - Engine requests SET_TEMPO. Target BPM: {target_bpm}")
+        logger.info(f"Deck {self.deck_id} - Engine requests SET_TEMPO. Target BPM: {target_bpm}")
         
         if self.total_frames == 0:
             logger.error(f"Deck {self.deck_id} - Cannot set tempo: track not loaded.")
@@ -483,7 +504,7 @@ class Deck:
             logger.debug(f"Deck {self.deck_id} - Audio thread sample rate: {self.audio_thread_sample_rate} (type: {type(self.audio_thread_sample_rate)})")
             logger.debug(f"Deck {self.deck_id} - Main sample rate: {self.sample_rate} (type: {type(self.sample_rate)})")
             logger.debug(f"Deck {self.deck_id} - Tempo ratio: {tempo_ratio} (type: {type(tempo_ratio)})")
-            logger.debug(f"Deck {self.deck_id} - Audio data shape: {self.audio_thread_data.shape if hasattr(self.audio_thread_data, 'shape') else 'no shape'}")
+            logger.debug(f"Deck {self.deck_id} - Audio data shape: {self.audio_thread_data.shape if (self.audio_thread_data is not None and hasattr(self.audio_thread_data, 'shape')) else 'no shape'}")
             logger.debug(f"Deck {self.deck_id} - Audio data type: {type(self.audio_thread_data)}")
             
             # Use the audio thread sample rate to match the audio data
@@ -522,7 +543,7 @@ class Deck:
                 # Scale the beat timestamps to match the new tempo
                 self._scale_beat_positions(tempo_ratio)
             
-            logger.debug(f"Deck {self.deck_id} - Rubber Band processing complete, BPM now {self.bpm}")
+            logger.info(f"Deck {self.deck_id} - Rubber Band processing complete, BPM now {self.bpm}")
             
         except Exception as e:
             logger.error(f"Deck {self.deck_id} - Rubber Band processing failed: {e}")
@@ -592,7 +613,7 @@ class Deck:
 
     def _update_volume_fade(self):
         """Update volume based on active fade"""
-        if self._fade_target_volume is None:
+        if self._fade_target_volume is None or self._fade_start_volume is None or self._fade_start_time is None or self._fade_duration is None:
             return
             
         current_time = time.time()
@@ -614,6 +635,11 @@ class Deck:
     def _update_tempo_ramp(self, current_time=None):
         """Update tempo based on active ramp - USE TIME-BASED PROGRESS"""
         if not self._tempo_ramp_active:
+            return
+        # PATCH: Ensure all ramp variables are not None
+        required_vars = [self._ramp_start_beat, self._ramp_end_beat, self._ramp_start_bpm, self._ramp_end_bpm, self.original_bpm]
+        if any(v is None for v in required_vars):
+            logger.warning(f"Deck {self.deck_id} - Tempo ramp variables not fully initialized. Skipping update.")
             return
             
         # Remove the constant "called" message
@@ -828,7 +854,8 @@ class Deck:
                         _current_stream_in_thread = sd.OutputStream(
                             samplerate=self.audio_thread_sample_rate, channels=1,
                             callback=self._sd_callback, 
-                            finished_callback=self._on_stream_finished_from_audio_thread 
+                            finished_callback=self._on_stream_finished_from_audio_thread, 
+                            blocksize=256  # PATCH: Lower buffer size for tighter loop cueing
                         )
                         self.playback_stream_obj = _current_stream_in_thread 
                         _current_stream_in_thread.start()
@@ -886,22 +913,33 @@ class Deck:
                         'action_id': data.get('action_id')
                     }
                     
+                    # Log the first 10 sample values at the loop start for debugging
+                    start_frame = data['start_frame']
+                    if self.audio_thread_data is not None:
+                        sample_preview = self.audio_thread_data[start_frame:start_frame+10]
+                        last_sample_before = self.audio_thread_data[start_frame-1] if start_frame > 0 else None
+                        first_sample = self.audio_thread_data[start_frame] if len(self.audio_thread_data) > start_frame else None
+                        logger.debug(f"[LOOP ACTIVATION SAMPLES] Frame {start_frame}: {sample_preview}")
+                        logger.debug(f"[LOOP ACTIVATION SAMPLES] Last sample before loop: {last_sample_before}, First sample at loop: {first_sample}")
+
                     with self._stream_lock:
+                        # LOOP STATE IS ALREADY SET - just update playback pointer
                         if self._loop_active:
-                            # Add to queue
-                            self._loop_queue.append(loop_data)
-                            logger.debug(f"Deck {self.deck_id} AudioThread - Queued loop: {loop_data}")
+                            # Set playback pointer to loop start immediately (uses predictive start)
+                            self._current_playback_frame_for_display = self._loop_start_frame
+                            self.audio_thread_current_frame = self._loop_start_frame
+                            logger.debug(f"Deck {self.deck_id} AudioThread - Updated playback pointer to exact loop start: {self._loop_start_frame}")
                         else:
-                            # Activate immediately
+                            # Loop state should already be set, but handle edge case
+                            logger.warning(f"Deck {self.deck_id} AudioThread - Loop state not set when processing ACTIVATE_LOOP command")
                             self._loop_start_frame = data['start_frame']
                             self._loop_end_frame = data['end_frame']
                             self._loop_repetitions_total = data.get('repetitions')
-                            self._loop_repetitions_done = 0  # Start at 0 for new loop
+                            self._loop_repetitions_done = 0
                             self._loop_active = True
-                            # DON'T jump the frame - let it continue from current position
-                            # The frame will only jump when it reaches the loop boundary
                             self._current_loop_action_id = data.get('action_id')
-                            logger.debug(f"Deck {self.deck_id} AudioThread - Activated loop: {self._current_loop_action_id}")
+                            self._current_playback_frame_for_display = self._loop_start_frame
+                            self.audio_thread_current_frame = self._loop_start_frame
 
                 elif command == DECK_CMD_DEACTIVATE_LOOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing DEACTIVATE_LOOP")
@@ -984,7 +1022,10 @@ class Deck:
             if status_obj.output_overflow: logger.warning(f"Warning: Deck {self.deck_id} CB - Output overflow")
 
         try:
-            with self._stream_lock: 
+            with self._stream_lock:
+                # REMOVED: Hard seek patch that was causing artifacts
+                # The loop should activate naturally without aggressive frame jumping
+
                 if not self._user_wants_to_play or self.audio_thread_data is None:
                     logger.debug(f"DEBUG: Deck {self.deck_id} CB - No play or no audio data")
                     outdata[:] = 0
@@ -1014,11 +1055,15 @@ class Deck:
                     if current_frame >= self._loop_end_frame:
                         self._loop_repetitions_done += 1
                         logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop repetition {self._loop_repetitions_done}/{self._loop_repetitions_total}")
-                        if self._loop_repetitions_done < self._loop_repetitions_total:
+                        # PATCH: Handle None (infinite) repetitions safely
+                        reps_total = self._loop_repetitions_total if self._loop_repetitions_total is not None else float('inf')
+                        if self._loop_repetitions_done < reps_total:
                             # More repetitions to go - jump back to start
                             logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop boundary reached, jumping to {self._loop_start_frame}")
                             self._current_playback_frame_for_display = self._loop_start_frame
                             current_frame = self._loop_start_frame
+                            outdata[:] = 0  # Prevent audio overlap
+                            return  # Exit callback immediately
                         else:
                             # Loop complete - don't jump back
                             logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop complete, deactivating")
@@ -1038,9 +1083,10 @@ class Deck:
                                 self._current_loop_action_id = next_loop.get('action_id')
                                 self._loop_just_completed = False
                                 self._completed_loop_action_id = None
-                                logger.debug(f"Deck {self.deck_id} AudioThread - Activated next loop: {self._current_loop_action_id}")
                                 self._current_playback_frame_for_display = self._loop_start_frame
                                 current_frame = self._loop_start_frame
+                                outdata[:] = 0  # Prevent audio overlap
+                                return  # Exit callback immediately
                 
                 # Calculate current beat AFTER loop boundary check
                 # This ensures the beat detection reflects the current position after any loop jumps
@@ -1093,7 +1139,8 @@ class Deck:
                         self._current_playback_frame_for_display += frames_consumed
                     else:
                         # No audio data available
-                        audio_chunk = np.zeros((frames, self.audio_thread_data.shape[1]))
+                        # PATCH: Ensure zeros are correct shape for mono
+                        audio_chunk = np.zeros((frames, 1))
                 else:
                     # No tempo change, use original audio
                     audio_chunk = self.audio_thread_data[current_frame:current_frame + frames]
@@ -1105,11 +1152,15 @@ class Deck:
                 if hasattr(self, '_volume') and self._volume != 1.0:
                     audio_chunk *= self._volume
                 
+                # REMOVED: Crossfade logic that was masking the real issue
+                
                 # Ensure audio_chunk has the correct shape for output
                 # outdata expects shape (frames, channels) but audio_chunk might be (frames,)
                 if audio_chunk.ndim == 1:
                     # Convert 1D array to 2D array with 1 channel
                     audio_chunk = audio_chunk.reshape(-1, 1)
+                
+                # REMOVED: Split buffer logic that was causing artifacts
                 
                 # Copy to output
                 outdata[:] = audio_chunk
@@ -1204,7 +1255,7 @@ if __name__ == '__main__':
     if not os.path.exists(test_audio_file): logger.warning(f"WARNING: Test audio file not found: {test_audio_file}.")
     else:
         if deck.load_track(test_audio_file):
-            logger.debug(f"\nTrack loaded: {deck.deck_id}. BPM: {deck.bpm}, SR: {deck.sample_rate}")
+            logger.info(f"\nTrack loaded: {deck.deck_id}. BPM: {deck.bpm}, SR: {deck.sample_rate}")
             if deck.bpm == 0: logger.warning("WARNING: BPM is 0, loop length calc will be incorrect.")
             logger.debug("\nPlaying from CUE 'intro_start'..."); deck.play(start_at_cue_name="intro_start")
             time.sleep(0.2); logger.debug("Playing for ~2.0s to reach near beat 5..."); time.sleep(2.0) 

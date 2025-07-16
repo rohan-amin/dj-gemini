@@ -17,7 +17,7 @@ except ImportError:
 from .audio_analyzer import AudioAnalyzer
 from .deck import Deck
 
-ENGINE_TICK_INTERVAL = 0.05 
+ENGINE_TICK_INTERVAL = 0.01  # 10ms intervals for tighter timing 
 
 class AudioEngine:
     def __init__(self, app_config_module): 
@@ -91,8 +91,8 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "ramp_tempo"]
-        engine_level_commands = ["crossfade", "beatmatch"] 
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "ramp_tempo"]
+        engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Command '{command}' is missing 'deck_id'.")
@@ -168,20 +168,13 @@ class AudioEngine:
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'crossfade' duration not a valid number. Params: {params}")
                 return False
-        elif command == "beatmatch":
+        elif command == "bpm_match":
             params = action.get("parameters", {})
             if params.get("reference_deck") is None or params.get("follow_deck") is None:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'beatmatch' missing 'reference_deck' or 'follow_deck' in parameters. Params: {params}")
-                return False
-            sync_method = params.get("sync_method", "auto")
-            if sync_method not in ["auto", "manual", "grid"]:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'sync_method' must be 'auto', 'manual', or 'grid'. Value: {sync_method}")
-                return False
-            if sync_method == "manual" and params.get("target_beat") is None:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'manual' sync_method requires 'target_beat' parameter. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'bpm_match' missing 'reference_deck' or 'follow_deck' in parameters. Params: {params}")
                 return False
             try:
-                if sync_method == "manual" and params.get("target_beat") is not None:
+                if params.get("target_beat") is not None:
                     target_beat = float(params["target_beat"])
                     if target_beat <= 0:
                         logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' must be positive. Value: {target_beat}")
@@ -193,6 +186,61 @@ class AudioEngine:
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Invalid numeric parameter. Params: {params}")
                 return False
+        elif command == "seek_and_play":
+            params = action.get("parameters", {})
+            # Must have exactly one of the seek targets
+            seek_targets = ["start_at_beat", "start_at_cue_name", "start_at_loop"]
+            found_targets = [target for target in seek_targets if target in params]
+            
+            if len(found_targets) != 1:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'seek_and_play' must have exactly one of: 'start_at_beat', 'start_at_cue_name', or 'start_at_loop'. Found: {found_targets}")
+                return False
+            
+            target = found_targets[0]
+            if target == "start_at_beat":
+                try:
+                    start_beat = float(params["start_at_beat"])
+                    if start_beat < 0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_beat' must be non-negative. Value: {start_beat}")
+                        return False
+                except (ValueError, TypeError):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_beat' must be a valid number. Value: {params['start_at_beat']}")
+                    return False
+            elif target == "start_at_cue_name":
+                cue_name = params["start_at_cue_name"]
+                if not isinstance(cue_name, str) or not cue_name.strip():
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_cue_name' must be a non-empty string. Value: {cue_name}")
+                    return False
+            elif target == "start_at_loop":
+                loop_params = params["start_at_loop"]
+                if not isinstance(loop_params, dict):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' must be an object. Value: {loop_params}")
+                    return False
+                
+                if loop_params.get("start_at_beat") is None or loop_params.get("length_beats") is None:
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' requires 'start_at_beat' and 'length_beats'. Params: {loop_params}")
+                    return False
+                
+                try:
+                    start_beat = float(loop_params["start_at_beat"])
+                    length_beats = float(loop_params["length_beats"])
+                    if start_beat < 0 or length_beats <= 0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_beat' must be non-negative and 'length_beats' must be positive. Values: {start_beat}, {length_beats}")
+                        return False
+                    
+                    # Validate repetitions if present
+                    repetitions = loop_params.get("repetitions")
+                    if repetitions is not None:
+                        if not (isinstance(repetitions, str) and repetitions.lower() == "infinite"):
+                            try:
+                                int(repetitions)
+                            except (ValueError, TypeError):
+                                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'repetitions' must be an integer or 'infinite'. Value: {repetitions}")
+                                return False
+                except (ValueError, TypeError):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' parameters not valid numbers. Params: {loop_params}")
+                    return False
+        
         elif command == "ramp_tempo":
             params = action.get("parameters", {})
             if (params.get("start_beat") is None or params.get("end_beat") is None or 
@@ -468,7 +516,7 @@ class AudioEngine:
                     if reference_deck.bpm > 0:
                         target_bpm = reference_deck.bpm + tempo_offset_bpm
                         deck.set_tempo(target_bpm)
-                        logger.debug(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_deck.bpm} + {tempo_offset_bpm} = {target_bpm} BPM")
+                        logger.info(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_deck.bpm} + {tempo_offset_bpm} = {target_bpm} BPM")
                     else:
                         logger.warning(f"Cannot match tempo: reference deck {match_tempo_to} has invalid BPM ({reference_deck.bpm})")
 
@@ -487,6 +535,42 @@ class AudioEngine:
                 if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
                 deck.stop()
+            
+            elif command == "seek_and_play":
+                if not deck_id: logger.warning("'seek_and_play' missing deck_id. Skipping."); return
+                deck = self._get_or_create_deck(deck_id)
+                
+                # Check for different seek targets
+                if "start_at_beat" in parameters:
+                    start_beat = float(parameters["start_at_beat"])
+                    deck.play(start_at_beat=start_beat)
+                    logger.info(f"Seeking and playing deck {deck_id} from beat {start_beat}")
+                elif "start_at_cue_name" in parameters:
+                    cue_name = parameters["start_at_cue_name"]
+                    deck.play(start_at_cue_name=cue_name)
+                    logger.info(f"Seeking and playing deck {deck_id} from cue '{cue_name}'")
+                elif "start_at_loop" in parameters:
+                    loop_params = parameters["start_at_loop"]
+                    start_beat = float(loop_params.get("start_at_beat"))
+                    length_beats = float(loop_params.get("length_beats"))
+                    repetitions = loop_params.get("repetitions")
+                    
+                    # Convert repetitions to proper format
+                    if repetitions is not None:
+                        if isinstance(repetitions, str) and repetitions.lower() == "infinite":
+                            repetitions = None
+                        else:
+                            try:
+                                repetitions = int(repetitions)
+                            except ValueError:
+                                logger.warning("Invalid repetitions value, defaulting to infinite")
+                                repetitions = None
+                    
+                    deck.activate_loop(start_beat=start_beat, length_beats=length_beats, repetitions=repetitions)
+                    logger.info(f"Seeking and playing deck {deck_id} with loop: beat {start_beat}, length {length_beats}, reps {repetitions}")
+                else:
+                    logger.warning("'seek_and_play' requires one of: 'start_at_beat', 'start_at_cue_name', or 'start_at_loop' in parameters. Skipping.")
+                    return
             
             elif command == "stop_at_beat":
                 if not deck_id: logger.warning("'stop_at_beat' missing deck_id. Skipping."); return
@@ -585,12 +669,10 @@ class AudioEngine:
                 
                 logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s")
             
-            elif command == "beatmatch":
+            elif command == "bpm_match":
                 params = action_dict.get("parameters", {})
                 reference_deck_id = params.get("reference_deck")
                 follow_deck_id = params.get("follow_deck")
-                sync_method = params.get("sync_method", "auto")
-                target_beat = params.get("target_beat", None)
                 
                 reference_deck = self._get_or_create_deck(reference_deck_id)
                 follow_deck = self._get_or_create_deck(follow_deck_id)
@@ -598,57 +680,16 @@ class AudioEngine:
                 reference_bpm = reference_deck.bpm
                 follow_bpm = follow_deck.bpm
                 
-                logger.debug(f"Beatmatching {follow_deck_id} to reference {reference_deck_id}")
-                logger.debug(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
+                logger.info(f"BPM-matching {follow_deck_id} to reference {reference_deck_id}")
+                logger.info(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
                 
                 if reference_bpm <= 0 or follow_bpm <= 0:
-                    logger.error(f"Invalid BPM for beatmatching")
+                    logger.error(f"Invalid BPM for bpm_match")
                     return
                 
-                # Step 1: Match tempo
-                tempo_ratio = reference_bpm / follow_bpm
+                # Only perform tempo matching (BPM match)
                 follow_deck.set_tempo(reference_bpm)
-                logger.debug(f"Tempo matched: ratio {tempo_ratio:.3f}")
-                
-                # Step 2: Phase alignment
-                phase_offset = params.get("phase_offset_beats", 0.0)
-                
-                if sync_method == "auto":
-                    reference_beat = reference_deck.get_current_beat_count()
-                    follow_beat = follow_deck.get_current_beat_count()
-                    beat_difference = reference_beat - follow_beat
-                    
-                    # Apply manual offset
-                    beat_difference += phase_offset
-                    
-                    if abs(beat_difference) > 0.5:
-                        # Store the phase offset to be applied when the deck starts playing
-                        follow_deck.set_phase_offset(beat_difference)
-                        logger.debug(f"Auto-aligned: stored offset {beat_difference:.1f} beats (including manual offset {phase_offset:.1f})")
-                    else:
-                        # Clear any existing offset if alignment is already close
-                        follow_deck.set_phase_offset(0.0)
-                        logger.debug(f"Auto-aligned: no offset needed (difference {beat_difference:.1f} beats)")
-                
-                elif sync_method == "manual" and target_beat is not None:
-                    # Apply manual offset to target beat
-                    adjusted_target_beat = target_beat + phase_offset
-                    target_frame = follow_deck.get_frame_from_beat(int(adjusted_target_beat))
-                    if target_frame is not None:
-                        follow_deck.seek(target_frame)
-                        logger.debug(f"Manual alignment to beat {adjusted_target_beat} (original {target_beat} + offset {phase_offset})")
-                
-                elif sync_method == "grid":
-                    current_beat = follow_deck.get_current_beat_count()
-                    grid_beat = ((current_beat - 1) // 4) * 4 + 1
-                    # Apply manual offset to grid beat
-                    adjusted_grid_beat = grid_beat + phase_offset
-                    grid_frame = follow_deck.get_frame_from_beat(adjusted_grid_beat)
-                    if grid_frame is not None:
-                        follow_deck.seek(grid_frame)
-                        logger.debug(f"Grid alignment to beat {adjusted_grid_beat} (original {grid_beat} + offset {phase_offset})")
-                
-                logger.debug(f"Beatmatch complete: {follow_deck_id} synchronized")
+                logger.info(f"BPM match complete: {follow_deck_id} synchronized. New BPM: {follow_deck.bpm}")
             
             elif command == "ramp_tempo":
                 deck_id = action_dict.get("deck_id")
