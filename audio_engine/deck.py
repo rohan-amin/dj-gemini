@@ -55,12 +55,15 @@ class Deck:
         self._is_actually_playing_stream_state = False 
         self.seek_in_progress_flag = False 
 
-        # --- Loop state attributes ---
+                # --- Loop state attributes ---
         self._loop_active = False
         self._loop_start_frame = 0
         self._loop_end_frame = 0
-        self._loop_repetitions_total = None 
+        self._loop_repetitions_total = None
         self._loop_repetitions_done = 0
+        
+        # --- Synchronized beat state ---
+        self._last_synchronized_beat = 0
 
         # Add loop queue for handling multiple loops
         self._loop_queue = []
@@ -94,6 +97,10 @@ class Deck:
 
         # Add to Deck class initialization
         self._tempo_cache = {}  # Cache processed audio for different tempos
+
+        # Phase offset storage for beatmatch
+        self._pending_phase_offset_beats = 0.0
+        self._phase_offset_applied = False
 
         self.audio_thread.start()
         logger.debug(f"Deck {self.deck_id} - Initialized and audio thread started.")
@@ -226,12 +233,57 @@ class Deck:
                 return 0
                 
             try:
-                beat_count = np.searchsorted(beat_timestamps_to_use, current_time_seconds, side='right')
+                # Use side='left' to get the current beat (not the next beat)
+                beat_count = np.searchsorted(beat_timestamps_to_use, current_time_seconds, side='left')
                 logger.debug(f"Deck {self.deck_id} - Beat count: {beat_count}")
                 return beat_count
             except Exception as e:
                 logger.error(f"Deck {self.deck_id} - Exception in searchsorted: {e}")
                 return 0
+    
+    def get_synchronized_beat_count(self):
+        """Get current beat count using the same logic as the audio callback"""
+        # FIXED: Use shared state updated by audio callback for deterministic timing
+        if hasattr(self, '_last_synchronized_beat'):
+            return self._last_synchronized_beat
+        else:
+            # Fallback to direct calculation if shared state not available
+            with self._stream_lock:
+                if self.audio_thread_data is None or self.sample_rate == 0 or len(self.beat_timestamps) == 0:
+                    return 0
+                
+                current_time_seconds = self._current_playback_frame_for_display / float(self.sample_rate)
+                return np.searchsorted(self.beat_timestamps, current_time_seconds, side='left')
+
+    def set_phase_offset(self, offset_beats):
+        """Set a phase offset to be applied when the deck starts playing"""
+        logger.debug(f"Deck {self.deck_id} - Setting phase offset: {offset_beats} beats")
+        self._pending_phase_offset_beats = offset_beats
+        self._phase_offset_applied = False
+    
+    def apply_phase_offset(self):
+        """Apply the pending phase offset by seeking the appropriate number of frames"""
+        if self._phase_offset_applied or self._pending_phase_offset_beats == 0.0:
+            return
+        
+        if self.bpm <= 0:
+            logger.warning(f"Deck {self.deck_id} - Cannot apply phase offset: BPM is {self.bpm}")
+            return
+        
+        # Calculate frames to offset
+        frames_per_beat = (60.0 / self.bpm) * self.sample_rate
+        offset_frames = int(self._pending_phase_offset_beats * frames_per_beat)
+        
+        # Apply the offset
+        current_frame = self._current_playback_frame_for_display
+        new_frame = current_frame + offset_frames
+        
+        if 0 <= new_frame < self.total_frames:
+            self._current_playback_frame_for_display = new_frame
+            logger.debug(f"Deck {self.deck_id} - Applied phase offset: {self._pending_phase_offset_beats} beats ({offset_frames} frames)")
+            self._phase_offset_applied = True
+        else:
+            logger.warning(f"Deck {self.deck_id} - Phase offset would seek beyond track bounds: {new_frame}")
 
     def play(self, start_at_beat=None, start_at_cue_name=None):
         logger.debug(f"Deck {self.deck_id} - Engine requests PLAY. Cue: '{start_at_cue_name}', Beat: {start_at_beat}")
@@ -257,6 +309,7 @@ class Deck:
                 self._current_playback_frame_for_display = target_start_frame
                 final_start_frame_for_command = target_start_frame
             else: 
+                # Use current position (which may have been set by beatmatch)
                 current_display_frame = self._current_playback_frame_for_display
                 is_at_end = self.total_frames > 0 and current_display_frame >= self.total_frames
                 if is_at_end:
@@ -264,6 +317,10 @@ class Deck:
                     self._current_playback_frame_for_display = 0
                 else:
                     final_start_frame_for_command = current_display_frame
+            
+            # Apply any pending phase offset
+            self.apply_phase_offset()
+            
             logger.debug(f"Deck {self.deck_id} - Finalizing PLAY from frame {final_start_frame_for_command} ({operation_description})")
         self.command_queue.put((DECK_CMD_PLAY, {'start_frame': final_start_frame_for_command}))
 
@@ -316,6 +373,7 @@ class Deck:
             # Fallback to get_frame_from_beat
             start_frame = self.get_frame_from_beat(start_beat)
         
+        # Calculate loop end frame
         end_frame = start_frame + loop_length_frames
         
         logger.debug(f"Deck {self.deck_id} - Activating loop: {length_beats} beats ({loop_length_frames} frames), {repetitions} reps, Action ID: {action_id}")
@@ -818,8 +876,10 @@ class Deck:
                             self._loop_start_frame = data['start_frame']
                             self._loop_end_frame = data['end_frame']
                             self._loop_repetitions_total = data.get('repetitions')
-                            self._loop_repetitions_done = 0
+                            self._loop_repetitions_done = 0  # Start at 0 for new loop
                             self._loop_active = True
+                            # DON'T jump the frame - let it continue from current position
+                            # The frame will only jump when it reaches the loop boundary
                             self._current_loop_action_id = data.get('action_id')
                             logger.debug(f"Deck {self.deck_id} AudioThread - Activated loop: {self._current_loop_action_id}")
 
@@ -916,15 +976,6 @@ class Deck:
                 # Calculate current time for tempo ramp updates
                 current_time = current_frame / self.sample_rate
                 
-                # Calculate current beat - FIXED: Use original beat timestamps for consistent trigger detection
-                # Always use the original beat timestamps for trigger detection, regardless of ramp
-                current_beat = np.searchsorted(self.beat_timestamps, current_time, side='right')
-                
-                # Only print beat changes, not every callback
-                if not hasattr(self, '_last_printed_beat') or self._last_printed_beat != current_beat:
-                    logger.debug(f"DEBUG: Deck {self.deck_id} CB - Current Beat: {current_beat} (Frame: {current_frame})")
-                    self._last_printed_beat = current_beat
-                
                 # Check if we need to update tempo ramp - PASS CURRENT TIME INSTEAD OF BEAT
                 if self._tempo_ramp_active:
                     # Remove the constant ramp update message
@@ -940,32 +991,49 @@ class Deck:
                 
                 # ADDED: Check for loop boundaries during ramp
                 if self._loop_active and self._loop_end_frame > 0:
-                    # Check if we've reached the loop end
                     if current_frame >= self._loop_end_frame:
-                        # FIXED: Check repetition count BEFORE jumping back
-                        if self._loop_repetitions_total is not None:
-                            self._loop_repetitions_done += 1
-                            logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop repetition {self._loop_repetitions_done}/{self._loop_repetitions_total}")
-                            
-                            if self._loop_repetitions_done >= self._loop_repetitions_total:
-                                # Loop complete - don't jump back
-                                logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop complete, deactivating")
-                                self._loop_active = False
-                                self._loop_repetitions_done = 0
-                                self._loop_repetitions_total = None
-                                # Signal loop completion to engine
-                                self._loop_just_completed = True
-                                self._completed_loop_action_id = getattr(self, '_current_loop_action_id', None)
-                            else:
-                                # More repetitions to go - jump back to start
-                                logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop boundary reached, jumping to {self._loop_start_frame}")
-                                self._current_playback_frame_for_display = self._loop_start_frame
-                                current_frame = self._loop_start_frame
-                        else:
-                            # Infinite loop - just jump back
+                        self._loop_repetitions_done += 1
+                        logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop repetition {self._loop_repetitions_done}/{self._loop_repetitions_total}")
+                        if self._loop_repetitions_done < self._loop_repetitions_total:
+                            # More repetitions to go - jump back to start
                             logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop boundary reached, jumping to {self._loop_start_frame}")
                             self._current_playback_frame_for_display = self._loop_start_frame
                             current_frame = self._loop_start_frame
+                        else:
+                            # Loop complete - don't jump back
+                            logger.debug(f"DEBUG: Deck {self.deck_id} CB - Loop complete, deactivating")
+                            self._loop_active = False
+                            self._loop_repetitions_done = 0
+                            self._loop_repetitions_total = None
+                            self._loop_just_completed = True
+                            self._completed_loop_action_id = getattr(self, '_current_loop_action_id', None)
+                            # If there is another loop in the queue, activate it and set its action_id
+                            if self._loop_queue:
+                                next_loop = self._loop_queue.pop(0)
+                                self._loop_start_frame = next_loop['start_frame']
+                                self._loop_end_frame = next_loop['end_frame']
+                                self._loop_repetitions_total = next_loop.get('repetitions')
+                                self._loop_repetitions_done = 0  # Start at 0 for new loop
+                                self._loop_active = True
+                                self._current_loop_action_id = next_loop.get('action_id')
+                                self._loop_just_completed = False
+                                self._completed_loop_action_id = None
+                                logger.debug(f"Deck {self.deck_id} AudioThread - Activated next loop: {self._current_loop_action_id}")
+                                self._current_playback_frame_for_display = self._loop_start_frame
+                                current_frame = self._loop_start_frame
+                
+                # Calculate current beat AFTER loop boundary check
+                # This ensures the beat detection reflects the current position after any loop jumps
+                current_time_after_loop = current_frame / self.sample_rate
+                current_beat = np.searchsorted(self.beat_timestamps, current_time_after_loop, side='left')
+                
+                # FIXED: Update shared state for synchronized trigger checking
+                self._last_synchronized_beat = current_beat
+                
+                # Only print beat changes, not every callback
+                if not hasattr(self, '_last_printed_beat') or self._last_printed_beat != current_beat:
+                    logger.debug(f"DEBUG: Deck {self.deck_id} CB - Current Beat: {current_beat} (Frame: {current_frame})")
+                    self._last_printed_beat = current_beat
                 
                 # Get the audio chunk with tempo processing
                 if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
@@ -1011,6 +1079,8 @@ class Deck:
                     audio_chunk = self.audio_thread_data[current_frame:current_frame + frames]
                     self._current_playback_frame_for_display += frames
                 
+                # Update volume fade before applying volume
+                self._update_volume_fade()
                 # FIXED: Apply volume changes using the correct attribute name
                 if hasattr(self, '_volume') and self._volume != 1.0:
                     audio_chunk *= self._volume

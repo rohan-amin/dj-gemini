@@ -186,8 +186,12 @@ class AudioEngine:
                     if target_beat <= 0:
                         logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' must be positive. Value: {target_beat}")
                         return False
+                # Validate phase_offset_beats if present
+                if params.get("phase_offset_beats") is not None:
+                    phase_offset = float(params["phase_offset_beats"])
+                    logger.debug(f"VALIDATION OK: phase_offset_beats = {phase_offset}")
             except (ValueError, TypeError):
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'target_beat' not a valid number. Params: {params}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Invalid numeric parameter. Params: {params}")
                 return False
         elif command == "ramp_tempo":
             params = action.get("parameters", {})
@@ -379,7 +383,7 @@ class AudioEngine:
                             continue
                         try:
                             target_beat = float(target_beat_str)
-                            current_beat = deck.get_current_beat_count()
+                            current_beat = deck.get_synchronized_beat_count()
                             logger.debug(f"AudioEngine - Beat check: Deck='{source_deck_id}', Current={current_beat}, Target={target_beat}")
                             if current_beat >= target_beat: 
                                 logger.info(f"Trigger MET: on_deck_beat for action '{action_id_for_log}'")
@@ -454,6 +458,19 @@ class AudioEngine:
                         else: logger.warning(f"Track file '{file_path_param}' not found. Trying as is.")
                 logger.debug(f"Attempting to load track from resolved path: {track_path}")
                 deck.load_track(track_path)
+                
+                # Handle tempo matching after track is loaded
+                match_tempo_to = parameters.get("match_tempo_to")
+                tempo_offset_bpm = parameters.get("tempo_offset_bpm", 0.0)
+                
+                if match_tempo_to:
+                    reference_deck = self._get_or_create_deck(match_tempo_to)
+                    if reference_deck.bpm > 0:
+                        target_bpm = reference_deck.bpm + tempo_offset_bpm
+                        deck.set_tempo(target_bpm)
+                        logger.debug(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_deck.bpm} + {tempo_offset_bpm} = {target_bpm} BPM")
+                    else:
+                        logger.warning(f"Cannot match tempo: reference deck {match_tempo_to} has invalid BPM ({reference_deck.bpm})")
 
             elif command == "play":
                 if not deck_id: logger.warning("'play' missing deck_id. Skipping."); return
@@ -594,33 +611,42 @@ class AudioEngine:
                 logger.debug(f"Tempo matched: ratio {tempo_ratio:.3f}")
                 
                 # Step 2: Phase alignment
+                phase_offset = params.get("phase_offset_beats", 0.0)
+                
                 if sync_method == "auto":
                     reference_beat = reference_deck.get_current_beat_count()
                     follow_beat = follow_deck.get_current_beat_count()
                     beat_difference = reference_beat - follow_beat
                     
+                    # Apply manual offset
+                    beat_difference += phase_offset
+                    
                     if abs(beat_difference) > 0.5:
-                        frames_per_beat = (60.0 / reference_bpm) * follow_deck.sample_rate
-                        offset_frames = int(beat_difference * frames_per_beat)
-                        new_frame = follow_deck.get_current_display_frame() + offset_frames
-                        
-                        if 0 <= new_frame < follow_deck.total_frames:
-                            follow_deck.seek(new_frame)
-                            logger.debug(f"Auto-aligned: offset {beat_difference:.1f} beats")
+                        # Store the phase offset to be applied when the deck starts playing
+                        follow_deck.set_phase_offset(beat_difference)
+                        logger.debug(f"Auto-aligned: stored offset {beat_difference:.1f} beats (including manual offset {phase_offset:.1f})")
+                    else:
+                        # Clear any existing offset if alignment is already close
+                        follow_deck.set_phase_offset(0.0)
+                        logger.debug(f"Auto-aligned: no offset needed (difference {beat_difference:.1f} beats)")
                 
                 elif sync_method == "manual" and target_beat is not None:
-                    target_frame = follow_deck.get_frame_from_beat(int(target_beat))
+                    # Apply manual offset to target beat
+                    adjusted_target_beat = target_beat + phase_offset
+                    target_frame = follow_deck.get_frame_from_beat(int(adjusted_target_beat))
                     if target_frame is not None:
                         follow_deck.seek(target_frame)
-                        logger.debug(f"Manual alignment to beat {target_beat}")
+                        logger.debug(f"Manual alignment to beat {adjusted_target_beat} (original {target_beat} + offset {phase_offset})")
                 
                 elif sync_method == "grid":
                     current_beat = follow_deck.get_current_beat_count()
                     grid_beat = ((current_beat - 1) // 4) * 4 + 1
-                    grid_frame = follow_deck.get_frame_from_beat(grid_beat)
+                    # Apply manual offset to grid beat
+                    adjusted_grid_beat = grid_beat + phase_offset
+                    grid_frame = follow_deck.get_frame_from_beat(adjusted_grid_beat)
                     if grid_frame is not None:
                         follow_deck.seek(grid_frame)
-                        logger.debug(f"Grid alignment to beat {grid_beat}")
+                        logger.debug(f"Grid alignment to beat {adjusted_grid_beat} (original {grid_beat} + offset {phase_offset})")
                 
                 logger.debug(f"Beatmatch complete: {follow_deck_id} synchronized")
             

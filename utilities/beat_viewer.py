@@ -1,4 +1,11 @@
-# utilities/beat_viewer.py
+#!/usr/bin/env python3
+"""
+play_song.py - Simple audio player with BPM detection, robust seeking, and beat navigation
+
+Dependencies:
+    pip install pydub simpleaudio essentia numpy
+    # For MP3 support, install ffmpeg (e.g., brew install ffmpeg on macOS)
+"""
 
 import tkinter as tk
 from tkinter import filedialog, ttk
@@ -6,560 +13,274 @@ import argparse
 import os
 import time
 import threading
-import queue 
-
-import essentia.standard as es
 import numpy as np
-import sounddevice as sd
-
+import essentia.standard as es
+from pydub import AudioSegment
+import simpleaudio as sa
 import logging
+
 logger = logging.getLogger(__name__)
 
-UPDATE_INTERVAL_MS = 100
-
-CMD_LOAD_FILE = "LOAD_FILE"
-CMD_PLAY = "PLAY"
-CMD_PAUSE = "PAUSE"
-CMD_SEEK = "SEEK" 
-CMD_STOP_STREAM_FORCED = "STOP_STREAM_FORCED"
-CMD_SHUTDOWN = "SHUTDOWN"
-
-class BeatViewerApp:
+class PlaySongApp:
     def __init__(self, master_window, initial_filepath=None):
         self.master = master_window
-        self.master.title("DJ Gemini - Beat Viewer")
-        self.master.geometry("550x280")
-
-        self.audio_data_gui = None 
-        self.sample_rate_gui = 0
-        self.beat_timestamps_gui = []
-        self.total_duration_samples_gui = 0
-        self.total_duration_seconds_gui = 0.0
+        self.master.title("Play Song - Audio Player")
+        self.master.geometry("600x400")
         
-        self.audio_thread_data = None
-        self.audio_thread_sample_rate = 0
-        self.audio_thread_total_samples = 0
-        self.audio_thread_current_frame = 0
-
-        self.stream_lock = threading.Lock()
-        self.current_playback_frame_shared = 0 
-        self.is_playing_desired_state = False  
-        self.audio_file_loaded = False 
-        self.seek_in_progress_flag = False 
-
-        self.audio_command_queue = queue.Queue()
-        self.audio_thread_stop_event = threading.Event()
-        self.audio_thread = threading.Thread(target=self._audio_management_loop, daemon=True)
+        # Audio state
+        self.audio_segment = None
+        self.sample_rate = 0
+        self.duration_seconds = 0
+        self.bpm = 0
+        self.beat_timestamps = np.array([])
+        self.current_position = 0.0
+        self.is_playing = False
+        self.file_loaded = False
+        self.play_obj = None
+        self.playback_thread = None
+        self.stop_playback = threading.Event()
+        self.position_update_id = None
+        self._playback_start_time = None
+        self._playback_start_pos = 0.0
+        self._slider_dragging = False
         
-        # self.playback_stream_obj = None # Audio thread manages its own stream reference internally
-
-        self.update_job_id = None
         self._create_widgets()
         self._configure_bindings()
-
-        self.audio_thread.start()
-
+        
         if initial_filepath:
-            self.master.after(10, lambda: self._process_load_file_request(initial_filepath))
-        logger.debug("DEBUG: BeatViewerApp initialized")
-
+            self.master.after(100, lambda: self._load_audio_file(initial_filepath))
+    
     def _create_widgets(self):
         load_frame = tk.Frame(self.master, padx=10, pady=10)
         load_frame.pack(fill=tk.X)
-        self.load_button = tk.Button(load_frame, text="Load Audio File", command=self._gui_select_file_and_load)
+        self.load_button = tk.Button(load_frame, text="Load Audio File", command=self._gui_load_file)
         self.load_button.pack(side=tk.LEFT)
-        self.filepath_label = tk.Label(load_frame, text="No file loaded.", anchor="w", wraplength=400)
+        self.filepath_label = tk.Label(load_frame, text="No file loaded", anchor="w", wraplength=400)
         self.filepath_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
-
+        info_frame = tk.Frame(self.master, padx=10, pady=5)
+        info_frame.pack(fill=tk.X)
+        self.bpm_label = tk.Label(info_frame, text="BPM: --", width=15, anchor="w")
+        self.bpm_label.pack(side=tk.LEFT, padx=5)
+        self.duration_label = tk.Label(info_frame, text="Duration: --", width=20, anchor="w")
+        self.duration_label.pack(side=tk.LEFT, padx=5)
+        self.position_label = tk.Label(info_frame, text="Position: 00:00", width=15, anchor="w")
+        self.position_label.pack(side=tk.LEFT, padx=5)
+        self.beat_label = tk.Label(info_frame, text="Beat: --", width=15, anchor="w")
+        self.beat_label.pack(side=tk.LEFT, padx=5)
         controls_frame = tk.Frame(self.master, pady=10)
         controls_frame.pack()
-        self.play_pause_button = tk.Button(controls_frame, text="Play", width=10, command=self._gui_toggle_play_pause, state=tk.DISABLED)
+        self.play_pause_button = tk.Button(controls_frame, text="Play", width=10, 
+                                         command=self._toggle_play_pause, state=tk.DISABLED)
         self.play_pause_button.pack(side=tk.LEFT, padx=5)
-
-        display_frame = tk.Frame(self.master, pady=10)
-        display_frame.pack(fill=tk.X, padx=10)
-        self.time_label = tk.Label(display_frame, text="Time: 00:00 / 00:00", width=20, anchor="w")
-        self.time_label.pack(side=tk.LEFT, padx=5)
-        self.beat_label = tk.Label(display_frame, text="Beat: --", width=20, anchor="w")
-        self.beat_label.pack(side=tk.LEFT, padx=5)
-
+        slider_frame = tk.Frame(self.master, pady=10)
+        slider_frame.pack(fill=tk.X, padx=10)
         self.seek_slider_var = tk.DoubleVar()
         self.seek_slider = ttk.Scale(
-            self.master, from_=0, to=100, orient=tk.HORIZONTAL,
-            variable=self.seek_slider_var, state=tk.DISABLED, length=450
+            slider_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+            variable=self.seek_slider_var, state=tk.DISABLED, length=500
         )
-        self.seek_slider.pack(pady=10, fill=tk.X, padx=10, expand=True)
-
-
+        self.seek_slider.pack(fill=tk.X, expand=True)
+        instructions_frame = tk.Frame(self.master, pady=10)
+        instructions_frame.pack()
+        instructions = tk.Label(instructions_frame, 
+                              text="Keyboard: Left/Right arrows = seek 1 beat, Space = play/pause",
+                              font=("Arial", 10))
+        instructions.pack()
+    
     def _configure_bindings(self):
-        self.seek_slider.bind("<ButtonRelease-1>", self._gui_on_slider_release)
-        self.seek_slider.bind("<B1-Motion>", self._gui_on_slider_drag_update_display_only)
-
-    def _gui_select_file_and_load(self):
-        logger.debug("DEBUG: GUI - _gui_select_file_and_load called")
-        self._send_audio_command(CMD_STOP_STREAM_FORCED, None, "GUI - Requesting stop before file load dialog")
-        with self.stream_lock: self.is_playing_desired_state = False
-        if self.master.winfo_exists(): self.play_pause_button.config(text="Play")
-        if self.update_job_id: 
-            if self.master.winfo_exists(): self.master.after_cancel(self.update_job_id)
-            self.update_job_id = None
-
+        self.seek_slider.bind("<Button-1>", self._on_slider_click)
+        self.seek_slider.bind("<B1-Motion>", self._on_slider_drag)
+        self.seek_slider.bind("<ButtonRelease-1>", self._on_slider_release)
+        self.master.bind("<Left>", self._seek_backward_beat)
+        self.master.bind("<Right>", self._seek_forward_beat)
+        self.master.bind("<space>", self._toggle_play_pause)
+        self.master.focus_set()
+    
+    def _gui_load_file(self):
         filepath = filedialog.askopenfilename(
             title="Select Audio File",
             filetypes=(("Audio Files", "*.wav *.mp3 *.aac *.flac"), ("All files", "*.*"))
         )
         if filepath:
-            logger.debug(f"DEBUG: GUI - File selected: {filepath}")
-            self._process_load_file_request(filepath)
-        else:
-            logger.debug("DEBUG: GUI - File selection cancelled")
-
-    def _process_load_file_request(self, filepath):
-        logger.debug(f"DEBUG: GUI - _process_load_file_request for {filepath}")
-        if self.master.winfo_exists():
+            self._load_audio_file(filepath)
+    
+    def _load_audio_file(self, filepath):
+        try:
             self.filepath_label.config(text=f"Loading: {os.path.basename(filepath)}...")
             self.master.update_idletasks()
-            self.play_pause_button.config(state=tk.DISABLED, text="Play")
-            self.seek_slider.config(state=tk.DISABLED)
-            self.seek_slider_var.set(0)
-
-        try:
-            loader = es.MonoLoader(filename=filepath)
-            self.audio_data_gui = loader() 
-            self.sample_rate_gui = loader.paramValue('sampleRate')
-            if self.sample_rate_gui == 0: raise ValueError("Sample rate is 0.")
-
-            self.total_duration_samples_gui = len(self.audio_data_gui)
-            self.total_duration_seconds_gui = self.total_duration_samples_gui / float(self.sample_rate_gui)
-
+            self.audio_segment = AudioSegment.from_file(filepath)
+            self.sample_rate = self.audio_segment.frame_rate
+            self.duration_seconds = len(self.audio_segment) / 1000.0
+            # Convert to mono numpy array for Essentia
+            samples = np.array(self.audio_segment.get_array_of_samples()).astype(np.float32)
+            if self.audio_segment.channels > 1:
+                samples = samples.reshape((-1, self.audio_segment.channels)).mean(axis=1)
+            samples /= np.iinfo(self.audio_segment.array_type).max
             beat_tracker = es.BeatTrackerDegara()
-            self.beat_timestamps_gui = beat_tracker(self.audio_data_gui)
-            logger.debug(f"DEBUG: GUI - Loaded {filepath}, SR: {self.sample_rate_gui}, Duration: {self.total_duration_seconds_gui:.2f}s, Beats: {len(self.beat_timestamps_gui)}")
-
-            with self.stream_lock:
-                self.current_playback_frame_shared = 0
-                self.is_playing_desired_state = False 
-                self.audio_file_loaded = True
-            
-            self._send_audio_command(CMD_LOAD_FILE, {
-                'audio_data': self.audio_data_gui.copy(), 
-                'sample_rate': self.sample_rate_gui,
-                'total_samples': self.total_duration_samples_gui
-            }, "GUI - Sending LOAD_FILE command")
-
-            if self.master.winfo_exists():
-                self.filepath_label.config(text=f"File: {os.path.basename(filepath)}")
-                self._update_time_display(0, self.total_duration_seconds_gui)
-                self._update_beat_label(0)
-                self.play_pause_button.config(state=tk.NORMAL)
-                self.seek_slider.config(state=tk.NORMAL, to=self.total_duration_seconds_gui)
+            self.beat_timestamps = beat_tracker(samples)
+            self.bpm = len(self.beat_timestamps) / (self.duration_seconds / 60.0) if self.duration_seconds > 0 else 0
+            self.current_position = 0.0
+            self.is_playing = False
+            self.file_loaded = True
+            self._playback_start_time = None
+            self._playback_start_pos = 0.0
+            self.filepath_label.config(text=f"File: {os.path.basename(filepath)}")
+            self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+            self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
+            self.position_label.config(text="Position: 00:00")
+            self.beat_label.config(text="Beat: 1")
+            self.play_pause_button.config(state=tk.NORMAL)
+            self.seek_slider.config(state=tk.NORMAL, to=self.duration_seconds)
+            self.seek_slider_var.set(0)
+            logger.info(f"Loaded {filepath}: BPM={self.bpm:.1f}, Duration={self.duration_seconds:.2f}s")
         except Exception as e:
-            error_msg = f"Error: {str(e)[:100]}"
-            if self.master.winfo_exists(): self.filepath_label.config(text=error_msg)
-            logger.error(f"ERROR in GUI - _process_load_file_request: {e}")
-            self.audio_data_gui = None
-            with self.stream_lock: self.audio_file_loaded = False; self.is_playing_desired_state = False
+            error_msg = f"Error loading file: {str(e)[:100]}"
+            self.filepath_label.config(text=error_msg)
+            logger.error(f"Error loading {filepath}: {e}")
+            self.file_loaded = False
     
-    def _gui_toggle_play_pause(self):
-        logger.debug("DEBUG: GUI - _gui_toggle_play_pause called")
-        if not self.audio_file_loaded: return
-
-        should_play_now = False
-        with self.stream_lock:
-            self.is_playing_desired_state = not self.is_playing_desired_state 
-            should_play_now = self.is_playing_desired_state
-        
-        if should_play_now:
-            if self.master.winfo_exists(): self.play_pause_button.config(text="Pause")
-            self._send_audio_command(CMD_PLAY, None, "GUI - Sending PLAY command")
-            # _schedule_display_update will be started by audio thread's PLAY command success
+    def _toggle_play_pause(self, event=None):
+        if not self.file_loaded:
+            return
+        if self.is_playing:
+            self._pause_playback()
         else:
-            if self.master.winfo_exists(): self.play_pause_button.config(text="Play")
-            self._send_audio_command(CMD_PAUSE, None, "GUI - Sending PAUSE command")
-            # GUI updates are stopped by _schedule_display_update checking is_playing_desired_state
-
-    def _gui_on_slider_drag_update_display_only(self, event=None):
-        is_playing_now = False
-        with self.stream_lock: is_playing_now = self.is_playing_desired_state
-        if not self.audio_file_loaded or is_playing_now: return
-
-        current_time_sec = self.seek_slider_var.get()
-        self._update_time_display(current_time_sec, self.total_duration_seconds_gui)
-        self._update_beat_label(current_time_sec)
-
-    def _gui_on_slider_release(self, event=None):
-        logger.debug("DEBUG: GUI - _gui_on_slider_release called")
-        if not self.audio_file_loaded: return
-
-        seek_time_seconds = self.seek_slider_var.get()
-        new_frame = int(seek_time_seconds * self.sample_rate_gui) 
-        new_frame = max(0, min(new_frame, self.total_duration_samples_gui)) 
-        
-        logger.debug(f"DEBUG: GUI - Seek to time: {seek_time_seconds:.2f}s, frame: {new_frame}")
-
-        # Immediately update GUI display to reflect the seek target
-        self._update_time_display(seek_time_seconds, self.total_duration_seconds_gui)
-        self._update_beat_label(new_frame / float(self.sample_rate_gui) if self.sample_rate_gui > 0 else 0)
-
-        was_playing_before_seek = False
-        with self.stream_lock:
-            was_playing_before_seek = self.is_playing_desired_state 
-            self.current_playback_frame_shared = new_frame # Set new frame for audio thread
-            if was_playing_before_seek:
-                self.seek_in_progress_flag = True # Signal that a seek is happening
-                # Desired state remains playing
-        
-        self._send_audio_command(CMD_SEEK, 
-                                 {'frame': new_frame, 'was_playing': was_playing_before_seek}, 
-                                 "GUI - Sending SEEK command")
-        
-        if was_playing_before_seek:
-            # The audio thread (CMD_SEEK -> CMD_PLAY) will restart the audio
-            # and also restart the _schedule_display_update loop.
-            # GUI should reflect intent to play.
-            if self.master.winfo_exists(): self.play_pause_button.config(text="Pause") 
-
-
-    def _send_audio_command(self, command, data, debug_msg=""):
-        data_summary = type(data).__name__ if data is not None else 'None'
-        if isinstance(data, dict): data_summary = f"dict_keys({list(data.keys())})"
-        logger.debug(f"DEBUG: {debug_msg if debug_msg else 'GUI - Sending command:'} {command}, Data: {data_summary}")
-        self.audio_command_queue.put((command, data))
-
-    # --- Audio Management Thread ---
-    def _audio_management_loop(self):
-        logger.debug("DEBUG: AudioThread - Started")
-        current_managed_stream = None # Stream object managed by this thread
-        
-        # These are instance variables, set by CMD_LOAD_FILE, used by _sd_callback via self
-        # self.audio_thread_data, self.audio_thread_sample_rate etc.
-
-        while not self.audio_thread_stop_event.is_set():
-            try:
-                command, data = self.audio_command_queue.get(timeout=0.05)
-                logger.debug(f"DEBUG: AudioThread - Received command: {command}")
-
-                if command == CMD_LOAD_FILE:
-                    logger.debug("DEBUG: AudioThread - Processing LOAD_FILE")
-                    with self.stream_lock: 
-                        if current_managed_stream: 
-                            current_managed_stream.abort(ignore_errors=True)
-                            current_managed_stream.close(ignore_errors=True)
-                            current_managed_stream = None
-                        
-                        self.audio_thread_data = data['audio_data']
-                        self.audio_thread_sample_rate = data['sample_rate']
-                        self.audio_thread_total_samples = data['total_samples']
-                        self.audio_thread_current_frame = 0 
-                        self.current_playback_frame_shared = 0 
-                    logger.debug("DEBUG: AudioThread - New audio data processed for LOAD_FILE")
-
-                elif command == CMD_PLAY:
-                    logger.debug("DEBUG: AudioThread - Processing PLAY")
-                    with self.stream_lock: 
-                        if self.audio_thread_data is None: 
-                            logger.debug("DEBUG: AudioThread - No audio to play for PLAY command")
-                            self.is_playing_desired_state = False 
-                            self.master.after(0, lambda: self.play_pause_button.config(text="Play") if self.master.winfo_exists() else None)
-                            continue 
-
-                        self.is_playing_desired_state = True # Confirm desired state is play
-                        self.audio_thread_current_frame = self.current_playback_frame_shared # Sync from shared
-                        
-                        if self.audio_thread_current_frame >= self.audio_thread_total_samples: 
-                            self.audio_thread_current_frame = 0
-                        
-                        if current_managed_stream: # Clean up if not None
-                            logger.debug("DEBUG: AudioThread - PLAY: Cleaning up old stream.")
-                            current_managed_stream.abort(ignore_errors=True)
-                            current_managed_stream.close(ignore_errors=True)
-                            current_managed_stream = None
-
-                        logger.debug(f"DEBUG: AudioThread - Creating new stream for PLAY. SR: {self.audio_thread_sample_rate}, Frame: {self.audio_thread_current_frame}")
-                        current_managed_stream = sd.OutputStream(
-                            samplerate=self.audio_thread_sample_rate, channels=1,
-                            callback=self._sd_callback, 
-                            finished_callback=lambda: self.master.after(0, self._handle_stream_finished)
-                        )
-                        # Store this stream reference on the instance for the audio thread to manage
-                        self.playback_stream_obj = current_managed_stream
-                        current_managed_stream.start()
-                        logger.debug("DEBUG: AudioThread - New stream started for PLAY.")
-                    
-                    self.master.after(0, self._schedule_display_update) 
-                    
-                elif command == CMD_PAUSE:
-                    logger.debug("DEBUG: AudioThread - Processing PAUSE")
-                    # is_playing_desired_state already set to False by GUI thread
-                    if current_managed_stream and current_managed_stream.active:
-                        logger.debug("DEBUG: AudioThread - Stopping stream for PAUSE.")
-                        current_managed_stream.stop(ignore_errors=True) 
-                        logger.debug("DEBUG: AudioThread - Stream stopped for PAUSE.")
-                    # finished_callback might be triggered by stop(). 
-                    # _handle_stream_finished will check seek_flag.
-
-                elif command == CMD_SEEK:
-                    seek_info = data 
-                    new_seek_frame = seek_info['frame']
-                    gui_wants_to_continue_playing = seek_info['was_playing']
-                    
-                    logger.debug(f"DEBUG: AudioThread - Processing SEEK to frame {new_seek_frame}, gui_wants_to_continue_playing: {gui_wants_to_continue_playing}")
-                    
-                    if current_managed_stream:
-                        logger.debug("DEBUG: AudioThread - SEEK: Aborting and closing existing stream.")
-                        current_managed_stream.abort(ignore_errors=True) 
-                        current_managed_stream.close(ignore_errors=True)
-                        current_managed_stream = None 
-                        logger.debug("DEBUG: AudioThread - SEEK: Existing stream aborted and closed.")
-                    
-                    with self.stream_lock:
-                        self.audio_thread_current_frame = new_seek_frame
-                        self.current_playback_frame_shared = new_seek_frame
-                    
-                    if gui_wants_to_continue_playing: 
-                        logger.debug("DEBUG: AudioThread - SEEK: Was playing, queueing internal PLAY cmd to restart.")
-                        with self.stream_lock: # Ensure desired state is Play before queueing PLAY
-                            self.is_playing_desired_state = True 
-                        self.audio_command_queue.put((CMD_PLAY, None)) 
-                    else: # If not continuing play, ensure state is not playing
-                        with self.stream_lock:
-                            self.is_playing_desired_state = False
-                        # GUI button text should be handled by _gui_on_slider_release if it wasn't playing
-
-                    logger.debug("DEBUG: AudioThread - SEEK processed.")
-
-
-                elif command == CMD_STOP_STREAM_FORCED: 
-                    logger.debug("DEBUG: AudioThread - Processing CMD_STOP_STREAM_FORCED")
-                    if current_managed_stream:
-                        current_managed_stream.abort(ignore_errors=True)
-                        current_managed_stream.close(ignore_errors=True)
-                        current_managed_stream = None
-                    with self.stream_lock: 
-                        self.audio_thread_current_frame = 0 
-                        self.current_playback_frame_shared = 0
-                        self.is_playing_desired_state = False
-
-
-                elif command == CMD_SHUTDOWN:
-                    logger.debug("DEBUG: AudioThread - Processing SHUTDOWN")
-                    if current_managed_stream:
-                        current_managed_stream.abort(ignore_errors=True)
-                        current_managed_stream.close(ignore_errors=True)
-                        current_managed_stream = None
-                    break 
-
-                self.audio_command_queue.task_done()
-            except queue.Empty:
-                # This timeout allows checking self.audio_thread_stop_event regularly
-                # Also, can do cleanup if stream stopped on its own.
-                if current_managed_stream and not current_managed_stream.active : 
-                    is_desired_playing_now = False
-                    with self.stream_lock: is_desired_playing_now = self.is_playing_desired_state
-                    
-                    if not is_desired_playing_now and not current_managed_stream.closed : 
-                        logger.debug("DEBUG: AudioThread - Stream inactive, desired state not playing, closing stream.")
-                        current_managed_stream.close(ignore_errors=True)
-                        current_managed_stream = None 
-                continue
-            except Exception as e:
-                logger.error(f"ERROR in _audio_management_loop: {e}")
-                import traceback
-                traceback.print_exc()
-                if current_managed_stream:
-                    try: current_managed_stream.abort(ignore_errors=True); current_managed_stream.close(ignore_errors=True)
-                    except: pass
-                    current_managed_stream = None
-                with self.stream_lock: self.is_playing_desired_state = False 
-
-        with self.stream_lock: # Update the instance ref on thread exit
-            self.playback_stream_obj = current_managed_stream # This thread's stream
-        logger.debug("DEBUG: AudioThread - Loop finished, thread ending.")
-
-    def _sd_callback(self, outdata, frames, time_info, status_obj):
-        if status_obj:
-            if status_obj.output_underflow: logger.warning("WARNING: AT_CB - Output underflow")
-
-        with self.stream_lock: 
-            if not self.is_playing_desired_state or self.audio_thread_data is None:
-                outdata[:] = 0
-                if not self.is_playing_desired_state and self.audio_thread_data is not None:
-                    # logger.debug("DEBUG: AT_CB - is_playing_desired_state is False. Raising CallbackStop.")
-                    raise sd.CallbackStop 
-                return 
-            
-            current_frame_for_chunk = self.audio_thread_current_frame
-            remaining_frames_in_track = self.audio_thread_total_samples - current_frame_for_chunk
-
-            if remaining_frames_in_track <= 0: 
-                outdata[:] = 0
-                # logger.debug("DEBUG: AT_CB - End of track reached.")
-                self.master.after(0, self._handle_stream_finished) 
-                raise sd.CallbackStop 
-            
-            valid_frames_to_play = min(frames, remaining_frames_in_track)
-            try:
-                if current_frame_for_chunk < 0 or \
-                   (current_frame_for_chunk + valid_frames_to_play > self.audio_thread_total_samples):
-                     outdata[:] = 0; logger.error(f"ERROR: AT_CB - Invalid frame range."); 
-                     self.master.after(0, self._handle_stream_finished)
-                     raise sd.CallbackStop
-                outdata[:valid_frames_to_play] = self.audio_thread_data[current_frame_for_chunk : current_frame_for_chunk + valid_frames_to_play].reshape(-1, 1)
-            except Exception as e:
-                logger.error(f"ERROR: AT_CB - Slicing error: {e}"); outdata[:] = 0; 
-                self.master.after(0, self._handle_stream_finished)
-                raise sd.CallbackStop
-            
-            if valid_frames_to_play < frames: outdata[valid_frames_to_play:] = 0
-            
-            self.audio_thread_current_frame += valid_frames_to_play
-            self.current_playback_frame_shared = self.audio_thread_current_frame
-
-
-    def _handle_stream_finished(self): 
-        logger.debug("DEBUG: GUI - _handle_stream_finished called")
-        
-        was_seek_in_progress = False
-        with self.stream_lock:
-            was_seek_in_progress = self.seek_in_progress_flag
-            self.seek_in_progress_flag = False 
-
-            # Only change desired state to False if it wasn't a seek that intends to continue.
-            # If it was a seek, the audio thread's CMD_PLAY will set is_playing_desired_state=True.
-            if not was_seek_in_progress:
-                logger.debug("DEBUG: GUI - _handle_stream_finished: Not a seek, setting desired_state=False.")
-                self.is_playing_desired_state = False
-            else:
-                logger.debug("DEBUG: GUI - _handle_stream_finished: Seek was in progress. is_playing_desired_state not changed here.")
-            
-            # The audio thread is responsible for setting its current_managed_stream to None.
-            # This callback just handles GUI side of stream finishing.
-        
-        if self.master.winfo_exists():
-            current_desired_playing = False
-            with self.stream_lock: current_desired_playing = self.is_playing_desired_state
-            
-            if not current_desired_playing: # Update button if truly stopped now
-                self.play_pause_button.config(text="Play")
-            
-            # Stop GUI updates ONLY if we are certain playback is not going to continue immediately (e.g. after seek)
-            if self.update_job_id and not current_desired_playing : 
-                self.master.after_cancel(self.update_job_id)
-                self.update_job_id = None
-            
-            final_display_frame = 0
-            with self.stream_lock: final_display_frame = self.current_playback_frame_shared
-
-            if self.audio_file_loaded:
-                if not was_seek_in_progress and final_display_frame >= self.total_duration_samples_gui : 
-                    final_display_frame = self.total_duration_samples_gui 
-            
-            current_time_sec = final_display_frame / float(self.sample_rate_gui) if self.sample_rate_gui > 0 else 0
-            current_time_sec = min(current_time_sec, self.total_duration_seconds_gui if self.audio_file_loaded else 0)
-
-            try: 
-                if self.master.winfo_exists(): self.seek_slider_var.set(current_time_sec)
-            except tk.TclError: pass
-            self._update_time_display(current_time_sec, self.total_duration_seconds_gui if self.audio_file_loaded else 0)
-            self._update_beat_label(current_time_sec)
-        logger.debug("DEBUG: GUI - _handle_stream_finished finished")
-
-
-    def _schedule_display_update(self):
-        # logger.debug("DEBUG: GUI - _schedule_display_update called") # Can be very verbose
-        is_playing_for_update = False
-        with self.stream_lock: is_playing_for_update = self.is_playing_desired_state
-        
-        if self.update_job_id: # Always cancel previous if exists
-            if self.master.winfo_exists(): self.master.after_cancel(self.update_job_id)
-            self.update_job_id = None
-
-        if is_playing_for_update and self.audio_file_loaded and self.master.winfo_exists():
-            self._update_display_elements() # Call once immediately
-            self.update_job_id = self.master.after(UPDATE_INTERVAL_MS, self._schedule_display_update)
-
-
-    def _update_display_elements(self):
-        current_frame_display = 0
-        is_playing_now = False
-        
-        with self.stream_lock: 
-            if not self.is_playing_desired_state or not self.audio_file_loaded: return
-            current_frame_display = self.current_playback_frame_shared
-            is_playing_now = self.is_playing_desired_state
-
-        if not is_playing_now: return 
-            
-        current_time_sec = current_frame_display / float(self.sample_rate_gui) if self.sample_rate_gui > 0 else 0
-        current_time_sec = min(current_time_sec, self.total_duration_seconds_gui)
-
-        if not self.master.winfo_exists(): return
+            self._start_playback()
+    
+    def _start_playback(self):
+        if not self.file_loaded:
+            return
+        self.is_playing = True
+        self.play_pause_button.config(text="Pause")
+        self.stop_playback.clear()
+        self._playback_start_time = time.time()
+        self._playback_start_pos = self.current_position
+        self.playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self.playback_thread.start()
+        self._schedule_position_update()
+    
+    def _pause_playback(self):
+        self.is_playing = False
+        self.play_pause_button.config(text="Play")
+        self.stop_playback.set()
+        if self.play_obj:
+            self.play_obj.stop()
+        if self.position_update_id:
+            self.master.after_cancel(self.position_update_id)
+            self.position_update_id = None
+    
+    def _playback_loop(self):
         try:
-            # Only update slider if the mouse button is not currently pressed on it
-            # This is tricky with ttk.Scale. A simpler way is to just always update.
-            # If slider jumpiness during drag is an issue, more complex state needed.
-            self.seek_slider_var.set(current_time_sec)
-            self._update_time_display(current_time_sec, self.total_duration_seconds_gui) 
-            self._update_beat_label(current_time_sec) 
-        except tk.TclError: pass 
-
-    def _update_time_display(self, current_seconds, total_seconds):
-        try:
-            if not self.master.winfo_exists(): return
-            current_str = time.strftime('%M:%S', time.gmtime(current_seconds))
-            total_str = time.strftime('%M:%S', time.gmtime(total_seconds))
-            self.time_label.config(text=f"Time: {current_str} / {total_str}")
-        except tk.TclError: pass
-
-    def _update_beat_label(self, current_time_seconds): 
-        try:
-            if not self.master.winfo_exists(): return
-            has_beats = False
-            if self.audio_file_loaded and isinstance(self.beat_timestamps_gui, np.ndarray) and self.beat_timestamps_gui.size > 0:
-                has_beats = True
-            
-            if has_beats:
-                count = np.searchsorted(self.beat_timestamps_gui, current_time_seconds, side='right')
-                self.beat_label.config(text=f"Beat: {count}")
-            else: 
-                self.beat_label.config(text="Beat: --")
-        except tk.TclError: pass
-
+            # Calculate start and end in ms
+            start_ms = int(self.current_position * 1000)
+            segment = self.audio_segment[start_ms:]
+            # Convert to raw audio for simpleaudio
+            raw_data = segment.raw_data
+            num_channels = segment.channels
+            bytes_per_sample = segment.sample_width
+            sample_rate = segment.frame_rate
+            self.play_obj = sa.play_buffer(raw_data, num_channels, bytes_per_sample, sample_rate)
+            # Wait for playback to finish or be stopped
+            while self.play_obj.is_playing() and not self.stop_playback.is_set():
+                time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Playback error: {e}")
+    
+    def _schedule_position_update(self):
+        if self.is_playing and self.file_loaded:
+            self._update_position()
+            self.position_update_id = self.master.after(100, self._schedule_position_update)
+    
+    def _update_position(self):
+        if not self.is_playing:
+            return
+        elapsed = time.time() - self._playback_start_time if self._playback_start_time else 0
+        self.current_position = min(self._playback_start_pos + elapsed, self.duration_seconds)
+        self._update_position_display()
+    
+    def _update_position_display(self):
+        if not self.file_loaded:
+            return
+        position_str = time.strftime('%M:%S', time.gmtime(float(self.current_position)))
+        self.position_label.config(text=f"Position: {position_str}")
+        if not getattr(self, '_slider_dragging', False):
+            self.seek_slider_var.set(self.current_position)
+        # Calculate current beat number
+        if self.beat_timestamps.size > 0:
+            current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='right'))
+            self.beat_label.config(text=f"Beat: {current_beat_idx + 1}")
+        else:
+            self.beat_label.config(text="Beat: --")
+    
+    def _on_slider_click(self, event):
+        if not self.file_loaded:
+            return
+        slider = event.widget
+        slider_length = slider.winfo_width()
+        click_x = event.x
+        minval = float(slider.cget("from"))
+        maxval = float(slider.cget("to"))
+        value = minval + (maxval - minval) * click_x / slider_length
+        self.seek_slider_var.set(value)
+        self._seek_to_position(value)
+    
+    def _on_slider_release(self, event):
+        self._slider_dragging = False
+        if not self.file_loaded:
+            return
+        position = self.seek_slider_var.get()
+        self._seek_to_position(position)
+    
+    def _on_slider_drag(self, event):
+        if not self.file_loaded:
+            return
+        self._slider_dragging = True
+        position = self.seek_slider_var.get()
+        self.current_position = float(position)
+        self._update_position_display()
+    
+    def _seek_to_position(self, position_seconds):
+        if not self.file_loaded:
+            return
+        position_seconds = max(0, min(position_seconds, self.duration_seconds))
+        self.current_position = float(position_seconds)
+        was_playing = self.is_playing
+        self._pause_playback()
+        if was_playing:
+            self._start_playback()
+        self._update_position_display()
+        logger.info(f"Seeked to {position_seconds:.2f}s")
+    
+    def _seek_forward_beat(self, event):
+        if not self.file_loaded or not self.beat_timestamps.size:
+            return
+        current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='right'))
+        if current_beat_idx < len(self.beat_timestamps):
+            next_beat_time = self.beat_timestamps[current_beat_idx]
+            self._seek_to_position(next_beat_time)
+    
+    def _seek_backward_beat(self, event):
+        if not self.file_loaded or not self.beat_timestamps.size:
+            return
+        current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='left'))
+        if current_beat_idx > 0:
+            prev_beat_time = self.beat_timestamps[current_beat_idx - 1]
+            self._seek_to_position(prev_beat_time)
+    
     def on_closing(self):
-        logger.debug("DEBUG: GUI - on_closing called")
-        self.audio_thread_stop_event.set() 
-        self._send_audio_command(CMD_SHUTDOWN, None, "GUI - Sending SHUTDOWN to audio thread")
-        
-        logger.debug("DEBUG: GUI - Waiting for audio thread to join...")
-        self.audio_thread.join(timeout=2.0) 
-        if self.audio_thread.is_alive():
-            logger.warning("WARNING: GUI - Audio thread did not join in time.")
-            # If thread is stuck, self.playback_stream_obj might be the audio thread's last stream
-            with self.stream_lock:
-                stream_to_kill = self.playback_stream_obj 
-            if stream_to_kill:
-                try:
-                    logger.warning("WARNING: GUI - Forcing abort/close on lingering stream during unresponsive shutdown.")
-                    stream_to_kill.abort(ignore_errors=True)
-                    stream_to_kill.close(ignore_errors=True)
-                except Exception as e_close:
-                    logger.error(f"ERROR: GUI - Exception during forced stream close: {e_close}")
-        
-        if self.update_job_id: 
-            if self.master.winfo_exists(): self.master.after_cancel(self.update_job_id)
-        
-        if self.master.winfo_exists():
-            self.master.destroy()
-        logger.debug("DEBUG: GUI - on_closing finished")
+        self._pause_playback()
+        self.master.destroy()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Interactive Beat Viewer for audio files.")
+def main():
+    parser = argparse.ArgumentParser(description="Simple audio player with BPM detection")
     parser.add_argument("filepath", type=str, nargs='?', default=None,
-                        help="Optional. Path to the audio file to load initially.")
+                       help="Optional. Path to the audio file to load initially.")
     args = parser.parse_args()
-
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     root = tk.Tk()
-    app = BeatViewerApp(root, initial_filepath=args.filepath)
+    app = PlaySongApp(root, initial_filepath=args.filepath)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
-    logger.debug("DEBUG: Mainloop exited.")
+
+if __name__ == "__main__":
+    main() 
