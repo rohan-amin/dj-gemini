@@ -167,25 +167,45 @@ class Deck:
         return True
 
     def get_frame_from_beat(self, beat_number):
-        """Get frame number for a specific beat, accounting for ramp adjustments"""
-        # Ensure beat_number is an integer
-        beat_number = int(beat_number)
-        
-        # Always use original beat positions as the musical reference
-        if beat_number in self.original_beat_positions:
-            original_frame = self.original_beat_positions[beat_number]
-            
-            # If we're in a tempo ramp, scale the position to maintain musical timing
-            if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
-                # Scale the frame position by the tempo ratio to maintain musical position
-                scaled_frame = int(original_frame / self._current_tempo_ratio)
-                logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ratio: {self._current_tempo_ratio:.3f})")
-                return scaled_frame
+        """Get frame number for a specific (possibly fractional) beat, accounting for ramp adjustments"""
+        # If beat_number is integer and exists, use direct lookup
+        if isinstance(beat_number, float) and not beat_number.is_integer():
+            lower_beat = int(np.floor(beat_number))
+            upper_beat = int(np.ceil(beat_number))
+            # Clamp to valid range
+            lower_beat = max(1, lower_beat)
+            upper_beat = max(1, upper_beat)
+            # If both beats exist, interpolate
+            if lower_beat in self.original_beat_positions and upper_beat in self.original_beat_positions:
+                lower_frame = self.original_beat_positions[lower_beat]
+                upper_frame = self.original_beat_positions[upper_beat]
+                frac = beat_number - lower_beat
+                interp_frame = int(lower_frame + frac * (upper_frame - lower_frame))
+                # If in tempo ramp, scale
+                if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
+                    interp_frame = int(interp_frame / self._current_tempo_ratio)
+                return interp_frame
+            # Fallback: use nearest
+            elif lower_beat in self.original_beat_positions:
+                return self.original_beat_positions[lower_beat]
+            elif upper_beat in self.original_beat_positions:
+                return self.original_beat_positions[upper_beat]
             else:
-                return original_frame
+                logger.warning(f"Deck {self.deck_id} - Fractional beat {beat_number} not found in original positions")
+                return 0
         else:
-            logger.warning(f"Deck {self.deck_id} - Beat {beat_number} not found in original positions")
-            return 0
+            beat_number = int(round(beat_number))
+            if beat_number in self.original_beat_positions:
+                original_frame = self.original_beat_positions[beat_number]
+                if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
+                    scaled_frame = int(original_frame / self._current_tempo_ratio)
+                    logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ratio: {self._current_tempo_ratio:.3f})")
+                    return scaled_frame
+                else:
+                    return original_frame
+            else:
+                logger.warning(f"Deck {self.deck_id} - Beat {beat_number} not found in original positions")
+                return 0
 
     def get_frame_from_cue(self, cue_name):
         if not self.cue_points or cue_name not in self.cue_points:
