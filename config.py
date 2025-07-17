@@ -56,6 +56,14 @@ def ensure_dir_exists(dir_path):
 # ensure_dir_exists(BEATS_CACHE_DIR)   
 # print("DEBUG: CONFIG - Directory check complete.")
 
+# Global setting for EQ smoothing duration (in milliseconds).
+# This controls how quickly EQ changes are interpolated to prevent clicks/pops
+# when using the set_eq command (i.e., for near-instant EQ changes).
+# It does NOT affect the fade_eq command, which uses its own per-action duration.
+# Lower values make transitions faster (more 'instant'), but too low may reintroduce artifacts.
+# Typical range: 0.5-5.0 ms. Default is 0.5 ms for near-instant, click-free EQ changes.
+EQ_SMOOTHING_MS = 0.5
+
 if __name__ == '__main__':
     logger.info(f"Project Root Directory: {PROJECT_ROOT_DIR}")
     logger.info(f"Audio Tracks Directory: {AUDIO_TRACKS_DIR}")

@@ -91,7 +91,7 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "ramp_tempo"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -154,6 +154,53 @@ class AudioEngine:
                     return False
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_volume' parameters not valid numbers. Params: {params}")
+                return False
+        
+        elif command == "set_eq":
+            params = action.get("parameters", {})
+            # At least one EQ band must be specified
+            eq_bands = ["low", "mid", "high"]
+            found_bands = [band for band in eq_bands if band in params]
+            
+            if not found_bands:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_eq' must specify at least one of: 'low', 'mid', 'high'. Params: {params}")
+                return False
+            
+            try:
+                for band in found_bands:
+                    value = float(params[band])
+                    if value < 0.0 or value > 2.0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{band}' must be between 0.0 and 2.0. Value: {value}")
+                        return False
+            except (ValueError, TypeError):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_eq' parameters not valid numbers. Params: {params}")
+                return False
+        
+        elif command == "fade_eq":
+            params = action.get("parameters", {})
+            # At least one EQ band must be specified
+            eq_bands = ["target_low", "target_mid", "target_high"]
+            found_bands = [band for band in eq_bands if band in params]
+            
+            if not found_bands:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_eq' must specify at least one of: 'target_low', 'target_mid', 'target_high'. Params: {params}")
+                return False
+            
+            try:
+                for band in found_bands:
+                    value = float(params[band])
+                    if value < 0.0 or value > 2.0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{band}' must be between 0.0 and 2.0. Value: {value}")
+                        return False
+                
+                # Validate duration if present
+                if "duration_seconds" in params:
+                    duration = float(params["duration_seconds"])
+                    if duration < 0.0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'duration_seconds' must be positive. Value: {duration}")
+                        return False
+            except (ValueError, TypeError):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_eq' parameters not valid numbers. Params: {params}")
                 return False
         elif command == "crossfade":
             params = action.get("parameters", {})
@@ -653,6 +700,25 @@ class AudioEngine:
                 target_volume = float(params.get("target_volume"))
                 duration_seconds = float(params.get("duration_seconds"))
                 deck.fade_volume(target_volume, duration_seconds)
+            
+            elif command == "set_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                low = params.get("low")
+                mid = params.get("mid")
+                high = params.get("high")
+                deck.set_eq(low=low, mid=mid, high=high)
+            
+            elif command == "fade_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                target_low = params.get("target_low")
+                target_mid = params.get("target_mid")
+                target_high = params.get("target_high")
+                duration_seconds = float(params.get("duration_seconds", 1.0))
+                deck.fade_eq(target_low=target_low, target_mid=target_mid, target_high=target_high, duration_seconds=duration_seconds)
             
             elif command == "crossfade":
                 params = action_dict.get("parameters", {})

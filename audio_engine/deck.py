@@ -11,6 +11,8 @@ import essentia.standard as es
 import numpy as np
 import sounddevice as sd
 import librosa
+from scipy import signal
+from config import EQ_SMOOTHING_MS
 
 # Command constants for the Deck's internal audio thread
 DECK_CMD_LOAD_AUDIO = "LOAD_AUDIO"
@@ -93,7 +95,50 @@ class Deck:
         self._fade_start_time = None
         self._fade_duration = None
 
-        self.playback_stream_obj = None 
+        # Add EQ control
+        self._eq_low = 1.0    # 0.0 to 2.0 (cut/boost)
+        self._eq_mid = 1.0
+        self._eq_high = 1.0
+        self._eq_filters_initialized = False
+        self._eq_low_filter = None
+        self._eq_mid_filter = None
+        self._eq_high_filter = None
+        
+        # Add EQ smoothing to reduce artifacts
+        self._eq_smoothing_frames = max(1, int(self.sample_rate * (EQ_SMOOTHING_MS / 1000.0)))  # 0.5ms smoothing window
+        self._eq_smoothing_counter = 0
+        self._eq_smoothing_active = False
+        self._eq_smoothing_start = {'low': 1.0, 'mid': 1.0, 'high': 1.0}
+        self._eq_smoothing_target = {'low': 1.0, 'mid': 1.0, 'high': 1.0}
+        
+        # Add filter state for continuous filtering
+        self._eq_low_state = None
+        self._eq_mid_state = None
+        self._eq_high_state = None
+        
+        # Add EQ transition smoothing to eliminate artifacts
+        # self._eq_transition_frames = 64  # Short transition to eliminate click
+        # self._eq_transition_counter = 0
+        # self._eq_previous_low = 1.0
+        # self._eq_previous_mid = 1.0
+        # self._eq_previous_high = 1.0
+        
+        # EQ fade state (similar to volume fade)
+        self._fade_target_eq_low = None
+        self._fade_target_eq_mid = None
+        self._fade_target_eq_high = None
+        self._fade_start_eq_low = None
+        self._fade_start_eq_mid = None
+        self._fade_start_eq_high = None
+        self._fade_start_time_eq = None
+        self._fade_duration_eq = None
+
+        # Buffer-synchronized EQ changes to eliminate clicking
+        self._eq_pending_low = None
+        self._eq_pending_mid = None
+        self._eq_pending_high = None
+        self._eq_pending_change = False
+        self.playback_stream_obj = None
 
         # Add to Deck class initialization
         self._tempo_cache = {}  # Cache processed audio for different tempos
@@ -107,6 +152,169 @@ class Deck:
 
         self.audio_thread.start()
         logger.debug(f"Deck {self.deck_id} - Initialized and audio thread started.")
+
+    def _initialize_eq_filters(self):
+        """Initialize EQ filters for real-time processing"""
+        if self._eq_filters_initialized or self.sample_rate == 0:
+            return
+        
+        try:
+            from scipy import signal
+            
+            # True DJ-style shelving filters (like Pioneer DJM mixers)
+            low_shelf_freq = 120.0   # Hz - low shelf frequency
+            high_shelf_freq = 6000.0 # Hz - high shelf frequency
+            mid_low_freq = 400.0     # Hz - mid band low frequency
+            mid_high_freq = 2500.0   # Hz - mid band high frequency
+            
+            nyquist = self.sample_rate / 2.0
+            
+            # True DJ-style EQ filters (like Pioneer DJM, Serato, Traktor)
+            # Low: Low shelf filter (affects frequencies below cutoff)
+            # Mid: Peak/Bell filter (affects frequencies around center)
+            # High: High shelf filter (affects frequencies above cutoff)
+            
+            # Complementary filter design - filters sum to unity to avoid spectral holes
+            # This eliminates clicking by ensuring no frequency content is lost
+            
+            # Low band: frequencies below 120Hz
+            self._eq_low_filter = signal.butter(2, low_shelf_freq/nyquist, btype='low')
+            
+            # Mid band: frequencies between 120-6000Hz (complementary to low/high)
+            self._eq_mid_filter = signal.butter(2, [low_shelf_freq/nyquist, high_shelf_freq/nyquist], btype='band')
+            
+            # High band: frequencies above 6000Hz
+            self._eq_high_filter = signal.butter(2, high_shelf_freq/nyquist, btype='high')
+
+            # Initialize persistent filter state for each band
+            if self._eq_low_filter is not None:
+                self._eq_low_state = signal.lfilter_zi(self._eq_low_filter[0], self._eq_low_filter[1])
+            if self._eq_mid_filter is not None:
+                self._eq_mid_state = signal.lfilter_zi(self._eq_mid_filter[0], self._eq_mid_filter[1])
+            if self._eq_high_filter is not None:
+                self._eq_high_state = signal.lfilter_zi(self._eq_high_filter[0], self._eq_high_filter[1])
+            
+            self._eq_filters_initialized = True
+            logger.debug(f"Deck {self.deck_id} - EQ filters initialized for sample rate {self.sample_rate}")
+            
+        except ImportError:
+            logger.warning(f"Deck {self.deck_id} - SciPy not available, EQ disabled")
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to initialize EQ filters: {e}")
+            # Fallback to simple EQ without filters
+            self._eq_filters_initialized = True
+            self._eq_low_filter = None
+            self._eq_mid_filter = None
+            self._eq_high_filter = None
+            self._eq_low_state = None
+            self._eq_mid_state = None
+            self._eq_high_state = None
+
+    def apply_eq(self, audio_chunk):
+        """Apply EQ filtering to audio chunk with gain smoothing"""
+        logger.debug(f"Deck {self.deck_id} - apply_eq called, chunk shape: {audio_chunk.shape}")
+        
+        if (not self._eq_filters_initialized or
+            (self._eq_low == 1.0 and self._eq_mid == 1.0 and self._eq_high == 1.0)):
+            logger.debug(f"Deck {self.deck_id} - No EQ applied (neutral or not initialized)")
+            return audio_chunk  # No EQ applied
+        
+        try:
+            # Ensure audio_chunk is 1D for processing
+            if audio_chunk.ndim == 2:
+                audio_1d = audio_chunk[:, 0]  # Take first channel
+            else:
+                audio_1d = audio_chunk
+            
+            # Add safety checks for audio data
+            if len(audio_1d) == 0:
+                logger.warning(f"Deck {self.deck_id} - Empty audio chunk, skipping EQ")
+                return audio_chunk
+            
+            # Check for NaN or inf values
+            if np.any(np.isnan(audio_1d)) or np.any(np.isinf(audio_1d)):
+                logger.warning(f"Deck {self.deck_id} - Audio contains NaN/inf values, skipping EQ")
+                return audio_chunk
+            
+            if (self._eq_low_filter is not None and 
+                self._eq_mid_filter is not None and 
+                self._eq_high_filter is not None):
+                logger.debug(f"Deck {self.deck_id} - Using SciPy filtering")
+                try:
+                    # Apply each EQ band with error handling and persistent state
+                    try:
+                        low_band, self._eq_low_state = signal.lfilter(
+                            self._eq_low_filter[0], self._eq_low_filter[1], audio_1d, zi=self._eq_low_state)
+                        logger.debug(f"Deck {self.deck_id} - Low band filter applied successfully")
+                    except Exception as e:
+                        logger.error(f"Deck {self.deck_id} - Low band filter failed: {e}")
+                        low_band = audio_1d.copy() * 0.5  # Fallback to simple scaling
+                        self._eq_low_state = None
+                    try:
+                        mid_band, self._eq_mid_state = signal.lfilter(
+                            self._eq_mid_filter[0], self._eq_mid_filter[1], audio_1d, zi=self._eq_mid_state)
+                        logger.debug(f"Deck {self.deck_id} - Mid band filter applied successfully")
+                    except Exception as e:
+                        logger.error(f"Deck {self.deck_id} - Mid band filter failed: {e}")
+                        mid_band = audio_1d.copy() * 0.5  # Fallback to simple scaling
+                        self._eq_mid_state = None
+                    try:
+                        high_band, self._eq_high_state = signal.lfilter(
+                            self._eq_high_filter[0], self._eq_high_filter[1], audio_1d, zi=self._eq_high_state)
+                        logger.debug(f"Deck {self.deck_id} - High band filter applied successfully")
+                    except Exception as e:
+                        logger.error(f"Deck {self.deck_id} - High band filter failed: {e}")
+                        high_band = audio_1d.copy() * 0.5  # Fallback to simple scaling
+                        self._eq_high_state = None
+
+                    # Use direct EQ values - no smoothing
+                    low_val = self._eq_low
+                    mid_val = self._eq_mid
+                    high_val = self._eq_high
+
+                    # DJ-style EQ mixing - direct band mixing
+                    # Each band is mixed with its gain value
+                    # When gain is 0, that band contributes nothing
+                    
+                    eq_audio_1d = (low_band * low_val) + (mid_band * mid_val) + (high_band * high_val)
+                    
+                    # Calculate RMS levels for debugging
+                    original_rms = np.sqrt(np.mean(audio_1d**2))
+                    eq_rms = np.sqrt(np.mean(eq_audio_1d**2))
+                    rms_ratio = eq_rms / original_rms if original_rms > 0 else 1.0
+                    
+                    # Calculate individual band contributions
+                    low_rms = np.sqrt(np.mean((low_band * low_val)**2)) if low_val > 0 else 0
+                    mid_rms = np.sqrt(np.mean((mid_band * mid_val)**2)) if mid_val > 0 else 0
+                    high_rms = np.sqrt(np.mean((high_band * high_val)**2)) if high_val > 0 else 0
+                    
+                    # Check for potential clicking indicators
+                    max_amplitude_change = np.max(np.abs(eq_audio_1d - audio_1d))
+                    amplitude_ratio = np.max(np.abs(eq_audio_1d)) / np.max(np.abs(audio_1d)) if np.max(np.abs(audio_1d)) > 0 else 1.0
+                    
+                    logger.info(f"Deck {self.deck_id} - EQ levels: low={low_val:.2f}, mid={mid_val:.2f}, high={high_val:.2f}")
+                    logger.info(f"Deck {self.deck_id} - Applied values: low_val={low_val:.3f}, mid_val={mid_val:.3f}, high_val={high_val:.3f}")
+                    logger.info(f"Deck {self.deck_id} - RMS: original={original_rms:.4f}, eq={eq_rms:.4f}, ratio={rms_ratio:.2f}")
+                    logger.info(f"Deck {self.deck_id} - Band RMS: low={low_rms:.4f}, mid={mid_rms:.4f}, high={high_rms:.4f}")
+                    logger.info(f"Deck {self.deck_id} - Click indicators: max_change={max_amplitude_change:.4f}, amp_ratio={amplitude_ratio:.2f}")
+                except Exception as e:
+                    logger.error(f"Deck {self.deck_id} - SciPy filtering failed, using simple EQ: {e}")
+                    eq_audio_1d = audio_1d * ((self._eq_low + self._eq_mid + self._eq_high) / 3.0)
+            else:
+                eq_audio_1d = audio_1d * ((self._eq_low + self._eq_mid + self._eq_high) / 3.0)
+            if np.any(np.isnan(eq_audio_1d)) or np.any(np.isinf(eq_audio_1d)):
+                logger.warning(f"Deck {self.deck_id} - EQ output contains NaN/inf values, using original audio")
+                return audio_chunk
+            if audio_chunk.ndim == 2:
+                eq_audio = eq_audio_1d.reshape(-1, 1)
+            else:
+                eq_audio = eq_audio_1d
+            return eq_audio
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - EQ processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return audio_chunk  # Return original audio on error
 
     def load_track(self, audio_filepath):
         """Load audio track and analyze for BPM and beat detection"""
@@ -149,15 +357,16 @@ class Deck:
             if current_total_frames == 0:
                 logger.error(f"Deck {self.deck_id} - Loaded audio data is empty for {audio_filepath}")
                 return False
-            
             self.total_frames = current_total_frames 
-            
             self.command_queue.put((DECK_CMD_LOAD_AUDIO, {
                 'audio_data': loaded_audio_samples, 
                 'sample_rate': self.sample_rate,    
                 'total_frames': current_total_frames
             }))
-            
+            # Initialize EQ filters for this track
+            self._initialize_eq_filters()
+            # Initialize EQ smoothing frames now that sample_rate is known
+            self._eq_smoothing_frames = max(1, int(self.sample_rate * (EQ_SMOOTHING_MS / 1000.0)))  # 0.5ms smoothing window
         except Exception as e:
             logger.error(f"Deck {self.deck_id} - Failed to load audio samples for {audio_filepath}: {e}")
             return False
@@ -631,6 +840,106 @@ class Deck:
             # Calculate current volume during fade
             progress = elapsed / self._fade_duration
             self._volume = self._fade_start_volume + (self._fade_target_volume - self._fade_start_volume) * progress
+
+    def set_eq(self, low=None, mid=None, high=None):
+        """Set EQ levels (0.0 to 2.0 for each band) with fast smoothing to prevent clicks"""
+        logger.info(f"Deck {self.deck_id} - set_eq called with: low={low}, mid={mid}, high={high}")
+        with self._stream_lock:
+            eq_changed = False
+            if low is not None and abs(low - self._eq_low) > 1e-6:
+                eq_changed = True
+            if mid is not None and abs(mid - self._eq_mid) > 1e-6:
+                eq_changed = True
+            if high is not None and abs(high - self._eq_high) > 1e-6:
+                eq_changed = True
+            if eq_changed:
+                # Start smoothing from current values to new targets
+                self._eq_smoothing_start = {
+                    'low': self._eq_low,
+                    'mid': self._eq_mid,
+                    'high': self._eq_high
+                }
+                self._eq_smoothing_target = {
+                    'low': low if low is not None else self._eq_low,
+                    'mid': mid if mid is not None else self._eq_mid,
+                    'high': high if high is not None else self._eq_high
+                }
+                self._eq_smoothing_counter = 0
+                self._eq_smoothing_active = True
+            logger.info(f"Deck {self.deck_id} - EQ set: Low={self._eq_low:.2f}, Mid={self._eq_mid:.2f}, High={self._eq_high:.2f}")
+            logger.info(f"Deck {self.deck_id} - EQ filters initialized: {self._eq_filters_initialized}")
+            logger.info(f"Deck {self.deck_id} - EQ filters exist: low={self._eq_low_filter is not None}, mid={self._eq_mid_filter is not None}, high={self._eq_high_filter is not None}")
+
+    def fade_eq(self, target_low=None, target_mid=None, target_high=None, duration_seconds=1.0):
+        """Fade EQ levels over time"""
+        with self._stream_lock:
+            self._fade_target_eq_low = target_low
+            self._fade_target_eq_mid = target_mid
+            self._fade_target_eq_high = target_high
+            self._fade_start_eq_low = self._eq_low
+            self._fade_start_eq_mid = self._eq_mid
+            self._fade_start_eq_high = self._eq_high
+            self._fade_start_time_eq = time.time()
+            self._fade_duration_eq = duration_seconds
+            
+            logger.debug(f"Deck {self.deck_id} - EQ fade started: {duration_seconds}s")
+
+    def get_current_eq(self):
+        """Get current EQ levels"""
+        with self._stream_lock:
+            return {
+                'low': self._eq_low,
+                'mid': self._eq_mid,
+                'high': self._eq_high
+            }
+
+    def _update_eq_fade(self):
+        """Update EQ based on active fade"""
+        if (self._fade_target_eq_low is None and 
+            self._fade_target_eq_mid is None and 
+            self._fade_target_eq_high is None):
+            return
+            
+        if (self._fade_start_time_eq is None or 
+            self._fade_duration_eq is None):
+            return
+            
+        current_time = time.time()
+        elapsed = current_time - self._fade_start_time_eq
+        
+        if elapsed >= self._fade_duration_eq:
+            # Fade complete
+            if self._fade_target_eq_low is not None:
+                self._eq_low = self._fade_target_eq_low
+            if self._fade_target_eq_mid is not None:
+                self._eq_mid = self._fade_target_eq_mid
+            if self._fade_target_eq_high is not None:
+                self._eq_high = self._fade_target_eq_high
+            
+            # Reset fade state
+            self._fade_target_eq_low = None
+            self._fade_target_eq_mid = None
+            self._fade_target_eq_high = None
+            self._fade_start_eq_low = None
+            self._fade_start_eq_mid = None
+            self._fade_start_eq_high = None
+            self._fade_start_time_eq = None
+            self._fade_duration_eq = None
+            
+            logger.debug(f"Deck {self.deck_id} - EQ fade complete: Low={self._eq_low:.2f}, Mid={self._eq_mid:.2f}, High={self._eq_high:.2f}")
+        else:
+            # Calculate current EQ during fade
+            progress = elapsed / self._fade_duration_eq
+            
+            if (self._fade_target_eq_low is not None and 
+                self._fade_start_eq_low is not None):
+                self._eq_low = self._fade_start_eq_low + (self._fade_target_eq_low - self._fade_start_eq_low) * progress
+            if (self._fade_target_eq_mid is not None and 
+                self._fade_start_eq_mid is not None):
+                self._eq_mid = self._fade_start_eq_mid + (self._fade_target_eq_mid - self._fade_start_eq_mid) * progress
+            if (self._fade_target_eq_high is not None and 
+                self._fade_start_eq_high is not None):
+                self._eq_high = self._fade_start_eq_high + (self._fade_target_eq_high - self._fade_start_eq_high) * progress
 
     def _update_tempo_ramp(self, current_time=None):
         """Update tempo based on active ramp - USE TIME-BASED PROGRESS"""
@@ -1151,6 +1460,31 @@ class Deck:
                 # FIXED: Apply volume changes using the correct attribute name
                 if hasattr(self, '_volume') and self._volume != 1.0:
                     audio_chunk *= self._volume
+
+                # Update EQ fade before applying EQ
+                self._update_eq_fade()
+                # Apply pending EQ changes at buffer boundary to eliminate clicking
+                if self._eq_pending_change and self._eq_pending_low is not None and self._eq_pending_mid is not None and self._eq_pending_high is not None:
+                    # Instead of abrupt change, start smoothing
+                    self._eq_smoothing_start = {
+                        'low': self._eq_low,
+                        'mid': self._eq_mid,
+                        'high': self._eq_high
+                    }
+                    self._eq_smoothing_target = {
+                        'low': self._eq_pending_low,
+                        'mid': self._eq_pending_mid,
+                        'high': self._eq_pending_high
+                    }
+                    self._eq_smoothing_counter = 0
+                    self._eq_smoothing_active = True
+                    self._eq_pending_change = False
+                    logger.info(f"Deck {self.deck_id} CB - EQ smoothing started: Low={self._eq_pending_low:.2f}, Mid={self._eq_pending_mid:.2f}, High={self._eq_pending_high:.2f}")
+                # Apply EQ smoothing if active
+                self._apply_eq_smoothing()
+                logger.debug(f"Deck {self.deck_id} CB - About to apply EQ, chunk shape: {audio_chunk.shape}")
+                audio_chunk = self.apply_eq(audio_chunk)
+                logger.debug(f"Deck {self.deck_id} CB - EQ applied successfully, output shape: {audio_chunk.shape}")
                 
                 # REMOVED: Crossfade logic that was masking the real issue
                 
@@ -1222,6 +1556,28 @@ class Deck:
                     stream.abort(ignore_errors=True); stream.close(ignore_errors=True)
                 except Exception as e_close: logger.error(f"ERROR: Deck {self.deck_id} - Exception during forced stream close: {e_close}")
         logger.debug(f"DEBUG: Deck {self.deck_id} - Shutdown complete.")
+
+    def _apply_eq_smoothing(self):
+        """Update EQ values if smoothing is active (called in audio callback)"""
+        if self._eq_smoothing_active:
+            if not self._eq_smoothing_frames:
+                # Avoid division by zero
+                self._eq_low = self._eq_smoothing_target['low']
+                self._eq_mid = self._eq_smoothing_target['mid']
+                self._eq_high = self._eq_smoothing_target['high']
+                self._eq_smoothing_active = False
+                return
+            t = (self._eq_smoothing_counter + 1) / self._eq_smoothing_frames
+            t = min(t, 1.0)
+            self._eq_low = self._eq_smoothing_start['low'] + (self._eq_smoothing_target['low'] - self._eq_smoothing_start['low']) * t
+            self._eq_mid = self._eq_smoothing_start['mid'] + (self._eq_smoothing_target['mid'] - self._eq_smoothing_start['mid']) * t
+            self._eq_high = self._eq_smoothing_start['high'] + (self._eq_smoothing_target['high'] - self._eq_smoothing_start['high']) * t
+            self._eq_smoothing_counter += 1
+            if self._eq_smoothing_counter >= self._eq_smoothing_frames:
+                self._eq_low = self._eq_smoothing_target['low']
+                self._eq_mid = self._eq_smoothing_target['mid']
+                self._eq_high = self._eq_smoothing_target['high']
+                self._eq_smoothing_active = False
 
 
 if __name__ == '__main__':

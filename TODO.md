@@ -28,7 +28,11 @@
 ## 🔧 Medium Priority
 - [x] Add volume control per deck ✅ **COMPLETED**
 - [x] Implement crossfading between decks ✅ **COMPLETED**
-- [ ] Add fade in/out effects
+- [x] Add fade_eq command for EQ fade in/out effects ✅ **COMPLETED**
+- [x] Add fast EQ smoothing for set_eq (configurable, click-free) ✅ **COMPLETED**
+- [x] Add global EQ_SMOOTHING_MS config option ✅ **COMPLETED**
+- [x] Fix bug: fade_eq not processed in audio callback ✅ **COMPLETED**
+- [x] Update README and documentation for new EQ features ✅ **COMPLETED**
 - [ ] Support more audio formats (WAV, FLAC, OGG)
 - [ ] Add beatmatching functionality
   - [ ] Implement BPM synchronization between decks
@@ -43,6 +47,7 @@
 - [ ] Export mix as single audio file
 - [ ] Add more curve types for tempo ramps (sine, cosine, custom)
 - [ ] Implement tempo ramping with different curves per deck
+- [ ] Document, test, and improve `seek_and_play` command
 
 ## 🐛 Bugs to Fix
 - [ ] Handle edge case when audio file is corrupted

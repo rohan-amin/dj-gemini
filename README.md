@@ -188,6 +188,23 @@ Stop playback and reset deck position.
 }
 ```
 
+#### `seek_and_play`
+Seek to a specific beat or cue point and start playback immediately on a deck.
+```json
+{
+  "command": "seek_and_play",
+  "deck_id": "deckA",
+  "parameters": {
+    "beat_number": 64,
+    "cue_name": "drop"
+  }
+}
+```
+- `beat_number` (optional): Seek to this beat number and play from there.
+- `cue_name` (optional): Seek to this cue point and play from there.
+- If both are provided, `cue_name` takes precedence.
+- Use to jump to a specific position and start playback in one action.
+
 ### Tempo Control
 
 #### `set_tempo`
@@ -310,6 +327,23 @@ Stop the current loop and continue normal playback.
 
 ### Advanced Control
 
+#### `bpm_match`
+Synchronize the BPM of one deck to another deck's BPM instantly.
+```json
+{
+  "command": "bpm_match",
+  "deck_id": "deckB",
+  "parameters": {
+    "reference_deck": "deckA",
+    "phase_offset_beats": 0.5
+  }
+}
+```
+- `reference_deck`: The deck to match BPM to.
+- `phase_offset_beats` (optional): Apply a fractional beat offset to the matched deck after BPM sync. Use this to fine-tune the phase alignment between decks if the beats are not perfectly aligned after matching BPM.
+- For example, if you notice the downbeats are slightly off after BPM sync, you can set `phase_offset_beats` to a positive or negative value (e.g., 0.5 or -0.25) to nudge the alignment.
+- Use to instantly sync the tempo of two decks for beatmatching, with optional phase correction.
+
 #### `stop_at_beat`
 Stop playback when reaching a specific beat.
 ```json
@@ -319,6 +353,50 @@ Stop playback when reaching a specific beat.
   "parameters": {"beat_number": 64}
 }
 ```
+- `beat_number`: The beat at which to stop playback.
+- Use for precise, beat-synchronized stopping.
+
+#### `deactivate_loop`
+Stop the current loop and continue normal playback.
+```json
+{
+  "command": "deactivate_loop",
+  "deck_id": "deckA"
+}
+```
+- Use to exit a loop and resume normal track progression.
+
+### EQ Control
+
+#### `set_eq`
+Set EQ bands (low, mid, high) instantly (with configurable fast smoothing to prevent clicks).
+
+```json
+{
+  "command": "set_eq",
+  "deck_id": "deckA",
+  "parameters": {"low": 1.0, "mid": 0.5, "high": 0.2}
+}
+```
+- The transition is smoothed over a very short window (default: 0.5ms, configurable via `EQ_SMOOTHING_MS` in `config.py`).
+- Use for near-instant EQ changes (e.g., kill switches, quick boosts).
+
+#### `fade_eq`
+Fade EQ bands (low, mid, high) over a specified duration (in seconds).
+
+```json
+{
+  "command": "fade_eq",
+  "deck_id": "deckA",
+  "parameters": {"target_low": 1.0, "target_mid": 0.0, "target_high": 0.0, "duration_seconds": 2.0}
+}
+```
+- Use for smooth, gradual EQ transitions (e.g., filter sweeps, DJ-style fades).
+- The duration is set per-action and is not affected by `EQ_SMOOTHING_MS`.
+
+**Note:**
+- `set_eq` uses the global smoothing window for click-free, fast changes.
+- `fade_eq` uses the specified duration for gradual transitions.
 
 ## Triggers
 
@@ -555,3 +633,7 @@ python main.py mix_configs/my_mix.json --max_wait_after_script 3600
 - **Audio**: Working audio output device
 - **Memory**: 2GB+ RAM recommended for large audio files
 - **Storage**: Additional space for audio caching (varies by usage)
+
+## Configuration
+
+- `EQ_SMOOTHING_MS`: Global setting (in `config.py`) for how quickly EQ changes are interpolated when using `set_eq`. Lower values make transitions faster (default: 0.5ms). Does not affect `fade_eq`.
