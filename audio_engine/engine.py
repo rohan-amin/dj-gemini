@@ -91,7 +91,7 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -351,8 +351,18 @@ class AudioEngine:
                     return False
                 self._all_actions_from_script.append(action)
             
-            self.script_name = script_data.get("name", "Untitled Mix")
+            self.script_name = script_data.get("mix_name", "Untitled Mix")
             logger.debug(f"AudioEngine - Script '{self.script_name}' loaded and validated with {len(self._all_actions_from_script)} actions.")
+
+            # Build a lookup for track_id -> filepath
+            self.tracks_by_id = {}
+            for track in script_data.get('tracks', []):
+                tid = track.get('track_id')
+                fp = track.get('filepath')
+                if tid and fp:
+                    self.tracks_by_id[tid] = fp
+            logger.debug(f"AudioEngine - Tracks by ID loaded: {len(self.tracks_by_id)}")
+
             return True
             
         except Exception as e:
@@ -540,19 +550,14 @@ class AudioEngine:
 
         try:
             if command == "load_track":
-                if not deck_id or "file_path" not in parameters: logger.warning("'load_track' missing deck_id or file_path. Skipping."); return
+                track_id = action_dict.get("track_id")
+                if not deck_id or not track_id:
+                    logger.warning("'load_track' missing deck_id or track_id. Skipping."); return
+                filepath = self.tracks_by_id.get(track_id)
+                if not filepath:
+                    logger.error(f"Track ID '{track_id}' not found in tracks section. Skipping load_track."); return
                 deck = self._get_or_create_deck(deck_id)
-                file_path_param = parameters["file_path"]
-                track_path = file_path_param 
-                if self.app_config and not os.path.isabs(file_path_param):
-                    constructed_path = os.path.join(self.app_config.AUDIO_TRACKS_DIR, file_path_param)
-                    if os.path.exists(constructed_path): track_path = constructed_path
-                    else: 
-                        constructed_path_alt = os.path.join(self.app_config.PROJECT_ROOT_DIR, file_path_param)
-                        if os.path.exists(constructed_path_alt): track_path = constructed_path_alt
-                        else: logger.warning(f"Track file '{file_path_param}' not found. Trying as is.")
-                logger.debug(f"Attempting to load track from resolved path: {track_path}")
-                deck.load_track(track_path)
+                deck.load_track(filepath)
                 
                 # Handle tempo matching after track is loaded
                 match_tempo_to = parameters.get("match_tempo_to")
@@ -720,6 +725,30 @@ class AudioEngine:
                 duration_seconds = float(params.get("duration_seconds", 1.0))
                 deck.fade_eq(target_low=target_low, target_mid=target_mid, target_high=target_high, duration_seconds=duration_seconds)
             
+            elif command == "play_scratch_sample":
+                if not deck_id: logger.warning("'play_scratch_sample' missing deck_id. Skipping."); return
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                sample_filepath = params.get("sample_filepath")
+                volume = float(params.get("volume", 1.0))
+                
+                if not sample_filepath:
+                    logger.warning("'play_scratch_sample' missing 'sample_filepath' in parameters. Skipping.")
+                    return
+                
+                # Resolve sample path
+                if self.app_config and not os.path.isabs(sample_filepath):
+                    constructed_path = os.path.join(self.app_config.PROJECT_ROOT_DIR, "samples", sample_filepath)
+                    if os.path.exists(constructed_path):
+                        sample_filepath = constructed_path
+                    else:
+                        logger.warning(f"Scratch sample '{sample_filepath}' not found in samples directory. Trying as is.")
+                
+                logger.debug(f"Playing scratch sample: {sample_filepath}")
+                success = deck.play_scratch_sample(sample_filepath=sample_filepath, volume=volume)
+                if not success:
+                    logger.warning(f"Failed to play scratch sample: {sample_filepath}")
+            
             elif command == "crossfade":
                 params = action_dict.get("parameters", {})
                 from_deck_id = params.get("from_deck")
@@ -767,6 +796,20 @@ class AudioEngine:
                 end_bpm = float(params.get("end_bpm"))
                 curve = params.get("curve", "linear")
                 deck.ramp_tempo(start_beat, end_beat, start_bpm, end_bpm, curve)
+            
+            elif command == "scratch":
+                if not deck_id: logger.warning("'scratch' missing deck_id. Skipping."); return
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                pattern = params.get("pattern", [1.0, -1.0])
+                duration_beats = params.get("duration_beats")
+                duration_seconds = params.get("duration_seconds")
+                # Prefer duration_seconds, else convert beats to seconds using BPM
+                if duration_seconds is None and duration_beats is not None and deck.bpm > 0:
+                    duration_seconds = float(duration_beats) * 60.0 / deck.bpm
+                if duration_seconds is None:
+                    logger.warning("'scratch' missing duration (duration_beats or duration_seconds). Skipping."); return
+                deck.trigger_scratch(pattern, duration_seconds)
             
             else: logger.warning(f"Unknown command '{command}'. Skipping.")
         except Exception as e_action:
@@ -839,7 +882,7 @@ if __name__ == '__main__':
     test_json_content = {
         "script_name": "Engine Simplified Loop Test v5.1",
         "actions": [
-            {"id": "loadA", "command": "load_track", "deck_id": "deckA", "parameters": {"file_path": json_audio_path}},
+            {"id": "loadA", "command": "load_track", "deck_id": "deckA", "track_id": "track1"},
             {"id": "playA", "command": "play", "deck_id": "deckA", "parameters": {"start_at_beat": 1}},
             { 
                 "id": "loopA_at_beat_5", "command": "activate_loop", "deck_id": "deckA",
@@ -850,6 +893,9 @@ if __name__ == '__main__':
                 "id": "stop_A_at_beat_15", "command": "stop", "deck_id": "deckA",
                 "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 15} 
             }
+        ],
+        "tracks": [
+            {"track_id": "track1", "filepath": full_test_audio_path}
         ]
     }
     

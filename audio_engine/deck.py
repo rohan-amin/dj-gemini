@@ -28,6 +28,9 @@ DECK_CMD_SET_TEMPO = "SET_TEMPO"
 DECK_CMD_SET_VOLUME = "SET_VOLUME"
 DECK_CMD_FADE_VOLUME = "FADE_VOLUME"
 
+# --- Scratch cut effect config ---
+SCRATCH_CUT_FRAMES = 0  # Disabled for debugging
+
 class Deck:
     def __init__(self, deck_id, analyzer_instance):
         self.deck_id = deck_id
@@ -149,6 +152,19 @@ class Deck:
 
         self.enable_hard_seek_on_loop = True  # PATCH: Toggle for hard seek buffer zeroing on loop activation
         self._just_activated_loop_flush_count = 0  # PATCH: For double-flush after loop activation
+
+        # --- Scratch state (isolated) ---
+        self._scratch_active = False
+        self._scratch_pattern = []
+        self._scratch_duration_frames = 0
+        self._scratch_start_frame = 0
+        self._scratch_start_time = 0.0
+        self._scratch_pattern_index = 0
+        self._scratch_pattern_frames = int(0.5 * self.sample_rate)  # 0.5s per segment for dramatically slower hand movement
+        self._scratch_elapsed_frames = 0
+        self._scratch_window_frames = int(2.0 * self.sample_rate)  # 2.0s window for much larger movement
+        self._scratch_pointer = 0.0
+        self._scratch_cut_remaining = 0
 
         self.audio_thread.start()
         logger.debug(f"Deck {self.deck_id} - Initialized and audio thread started.")
@@ -332,7 +348,11 @@ class Deck:
         self.beat_timestamps = np.array(analysis_data.get('beat_timestamps', []))
         self.bpm = float(analysis_data.get('bpm', 0.0))
         self.cue_points = analysis_data.get('cue_points', {}) 
+        # Store key information
+        self.key = analysis_data.get('key', 'unknown')
+        self.key_confidence = float(analysis_data.get('key_confidence', 0.0))
         logger.debug(f"Deck {self.deck_id} - Loaded cue points: {list(self.cue_points.keys())}")
+        logger.debug(f"Deck {self.deck_id} - Track key: {self.key} (confidence: {self.key_confidence:.2f})")
 
         if self.sample_rate == 0:
             logger.error(f"Deck {self.deck_id} - Invalid sample rate from analysis for {audio_filepath}")
@@ -1332,8 +1352,92 @@ class Deck:
 
         try:
             with self._stream_lock:
-                # REMOVED: Hard seek patch that was causing artifacts
-                # The loop should activate naturally without aggressive frame jumping
+                # --- SCRATCH LOGIC (always runs if active) ---
+                if self._scratch_active:
+                    if self.audio_thread_data is None:
+                        logger.debug(f"DEBUG: Deck {self.deck_id} CB - No audio data for scratch")
+                        outdata[:] = 0
+                        return
+                    logger.info(f"Deck {self.deck_id} - Scratch MINIMAL: pattern={self._scratch_pattern}")
+                    pattern_len = max(1, len(self._scratch_pattern))
+                    seg_frames = self._scratch_pattern_frames
+                    seg_idx = min(self._scratch_pattern_index, pattern_len - 1)
+                    speed = self._scratch_pattern[seg_idx]
+                    scratch_audio = np.zeros((frames,), dtype=np.float32)
+                    for i in range(frames):
+                        self._scratch_pointer += speed
+                        # Clamp pointer to valid buffer range
+                        if self._scratch_pointer < 0:
+                            self._scratch_pointer = 0
+                        if self._scratch_pointer > len(self.audio_thread_data) - 2:
+                            self._scratch_pointer = len(self.audio_thread_data) - 2
+                        idx0 = int(np.floor(self._scratch_pointer))
+                        idx1 = min(idx0 + 1, len(self.audio_thread_data) - 1)
+                        frac = self._scratch_pointer - idx0
+                        sample = (1 - frac) * self.audio_thread_data[idx0] + frac * self.audio_thread_data[idx1]
+                        scratch_audio[i] = sample
+                        if i % 256 == 0:
+                            logger.info(f"Deck {self.deck_id} - Scratch: i={i}, seg_idx={seg_idx}, pointer={self._scratch_pointer:.2f}, speed={speed}, sample={sample:.5f}")
+                    self._scratch_elapsed_frames += frames
+                    if self._scratch_elapsed_frames >= (self._scratch_pattern_index + 1) * seg_frames:
+                        self._scratch_pattern_index += 1
+                        if self._scratch_pattern_index >= pattern_len:
+                            self._scratch_pattern_index = 0  # Loop the pattern
+                    if self._scratch_elapsed_frames >= self._scratch_duration_frames:
+                        self._scratch_active = False
+                        self._scratch_pattern = []
+                        self._scratch_pattern_index = 0
+                        self._scratch_elapsed_frames = 0
+                        self._current_playback_frame_for_display = int(self._scratch_pointer)
+                        logger.info(f"Deck {self.deck_id} - Scratch END, resumed at frame {self._current_playback_frame_for_display}")
+                        # --- Debug: Log the beat number after scratch ---
+                        if hasattr(self, 'beat_timestamps') and self.beat_timestamps is not None and len(self.beat_timestamps) > 0:
+                            new_time = self._current_playback_frame_for_display / float(self.sample_rate)
+                            new_beat = np.searchsorted(self.beat_timestamps, new_time, side='left')
+                            logger.info(f"Deck {self.deck_id} - After scratch, resuming at beat {new_beat} (time={new_time:.3f}s)")
+                        # --- Vinyl mode: Resume playback only if it was playing before ---
+                        if hasattr(self, '_was_playing_before_scratch') and self._was_playing_before_scratch:
+                            self._user_wants_to_play = True
+                            del self._was_playing_before_scratch
+                    if scratch_audio.ndim == 1:
+                        scratch_audio = scratch_audio.reshape(-1, 1)
+                    outdata[:] = scratch_audio
+                    return
+                # --- END SCRATCH LOGIC ---
+
+                # --- SCRATCH SAMPLE LOGIC ---
+                scratch_sample_audio = None
+                if hasattr(self, '_scratch_sample_active') and self._scratch_sample_active:
+                    if hasattr(self, '_scratch_sample_audio') and self._scratch_sample_audio is not None:
+                        # Get the portion of the sample we need
+                        remaining_samples = len(self._scratch_sample_audio) - self._scratch_sample_position
+                        if remaining_samples > 0:
+                            # Calculate how many samples we can output
+                            samples_to_output = min(frames, remaining_samples)
+                            scratch_sample_audio = self._scratch_sample_audio[
+                                self._scratch_sample_position:self._scratch_sample_position + samples_to_output
+                            ]
+                            
+                            # Pad with zeros if needed
+                            if len(scratch_sample_audio) < frames:
+                                padding = np.zeros(frames - len(scratch_sample_audio), dtype=np.float32)
+                                scratch_sample_audio = np.concatenate([scratch_sample_audio, padding])
+                            
+                            self._scratch_sample_position += samples_to_output
+                            
+                            # Check if sample is finished
+                            if self._scratch_sample_position >= len(self._scratch_sample_audio):
+                                self._scratch_sample_active = False
+                                logger.debug(f"Deck {self.deck_id} - Scratch sample finished")
+                        else:
+                            # Sample is finished
+                            self._scratch_sample_active = False
+                            scratch_sample_audio = np.zeros(frames, dtype=np.float32)
+                    else:
+                        # No sample audio available
+                        self._scratch_sample_active = False
+                        scratch_sample_audio = np.zeros(frames, dtype=np.float32)
+                # --- END SCRATCH SAMPLE LOGIC ---
 
                 if not self._user_wants_to_play or self.audio_thread_data is None:
                     logger.debug(f"DEBUG: Deck {self.deck_id} CB - No play or no audio data")
@@ -1494,6 +1598,22 @@ class Deck:
                     # Convert 1D array to 2D array with 1 channel
                     audio_chunk = audio_chunk.reshape(-1, 1)
                 
+                # Mix with scratch sample if active
+                if scratch_sample_audio is not None:
+                    # Ensure scratch sample has correct shape
+                    if scratch_sample_audio.ndim == 1:
+                        scratch_sample_audio = scratch_sample_audio.reshape(-1, 1)
+                    
+                    # Mix the audio (simple addition with potential clipping)
+                    mixed_audio = audio_chunk + scratch_sample_audio
+                    
+                    # Simple limiting to prevent clipping
+                    max_val = np.max(np.abs(mixed_audio))
+                    if max_val > 1.0:
+                        mixed_audio = mixed_audio / max_val * 0.95  # Leave some headroom
+                    
+                    audio_chunk = mixed_audio
+                
                 # REMOVED: Split buffer logic that was causing artifacts
                 
                 # Copy to output
@@ -1578,6 +1698,185 @@ class Deck:
                 self._eq_mid = self._eq_smoothing_target['mid']
                 self._eq_high = self._eq_smoothing_target['high']
                 self._eq_smoothing_active = False
+
+    def trigger_scratch(self, pattern, duration_seconds):
+        """Start a scratch effect with the given pattern and duration (in seconds)"""
+        if self.sample_rate == 0 or self.audio_thread_data is None:
+            logger.warning(f"Deck {self.deck_id} - Cannot start scratch: no audio loaded or sample rate 0.")
+            return
+        self._scratch_active = True
+        self._scratch_pattern = pattern if pattern else [100, -100]
+        self._scratch_duration_frames = int(duration_seconds * self.sample_rate)
+        self._scratch_start_frame = self._current_playback_frame_for_display
+        self._scratch_start_time = time.time()
+        self._scratch_pattern_index = 0
+        # Pattern segment duration: stretch pattern to fit total duration
+        if len(self._scratch_pattern) > 0:
+            self._scratch_pattern_frames = int(self._scratch_duration_frames / len(self._scratch_pattern))
+        else:
+            self._scratch_pattern_frames = self._scratch_duration_frames
+        self._scratch_elapsed_frames = 0
+        self._scratch_window_frames = int(2.0 * self.sample_rate)  # 2.0s window for much larger movement
+        self._scratch_pointer = float(self._scratch_start_frame)
+        self._scratch_cut_remaining = 0
+        # --- Vinyl mode: Pause normal playback and remember state ---
+        self._was_playing_before_scratch = self.is_active()
+        self._user_wants_to_play = False
+        logger.info(f"Deck {self.deck_id} - Scratch started: duration={self._scratch_duration_frames} frames, pattern={self._scratch_pattern}, window={self._scratch_window_frames} frames, cut={SCRATCH_CUT_FRAMES} frames")
+
+    def get_track_key(self):
+        """Get the detected key of the current track"""
+        return {
+            'key': self.key if hasattr(self, 'key') else 'unknown',
+            'confidence': self.key_confidence if hasattr(self, 'key_confidence') else 0.0
+        }
+
+    def load_scratch_sample(self, sample_filepath):
+        """Load a scratch sample and analyze its key"""
+        if not os.path.exists(sample_filepath):
+            logger.error(f"Deck {self.deck_id} - Scratch sample not found: {sample_filepath}")
+            return False
+        
+        try:
+            # Analyze the sample to get its key
+            sample_analysis = self.analyzer.analyze_track(sample_filepath)
+            if not sample_analysis:
+                logger.error(f"Deck {self.deck_id} - Failed to analyze scratch sample: {sample_filepath}")
+                return False
+            
+            # Load the sample audio
+            loader = es.MonoLoader(filename=sample_filepath)
+            sample_audio = loader()
+            sample_sr = int(loader.paramValue('sampleRate'))
+            
+            # Store sample data
+            self._scratch_sample = {
+                'audio': sample_audio,
+                'sample_rate': sample_sr,
+                'key': sample_analysis.get('key', 'unknown'),
+                'key_confidence': sample_analysis.get('key_confidence', 0.0),
+                'filepath': sample_filepath
+            }
+            
+            logger.debug(f"Deck {self.deck_id} - Loaded scratch sample: {os.path.basename(sample_filepath)} (key: {self._scratch_sample['key']})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Error loading scratch sample {sample_filepath}: {e}")
+            return False
+
+    def _calculate_pitch_shift(self, sample_key, track_key):
+        """Calculate the pitch shift needed to match sample key to track key"""
+        if sample_key == 'unknown' or track_key == 'unknown':
+            return 0.0  # No shift if we can't determine keys
+        
+        # Define the circle of fifths for key relationships
+        major_keys = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'F', 'Bb', 'Eb', 'Ab']
+        minor_keys = ['Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m', 'Dm', 'Gm', 'Cm', 'Fm']
+        
+        def parse_key(key_str):
+            """Parse key string like 'C major' or 'A minor'"""
+            parts = key_str.split()
+            if len(parts) >= 2:
+                note = parts[0]
+                scale = parts[1].lower()
+                if scale == 'minor':
+                    return f"{note}m"
+                else:
+                    return note
+            return key_str
+        
+        sample_note = parse_key(sample_key)
+        track_note = parse_key(track_key)
+        
+        # Find semitone difference
+        if sample_note in major_keys and track_note in major_keys:
+            sample_idx = major_keys.index(sample_note)
+            track_idx = major_keys.index(track_note)
+            semitones = (track_idx - sample_idx) % 12
+            if semitones > 6:
+                semitones -= 12  # Prefer downward shifts
+        elif sample_note in minor_keys and track_note in minor_keys:
+            sample_idx = minor_keys.index(sample_note)
+            track_idx = minor_keys.index(track_note)
+            semitones = (track_idx - sample_idx) % 12
+            if semitones > 6:
+                semitones -= 12
+        else:
+            # Different scales - use relative major/minor relationships
+            semitones = 0  # For now, no shift for different scales
+        
+        return semitones
+
+    def _apply_pitch_shift(self, audio, semitones, sample_rate):
+        """Apply pitch shift to audio using librosa"""
+        if semitones == 0:
+            return audio
+        
+        try:
+            # Use librosa's pitch shift
+            shifted_audio = librosa.effects.pitch_shift(
+                audio, 
+                sr=sample_rate, 
+                n_steps=semitones
+            )
+            logger.debug(f"Deck {self.deck_id} - Applied pitch shift: {semitones} semitones")
+            return shifted_audio
+        except Exception as e:
+            logger.warning(f"Deck {self.deck_id} - Pitch shift failed: {e}, using original audio")
+            return audio
+
+    def play_scratch_sample(self, sample_filepath=None, volume=1.0):
+        """Play a scratch sample with automatic key matching"""
+        if sample_filepath and not hasattr(self, '_scratch_sample'):
+            # Load the sample if not already loaded
+            if not self.load_scratch_sample(sample_filepath):
+                return False
+        
+        if not hasattr(self, '_scratch_sample'):
+            logger.error(f"Deck {self.deck_id} - No scratch sample loaded")
+            return False
+        
+        try:
+            # Get current track key
+            track_key_info = self.get_track_key()
+            track_key = track_key_info['key']
+            
+            # Calculate pitch shift
+            semitones = self._calculate_pitch_shift(
+                self._scratch_sample['key'], 
+                track_key
+            )
+            
+            # Apply pitch shift
+            shifted_audio = self._apply_pitch_shift(
+                self._scratch_sample['audio'],
+                semitones,
+                self._scratch_sample['sample_rate']
+            )
+            
+            # Resample if needed to match deck sample rate
+            if self._scratch_sample['sample_rate'] != self.sample_rate:
+                shifted_audio = librosa.resample(
+                    shifted_audio,
+                    orig_sr=self._scratch_sample['sample_rate'],
+                    target_sr=self.sample_rate
+                )
+            
+            # Apply volume
+            shifted_audio *= volume
+            
+            # Store for playback
+            self._scratch_sample_audio = shifted_audio
+            self._scratch_sample_position = 0
+            self._scratch_sample_active = True
+            
+            logger.debug(f"Deck {self.deck_id} - Playing scratch sample: {os.path.basename(self._scratch_sample['filepath'])} (shift: {semitones} semitones)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Error playing scratch sample: {e}")
+            return False
 
 
 if __name__ == '__main__':

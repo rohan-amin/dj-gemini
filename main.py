@@ -5,6 +5,7 @@ import time
 import sys
 import os
 import logging
+import json
 
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT_DIR not in sys.path:
@@ -18,6 +19,39 @@ def setup_logging(log_level_str='INFO'):
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     return logging.getLogger(__name__)
+
+def validate_tracks_exist(config):
+    tracks = config.get('tracks', [])
+    if not tracks:
+        print("WARNING: No tracks defined in the 'tracks' section. Any load_track actions will fail.")
+    missing = []
+    track_ids = set()
+    for track in tracks:
+        filepath = track.get('filepath')
+        track_id = track.get('track_id', '(no track_id)')
+        if not filepath or not os.path.isfile(filepath):
+            missing.append(f"track_id='{track_id}', filepath='{filepath}'")
+        if track_id != '(no track_id)':
+            track_ids.add(track_id)
+    if missing:
+        print("\nERROR: The following tracks are missing or invalid:")
+        for m in missing:
+            print(f"  - {m}")
+        print("\nAborting due to missing tracks. Please fix your config.")
+        sys.exit(1)
+    # Check that every load_track action references a valid track_id
+    invalid_actions = []
+    for action in config.get('actions', []):
+        if action.get('command') == 'load_track':
+            ref_id = action.get('track_id')
+            if not ref_id or ref_id not in track_ids:
+                invalid_actions.append(f"action_id='{action.get('id', '(no id)')}', track_id='{ref_id}'")
+    if invalid_actions:
+        print("\nERROR: The following load_track actions reference missing or invalid track_id:")
+        for m in invalid_actions:
+            print(f"  - {m}")
+        print("\nAborting due to invalid track_id references. Please fix your config.")
+        sys.exit(1)
 
 def run_dj_gemini():
     parser = argparse.ArgumentParser(description="DJ Gemini - JSON Audio Mixer")
@@ -100,6 +134,15 @@ def run_dj_gemini():
 
     if not audio_engine.load_script_from_file(script_path_to_load):
         logger.error(f"Failed to load script '{script_path_to_load}'. Exiting.")
+        return
+
+    # Validate that all tracks exist before starting
+    try:
+        with open(script_path_to_load) as f:
+            config = json.load(f)
+        validate_tracks_exist(config)
+    except Exception as e:
+        logger.error(f"Failed to validate tracks: {e}")
         return
 
     try:

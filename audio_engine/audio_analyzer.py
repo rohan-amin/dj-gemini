@@ -81,6 +81,12 @@ class AudioAnalyzer:
                     analysis_data = None 
                 else:
                     logger.debug(f"AudioAnalyzer - Loaded from beats cache: BPM {analysis_data.get('bpm')}, Beats: {len(analysis_data.get('beat_timestamps', []))}")
+                    # Handle missing key fields in old cache files
+                    if 'key' not in analysis_data:
+                        logger.debug("AudioAnalyzer - Key not found in cache, will re-analyze for key detection")
+                        analysis_data = None
+                    else:
+                        logger.debug(f"AudioAnalyzer - Key from cache: {analysis_data.get('key')} (confidence: {analysis_data.get('key_confidence', 0.0)})")
             except Exception as e:
                 logger.error(f"AudioAnalyzer - Could not load/parse beats cache {beats_cache_filepath}: {e}. Re-analyzing.")
                 analysis_data = None
@@ -119,11 +125,33 @@ class AudioAnalyzer:
                     bpm = float(bpm_result[0] if isinstance(bpm_result, (tuple, list, np.ndarray)) and len(bpm_result)>0 else bpm_result)
                 logger.debug(f"AudioAnalyzer - BPM: {bpm:.2f}")
 
+                # Add key detection
+                logger.debug("AudioAnalyzer - Performing key detection...")
+                try:
+                    key_extractor = es.KeyExtractor()
+                    key_results = key_extractor(audio)
+                    # KeyExtractor returns (key, scale, strength) where key is like "C", scale is like "major"
+                    if isinstance(key_results, (list, tuple)) and len(key_results) >= 2:
+                        key_note = str(key_results[0])  # e.g., "C"
+                        key_scale = str(key_results[1])  # e.g., "major"
+                        track_key = f"{key_note} {key_scale}"  # e.g., "C major"
+                        key_confidence = float(key_results[2]) if len(key_results) > 2 else 0.0
+                    else:
+                        track_key = str(key_results) if key_results is not None else "unknown"
+                        key_confidence = 0.0
+                    logger.debug(f"AudioAnalyzer - Key: {track_key} (confidence: {key_confidence:.2f})")
+                except Exception as e:
+                    logger.warning(f"AudioAnalyzer - Key detection failed: {e}")
+                    track_key = "unknown"
+                    key_confidence = 0.0
+
                 analysis_data = {
                     'file_path_original_for_beats': audio_filepath, 
                     'sample_rate': sample_rate,
                     'beat_timestamps': beat_timestamps_essentia.tolist(), 
-                    'bpm': float(bpm) 
+                    'bpm': float(bpm),
+                    'key': track_key,
+                    'key_confidence': key_confidence
                 }
                 try:
                     if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir, exist_ok=True)
