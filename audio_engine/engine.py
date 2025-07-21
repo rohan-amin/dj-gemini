@@ -56,7 +56,7 @@ class AudioEngine:
 
     def _validate_action(self, action, action_index):
         command = action.get("command")
-        action_id_for_log = action.get('id', f"action_idx_{action_index+1}")
+        action_id_for_log = action.get('action_id', f"action_idx_{action_index+1}")
         # print(f"DEBUG: Validating action {action_index+1} (ID: {action_id_for_log}): CMD='{command}'") 
 
         if not command:
@@ -354,15 +354,6 @@ class AudioEngine:
             self.script_name = script_data.get("mix_name", "Untitled Mix")
             logger.debug(f"AudioEngine - Script '{self.script_name}' loaded and validated with {len(self._all_actions_from_script)} actions.")
 
-            # Build a lookup for track_id -> filepath
-            self.tracks_by_id = {}
-            for track in script_data.get('tracks', []):
-                tid = track.get('track_id')
-                fp = track.get('filepath')
-                if tid and fp:
-                    self.tracks_by_id[tid] = fp
-            logger.debug(f"AudioEngine - Tracks by ID loaded: {len(self.tracks_by_id)}")
-
             return True
             
         except Exception as e:
@@ -395,7 +386,7 @@ class AudioEngine:
         for action in initial_actions_to_execute:
             action_command = action.get('command', 'N/A')
             action_deck_id = action.get('deck_id', 'Engine-Level')
-            action_id_for_log = action.get('id', 'N/A_script_start')
+            action_id_for_log = action.get('action_id', 'N/A_script_start')
             logger.info(f"AudioEngine (Initial) - Executing: CMD='{action_command}', Deck='{action_deck_id}', ActionID='{action_id_for_log}'")
             self._execute_action(action) 
             if self._engine_stop_event.is_set(): 
@@ -458,7 +449,7 @@ class AudioEngine:
                             # Check if we need a specific loop action ID
                             required_action_id = trigger.get("loop_action_id")
                             if required_action_id is None or required_action_id == completed_action_id:
-                                logger.info(f"Trigger MET: on_loop_complete for action '{action.get('id')}' (loop: {completed_action_id})")
+                                logger.info(f"Trigger MET: on_loop_complete for action '{action.get('action_id')}' (loop: {completed_action_id})")
                                 self._pending_on_beat_actions.remove(action)
                                 self._execute_action(action)
                     
@@ -472,7 +463,7 @@ class AudioEngine:
             for idx, action in enumerate(self._pending_on_beat_actions): 
                 trigger = action.get("trigger") 
                 trigger_type = trigger.get("type")
-                action_id_for_log = action.get('id', f'pending_action_idx_{idx}')
+                action_id_for_log = action.get('action_id', f'pending_action_idx_{idx}')
                 
                 triggered_this_tick = False
 
@@ -529,7 +520,7 @@ class AudioEngine:
                 for exec_action in actions_executed_this_tick: 
                     action_command = exec_action.get('command', 'N/A')
                     action_deck_id = exec_action.get('deck_id', 'Engine-Level')
-                    logger.info(f"Executing: CMD='{action_command}', Deck='{action_deck_id}' for action '{exec_action.get('id', 'N/A')}'")
+                    logger.info(f"Executing: CMD='{action_command}', Deck='{action_deck_id}' for action '{exec_action.get('action_id', 'N/A')}'")
                     self._execute_action(exec_action) 
                     if self._engine_stop_event.is_set(): break 
                 if self._engine_stop_event.is_set(): break 
@@ -550,12 +541,15 @@ class AudioEngine:
 
         try:
             if command == "load_track":
-                track_id = action_dict.get("track_id")
-                if not deck_id or not track_id:
-                    logger.warning("'load_track' missing deck_id or track_id. Skipping."); return
-                filepath = self.tracks_by_id.get(track_id)
-                if not filepath:
-                    logger.error(f"Track ID '{track_id}' not found in tracks section. Skipping load_track."); return
+                filepath = parameters.get("filepath")
+                if not deck_id or not filepath:
+                    logger.warning("'load_track' missing deck_id or filepath in parameters. Skipping."); return
+                
+                # Validate file exists
+                if not os.path.exists(filepath):
+                    logger.error(f"Track file not found: {filepath}. Exiting due to invalid load_track filepath.")
+                    sys.exit(1)
+                
                 deck = self._get_or_create_deck(deck_id)
                 deck.load_track(filepath)
                 
@@ -677,7 +671,7 @@ class AudioEngine:
                     deck.activate_loop(start_beat=start_beat_val, 
                                        length_beats=length_beats_val, 
                                        repetitions=repetitions_val,
-                                       action_id=action_dict.get('id'))
+                                       action_id=action_dict.get('action_id'))
                 except ValueError: 
                     logger.warning(f"Invalid numeric values for loop parameters: start_beat='{start_beat_from_json}', length_beats='{length_beats_from_json}'. Skipping.")
 
