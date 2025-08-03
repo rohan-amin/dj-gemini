@@ -1,20 +1,48 @@
 # DJ Gemini
 
-An automated DJ mixing system that creates synchronized audio performances using JSON scripts. DJ Gemini analyzes audio files for beats and BPM, then executes precise, beat-synchronized mix sequences with professional-grade tempo control.
+A Python-based DJ mixing system that uses JSON scripts to create automated audio mixes with precise timing, beat synchronization, and real-time audio effects.
 
-## Features
+## Overview
 
+DJ Gemini uses a **preprocessing architecture** to separate heavy audio processing from real-time performance. The system provides two workflows:
+
+### Preprocessing Workflow (Recommended)
+1. **Run preprocessing** to analyze your mix script and prepare all audio transformations
+2. **Smart BPM analysis** automatically predicts tempo needs (including `bpm_match` commands)
+3. **Cache audio files** with song-based organization for easy management
+4. **Execute mix** with instant playback and zero processing delays
+
+### Just-In-Time (JIT) Workflow (Fallback)
+- **Automatic fallback** when cached audio isn't available
+- **Real-time processing** using PyRubberBand for missing tempo variants
+- **Seamless experience** - no interruption in workflow
+
+This hybrid approach guarantees smooth, glitch-free performance while providing flexibility for experimentation.
+
+## Key Features
+
+### Core DJ Features
 - **Beat-accurate timing** - All actions synchronized to detected beats
 - **Multi-deck mixing** - Manage multiple audio tracks simultaneously
 - **Professional tempo control** - Pitch-preserving tempo changes using Rubber Band
 - **Tempo ramping** - Smooth BPM transitions over specified beat ranges
+- **BPM matching** - Instant tempo synchronization between decks
 - **Loop system** - Create precise beat-synchronized loops with repetitions
-- **Stop at beat** - Clean stopping at specific beat positions
 - **Volume control** - Per-deck volume adjustment and crossfading
-- **Cue point support** - Use predefined cue points in audio files
+- **EQ control** - 3-band EQ with instant and fade modes
+
+### Audio Processing
+- **Preprocessing system** - Separate heavy processing from performance
+- **Smart BPM analysis** - Automatically predicts tempo requirements
+- **Song-based caching** - Organized cache structure with hash-based directories
+- **JIT processing** - Real-time fallback for missing audio variants
+- **Perfect beat synchronization** - Beat viewer and main engine match exactly
+
+### Workflow Tools
+- **Beat viewer utility** - Visual tool for finding precise beat positions
 - **JSON-based scripting** - Define complex mix sequences in JSON format
 - **Real-time monitoring** - Track deck status and script execution progress
-- **Audio caching** - Pre-processed audio for instant tempo changes
+- **Cue point support** - Use predefined cue points in audio files
 - **Loop queue system** - Sequential loop execution without race conditions
 
 ## Installation
@@ -52,13 +80,63 @@ An automated DJ mixing system that creates synchronized audio performances using
 
 ## Quick Start
 
-### 1. Prepare Audio Files
+### 1. Preprocessing Workflow (Recommended)
+
+For the best performance, preprocess your mix scripts before execution:
+
+```bash
+# Activate conda environment
+conda activate dj-gemini-env
+
+# Run preprocessing on your mix script
+python preprocess.py mix_configs/my_mix.json
+
+# Execute the mix with instant playback
+python main.py mix_configs/my_mix.json
+```
+
+**What preprocessing does:**
+- Analyzes your JSON script to find all tempo/pitch requirements
+- Predicts BPM needs for `bpm_match` commands using smart analysis
+- Pre-processes all audio transformations using PyRubberBand
+- Caches results in organized `cache/` directory structure
+- Ensures zero-latency performance during mix execution
+
+**Smart BPM Analysis Example:**
+```bash
+# Output shows predicted requirements
+Smart analysis predicted BPMs for deckB: [124.1]
+Found 2 tracks requiring preprocessing:
+  Starships.mp3: 0 tempos, 0 pitches
+  One More Time.mp3: 1 tempos, 0 pitches
+```
+
+### 2. Beat Viewer Utility
+
+Use the beat viewer to find precise beat positions for your JSON scripts:
+
+```bash
+# Launch beat viewer
+python utilities/beat_viewer.py
+
+# Or load a specific file
+python utilities/beat_viewer.py audio_tracks/my_song.mp3
+```
+
+**Beat Viewer Features:**
+- **JIT tempo processing** - Change BPM to any value for precise timing
+- **Visual beat navigation** - Find exact musical positions
+- **Perfect synchronization** - Beat numbers match main engine exactly
+- **Easy workflow** - Pick beats in viewer, use same numbers in JSON
+
+### 3. Prepare Audio Files
 
 Place your audio files in the `audio_tracks/` directory:
 
 ```
 dj-gemini/
 ├── main.py                 # Main entry point
+├── preprocess.py          # Preprocessing script  
 ├── config.py              # Configuration settings
 ├── audio_engine/          # Core audio processing
 │   ├── engine.py         # Main audio engine
@@ -66,11 +144,16 @@ dj-gemini/
 │   └── audio_analyzer.py # Beat detection and analysis
 ├── audio_tracks/          # Audio files
 ├── mix_configs/           # JSON mix scripts
-├── analysis_data/         # Cached beat analysis
+├── cache/                 # Song-based cached audio processing
+│   └── hash_filename/    # Individual song cache directories
+│       ├── analysis.beats # Beat timestamps and BPM data
+│       ├── tempo_124.1.npy # Tempo-processed audio files
+│       └── pitch_+2.0.npy # Pitch-processed audio files
 └── utilities/             # Helper tools
+    └── beat_viewer.py    # Beat position finder tool
 ```
 
-### 2. Create a Mix Script
+### 4. Create a Mix Script
 
 Create a JSON file in the `mix_configs/` directory:
 
@@ -137,7 +220,7 @@ Create a JSON file in the `mix_configs/` directory:
 }
 ```
 
-### 3. Run the Mix
+### 5. Run the Mix
 
 ```bash
 python main.py mix_configs/my_mix.json
@@ -219,9 +302,28 @@ Change playback tempo with pitch preservation.
 
 **Features:**
 - Pitch-preserving tempo changes using Rubber Band
-- Automatic audio caching for instant tempo changes
+- **Pre-processed audio caching** - all tempo changes are processed upfront before playback
 - Beat positions, cue points, and loops scale correctly
 - Works with both faster and slower tempo changes
+- **Instant playback** - no processing delays during performance
+
+### Pitch Control
+
+#### `set_pitch`
+Change playback pitch with time preservation.
+```json
+{
+  "command": "set_pitch",
+  "deck_id": "deckA",
+  "parameters": {"semitones": -2}
+}
+```
+
+**Features:**
+- Time-preserving pitch changes using Rubber Band
+- **Pre-processed audio caching** - all pitch changes are processed upfront before playback
+- **Instant playback** - no processing delays during performance
+- Supports both upward and downward pitch shifts
 
 #### `ramp_tempo`
 Smoothly transition BPM over a specified beat range.
@@ -577,7 +679,7 @@ Then use them in play commands:
 ### Common Issues
 
 1. **"No module named 'essentia'"**
-   - Ensure you're in the correct conda environment
+   - Ensure you're in the correct conda environment: `conda activate dj-gemini-env`
    - Reinstall: `conda install -c conda-forge essentia`
 
 2. **"pyrubberband installation fails"**
@@ -593,6 +695,7 @@ Then use them in play commands:
    - Verify BPM detection in logs
 
 5. **Tempo change issues**
+   - Run preprocessing first: `python preprocess.py mix_configs/script.json`
    - Ensure Rubber Band is properly installed
    - Check that target BPM is reasonable (e.g., 80-200 BPM)
 
@@ -601,12 +704,74 @@ Then use them in play commands:
    - Check that start_beat < end_beat
    - Verify that ramp duration is sufficient for smooth transitions
 
+### Preprocessing Issues
+
+7. **"Tempo cache not found" errors**
+   - Run preprocessing first: `python preprocess.py mix_configs/script.json`
+   - Check that conda environment is activated
+   - Verify PyRubberBand is installed correctly
+
+8. **Beat viewer tempo changes don't work**
+   - Ensure PyRubberBand is installed: `pip install pyrubberband`
+   - Check that system dependencies are installed: `brew install rubberband`
+   - Look for JIT processing messages in console output
+
+9. **Beat numbers don't match between beat viewer and main engine**
+   - This should now be fixed with the latest updates
+   - Both systems use identical beat timestamp scaling logic
+   - Verify both are using the same BPM setting
+
+10. **Smart BPM analysis doesn't predict correctly**
+    - Check your JSON script has `bpm_match` commands
+    - Verify deck loading order and timing
+    - Look for prediction output in preprocessing logs
+
 ### Debug Mode
 
 Run with verbose logging:
 ```bash
 python main.py mix_configs/my_mix.json --max_wait_after_script 3600
 ```
+
+## New Features & Workflow
+
+### Beat-Perfect DJ Workflow
+
+1. **Find transition points** with beat viewer:
+   ```bash
+   python utilities/beat_viewer.py audio_tracks/song.mp3
+   # Set BPM to match your target, navigate to find perfect transition
+   # Note the beat number displayed (e.g., "Beat: 592")
+   ```
+
+2. **Use exact beat numbers** in JSON:
+   ```json
+   {
+     "command": "play",
+     "deck_id": "deckB", 
+     "parameters": {"start_at_beat": 592}
+   }
+   ```
+
+3. **Preprocess for performance**:
+   ```bash
+   python preprocess.py mix_configs/my_mix.json
+   # Smart analysis automatically handles bpm_match requirements
+   ```
+
+4. **Execute with perfect synchronization**:
+   ```bash
+   python main.py mix_configs/my_mix.json
+   # Beat 592 plays at exactly the same musical location
+   ```
+
+### Architecture Benefits
+
+- **Separation of concerns**: Heavy processing separated from performance
+- **Smart analysis**: Automatically predicts complex tempo requirements  
+- **Perfect synchronization**: Beat viewer and main engine use identical logic
+- **Performance optimization**: Zero-latency playback with preprocessing
+- **Flexibility**: JIT fallback for experimentation and edge cases
 
 ## Dependencies
 

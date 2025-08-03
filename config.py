@@ -11,21 +11,17 @@ PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # --- Core Directory Names (relative to project root) ---
 AUDIO_TRACKS_DIR_NAME = "audio_tracks"
 MIX_CONFIGS_DIR_NAME = "mix_configs"
-ANALYSIS_DATA_DIR_NAME = "analysis_data" # Main folder for any analysis output
+CACHE_DIR_NAME = "cache" # Main folder for cached data
 UTILITIES_DIR_NAME = "utilities"
-
-# --- Subdirectory Names for Analysis Data ---
-# User specified: analysis_data/beats_data/ for the cache files
-BEATS_DATA_SUBDIR_NAME = "beats_data" 
 
 # --- Full Absolute Paths (derived from above) ---
 AUDIO_TRACKS_DIR = os.path.join(PROJECT_ROOT_DIR, AUDIO_TRACKS_DIR_NAME)
 MIX_CONFIGS_DIR = os.path.join(PROJECT_ROOT_DIR, MIX_CONFIGS_DIR_NAME)
-ANALYSIS_DATA_DIR = os.path.join(PROJECT_ROOT_DIR, ANALYSIS_DATA_DIR_NAME)
+CACHE_DIR = os.path.join(PROJECT_ROOT_DIR, CACHE_DIR_NAME)
 UTILITIES_DIR = os.path.join(PROJECT_ROOT_DIR, UTILITIES_DIR_NAME)
 
-# Full path to the directory where beat analysis files will be cached/stored
-BEATS_CACHE_DIR = os.path.join(ANALYSIS_DATA_DIR, BEATS_DATA_SUBDIR_NAME)
+# Legacy compatibility - beats cache is now part of song-based cache structure
+BEATS_CACHE_DIR = CACHE_DIR  # For backwards compatibility
 
 # --- Essentia Algorithm Defaults (examples, can be expanded) ---
 DEFAULT_BEAT_TRACKER_ALGORITHM = "BeatTrackerDegara"
@@ -48,11 +44,51 @@ def ensure_dir_exists(dir_path):
     # else:
     #     logger.debug(f"DEBUG: CONFIG - Directory already exists: {dir_path}")
 
+# --- New Cache Structure Functions ---
+import re
+import hashlib
+
+def sanitize_filename(filename):
+    """Replace problematic chars with underscores for filesystem safety"""
+    return re.sub(r'[<>:"/\\|?*\s]', '_', filename)
+
+def get_song_cache_dir(audio_filepath):
+    """Get cache directory for a specific song using hash + sanitized filename"""
+    # Get absolute path for consistent hashing
+    abs_path = os.path.abspath(audio_filepath)
+    
+    # Create hash of the full path
+    path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:12]
+    
+    # Sanitize basename for safety
+    basename = os.path.basename(audio_filepath)
+    safe_name = sanitize_filename(basename)
+    
+    # Combine: hash_sanitized-filename
+    cache_dir_name = f"{path_hash}_{safe_name}"
+    
+    return os.path.join(CACHE_DIR, cache_dir_name)
+
+def get_beats_cache_filepath(audio_filepath):
+    """Get filepath for beat analysis cache"""
+    song_dir = get_song_cache_dir(audio_filepath)
+    return os.path.join(song_dir, "analysis.beats")
+
+def get_tempo_cache_filepath(audio_filepath, target_bpm):
+    """Get filepath for tempo-processed audio cache"""
+    song_dir = get_song_cache_dir(audio_filepath)
+    return os.path.join(song_dir, f"tempo_{target_bpm:.1f}.npy")
+
+def get_pitch_cache_filepath(audio_filepath, semitones):
+    """Get filepath for pitch-processed audio cache"""
+    song_dir = get_song_cache_dir(audio_filepath)
+    return os.path.join(song_dir, f"pitch_{semitones:+.1f}.npy")
+
 # --- Optional: Automatically ensure critical directories exist upon import ---
 # print("DEBUG: CONFIG - Ensuring critical directories exist...")
 # ensure_dir_exists(AUDIO_TRACKS_DIR)
 # ensure_dir_exists(MIX_CONFIGS_DIR)
-# ensure_dir_exists(ANALYSIS_DATA_DIR) 
+# ensure_dir_exists(CACHE_DIR) 
 # ensure_dir_exists(BEATS_CACHE_DIR)   
 # print("DEBUG: CONFIG - Directory check complete.")
 
@@ -68,11 +104,11 @@ if __name__ == '__main__':
     logger.info(f"Project Root Directory: {PROJECT_ROOT_DIR}")
     logger.info(f"Audio Tracks Directory: {AUDIO_TRACKS_DIR}")
     logger.info(f"Mix Configs Directory: {MIX_CONFIGS_DIR}")
-    logger.info(f"Analysis Data Directory: {ANALYSIS_DATA_DIR}")
+    logger.info(f"Cache Directory: {CACHE_DIR}")
     logger.info(f"Beats Cache Directory: {BEATS_CACHE_DIR} (Files will use {BEATS_CACHE_FILE_EXTENSION})")
     logger.info(f"Utilities Directory: {UTILITIES_DIR}")
 
     logger.info("\nEnsuring directories exist (example calls):")
     ensure_dir_exists(AUDIO_TRACKS_DIR)
     ensure_dir_exists(MIX_CONFIGS_DIR)
-    ensure_dir_exists(BEATS_CACHE_DIR)
+    ensure_dir_exists(CACHE_DIR)

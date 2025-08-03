@@ -49,9 +49,9 @@ class AudioEngine:
         logger.debug("AudioEngine - Initialized.")
 
     def _get_or_create_deck(self, deck_id):
+        """Get existing deck or create new one"""
         if deck_id not in self.decks:
-            logger.debug(f"AudioEngine - Creating new Deck: {deck_id}")
-            self.decks[deck_id] = Deck(deck_id, self.analyzer) 
+            self.decks[deck_id] = Deck(deck_id, self.analyzer, engine_instance=self)
         return self.decks[deck_id]
 
     def _validate_action(self, action, action_index):
@@ -91,7 +91,7 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -354,10 +354,268 @@ class AudioEngine:
             self.script_name = script_data.get("mix_name", "Untitled Mix")
             logger.debug(f"AudioEngine - Script '{self.script_name}' loaded and validated with {len(self._all_actions_from_script)} actions.")
 
+            # Pre-process all audio transformations
+            if not self._validate_audio_cache():
+                logger.error("AudioEngine - Pre-processing of audio transformations failed. Aborting script load.")
+                return False
+
             return True
             
         except Exception as e:
             logger.error(f"AudioEngine - Failed to load/parse script {path_to_load}: {e}"); return False
+
+    def _validate_audio_cache(self):
+        """Validate that all required audio transformations are pre-processed and cached"""
+        logger.info("AudioEngine - Validating audio cache...")
+        
+        # Collect all required transformations
+        required_transformations = {}
+        missing_cache = []
+        
+        for action in self._all_actions_from_script:
+            command = action.get("command")
+            deck_id = action.get("deck_id")
+            parameters = action.get("parameters", {})
+            
+            if command == "load_track":
+                filepath = parameters.get("filepath")
+                if filepath and deck_id:
+                    # Convert relative paths to absolute
+                    if not os.path.isabs(filepath):
+                        filepath = os.path.join(self.app_config.AUDIO_TRACKS_DIR, filepath)
+                    
+                    if deck_id not in required_transformations:
+                        required_transformations[deck_id] = {
+                            "filepath": filepath,
+                            "tempo_changes": set(),
+                            "pitch_changes": set()
+                        }
+            
+            elif command == "set_tempo" and deck_id:
+                target_bpm = parameters.get("target_bpm")
+                if target_bpm and deck_id in required_transformations:
+                    required_transformations[deck_id]["tempo_changes"].add(float(target_bpm))
+            
+            elif command == "set_pitch" and deck_id:
+                semitones = parameters.get("semitones")
+                if semitones and deck_id in required_transformations:
+                    required_transformations[deck_id]["pitch_changes"].add(float(semitones))
+            
+            elif command == "ramp_tempo" and deck_id:
+                start_bpm = parameters.get("start_bpm")
+                end_bpm = parameters.get("end_bpm")
+                if start_bpm and end_bpm and deck_id in required_transformations:
+                    required_transformations[deck_id]["tempo_changes"].add(float(start_bpm))
+                    required_transformations[deck_id]["tempo_changes"].add(float(end_bpm))
+        
+        # Validate cache for each deck's transformations
+        for deck_id, transformations in required_transformations.items():
+            filepath = transformations["filepath"]
+            
+            # Check tempo cache
+            for target_bpm in transformations["tempo_changes"]:
+                cache_filepath = self.app_config.get_tempo_cache_filepath(filepath, target_bpm)
+                if not os.path.exists(cache_filepath):
+                    missing_cache.append(f"Tempo {target_bpm} BPM for {os.path.basename(filepath)}")
+            
+            # Check pitch cache
+            for semitones in transformations["pitch_changes"]:
+                cache_filepath = self.app_config.get_pitch_cache_filepath(filepath, semitones)
+                if not os.path.exists(cache_filepath):
+                    missing_cache.append(f"Pitch {semitones:+.1f} semitones for {os.path.basename(filepath)}")
+        
+        if missing_cache:
+            logger.error("AudioEngine - Missing required audio cache files:")
+            for missing in missing_cache:
+                logger.error(f"  - {missing}")
+            logger.error("Run preprocessing first: python preprocess.py <script.json>")
+            return False
+        
+        logger.info(f"AudioEngine - Cache validation complete. Found cache for {len(required_transformations)} tracks.")
+        return True
+
+    def _jit_process_tempo(self, deck, target_bpm):
+        """Just-in-time processing of tempo variant for bpm_match fallback"""
+        try:
+            if not deck.filepath or not os.path.exists(deck.filepath):
+                logger.error(f"JIT tempo processing failed: invalid deck filepath {deck.filepath}")
+                return False
+            
+            if deck.original_bpm <= 0:
+                logger.error(f"JIT tempo processing failed: invalid original BPM {deck.original_bpm}")
+                return False
+            
+            # Calculate tempo ratio
+            tempo_ratio = target_bpm / deck.original_bpm
+            logger.info(f"JIT processing tempo ratio {tempo_ratio:.3f} for {os.path.basename(deck.filepath)}")
+            
+            # Get cache filepath
+            cache_filepath = self.app_config.get_tempo_cache_filepath(deck.filepath, target_bpm)
+            if os.path.exists(cache_filepath):
+                logger.debug(f"JIT: Cache file already exists, skipping processing")
+                return True
+            
+            # Ensure cache directory exists
+            cache_dir = os.path.dirname(cache_filepath)
+            self.app_config.ensure_dir_exists(cache_dir)
+            
+            # Load original audio data
+            if not hasattr(deck, 'audio_thread_data') or deck.audio_thread_data is None:
+                logger.error(f"JIT: No audio data available for deck {deck.deck_id}")
+                return False
+            
+            # Process with PyRubberBand
+            try:
+                import pyrubberband as pyrb
+                import numpy as np
+                
+                sample_rate = deck.sample_rate
+                audio_data = deck.audio_thread_data.astype(np.float32)
+                
+                logger.info(f"JIT: Processing {len(audio_data)} samples with PyRubberBand...")
+                processed_audio = pyrb.time_stretch(audio_data, sample_rate, tempo_ratio)
+                
+                # Save to cache
+                np.save(cache_filepath, processed_audio.astype(np.float32))
+                logger.info(f"JIT: Saved processed audio to {cache_filepath}")
+                
+                return True
+                
+            except ImportError:
+                logger.error("JIT: PyRubberBand not available for tempo processing")
+                return False
+            except Exception as e:
+                logger.error(f"JIT: PyRubberBand processing failed: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"JIT tempo processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _preprocess_deck_transformations(self, deck_id, transformations):
+        """Pre-process all transformations for a specific deck"""
+        try:
+            # Resolve filepath
+            filepath = transformations["filepath"]
+            if not os.path.isabs(filepath):
+                filepath = os.path.join(self.app_config.PROJECT_ROOT_DIR, filepath)
+            
+            # Create deck and load track
+            deck = Deck(deck_id, self.analyzer, engine_instance=self)
+            deck.load_track(filepath)
+            
+            # Pre-process tempo changes
+            for target_bpm in transformations["tempo_changes"]:
+                if not deck._preprocess_tempo_change(target_bpm):
+                    logger.error(f"AudioEngine - Failed to pre-process tempo change to {target_bpm} BPM for {deck_id}")
+                    return False
+            
+            # Pre-process pitch changes
+            for semitones in transformations["pitch_changes"]:
+                if not deck._preprocess_pitch_change(semitones):
+                    logger.error(f"AudioEngine - Failed to pre-process pitch change to {semitones} semitones for {deck_id}")
+                    return False
+            
+
+            
+            # Store the deck
+            self.decks[deck_id] = deck
+            
+            logger.info(f"AudioEngine - Successfully pre-processed all transformations for {deck_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"AudioEngine - Error pre-processing deck {deck_id}: {e}")
+            return False
+
+    def _preprocess_global_sample(self, sample_filepath, sample_id, pitch_semitones=None):
+        """Pre-process a global sample with optional pitch adjustment"""
+        try:
+            import essentia.standard as es
+            import librosa
+            import numpy as np
+            
+            # Load the sample audio
+            loader = es.MonoLoader(filename=sample_filepath)
+            sample_audio = loader()
+            sample_sr = int(loader.paramValue('sampleRate'))
+            
+            # Resample if needed to match standard sample rate (44100)
+            if sample_sr != 44100:
+                sample_audio = librosa.resample(
+                    sample_audio,
+                    orig_sr=sample_sr,
+                    target_sr=44100
+                )
+            
+            # Apply pitch adjustment if specified
+            if pitch_semitones is not None and pitch_semitones != 0:
+                sample_audio = librosa.effects.pitch_shift(sample_audio, sr=44100, n_steps=pitch_semitones)
+            
+            # Apply a gentle fade-in to the entire sample to prevent clicks
+            fade_samples = min(128, len(sample_audio) // 16)  # 128 samples or 1/16 of sample length
+            if fade_samples > 0:
+                fade_in = np.linspace(0, 1, fade_samples)
+                # Ensure sample_audio is 1D for the fade operation
+                if sample_audio.ndim == 1:
+                    sample_audio[:fade_samples] *= fade_in
+                else:
+                    sample_audio[:fade_samples] *= fade_in.reshape(-1, 1)
+            
+            # Apply a gentle fade-out to the entire sample
+            if fade_samples > 0:
+                fade_out = np.linspace(1, 0, fade_samples)
+                # Ensure sample_audio is 1D for the fade operation
+                if sample_audio.ndim == 1:
+                    sample_audio[-fade_samples:] *= fade_out
+                else:
+                    sample_audio[-fade_samples:] *= fade_out.reshape(-1, 1)
+            
+            # Store for global playback
+            if not hasattr(self, '_global_sample_cache'):
+                self._global_sample_cache = {}
+            
+            self._global_sample_cache[sample_id] = sample_audio
+            
+            logger.debug(f"AudioEngine - Pre-processed global sample: {sample_id} (pitch: {pitch_semitones or 0} semitones)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"AudioEngine - Error pre-processing global sample {sample_id}: {e}")
+            return False
+            
+            # Apply a gentle fade-in to the entire sample to prevent clicks
+            fade_samples = min(128, len(sample_audio) // 16)  # 128 samples or 1/16 of sample length
+            if fade_samples > 0:
+                fade_in = np.linspace(0, 1, fade_samples)
+                # Ensure sample_audio is 1D for the fade operation
+                if sample_audio.ndim == 1:
+                    sample_audio[:fade_samples] *= fade_in
+                else:
+                    sample_audio[:fade_samples] *= fade_in.reshape(-1, 1)
+            
+            # Apply a gentle fade-out to the entire sample
+            if fade_samples > 0:
+                fade_out = np.linspace(1, 0, fade_samples)
+                # Ensure sample_audio is 1D for the fade operation
+                if sample_audio.ndim == 1:
+                    sample_audio[-fade_samples:] *= fade_out
+                else:
+                    sample_audio[-fade_samples:] *= fade_out.reshape(-1, 1)
+            
+            # Store for global playback
+            self._global_scratch_sample_audio = sample_audio
+            self._global_scratch_sample_position = 0
+            self._global_scratch_sample_active = True
+            
+            logger.debug(f"AudioEngine - Pre-processed global scratch sample: {os.path.basename(sample_filepath)}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"AudioEngine - Error pre-processing global scratch sample: {e}")
+            return False
 
 
     def start_script_processing(self): 
@@ -426,7 +684,7 @@ class AudioEngine:
 
     def _engine_loop(self):
         logger.info(f"Engine loop started (monitoring {len(self._pending_on_beat_actions)} actions)")
-
+        
         while not self._engine_stop_event.is_set():
             if not self._pending_on_beat_actions:
                 self.is_processing_script_actions = False 
@@ -480,7 +738,11 @@ class AudioEngine:
                         try:
                             target_beat = float(target_beat_str)
                             current_beat = deck.get_synchronized_beat_count()
-                            logger.debug(f"AudioEngine - Beat check: Deck='{source_deck_id}', Current={current_beat}, Target={target_beat}")
+                            
+                            # Print beat indicator in DEBUG mode
+                            if logger.isEnabledFor(logging.DEBUG):
+                                self._print_beat_indicator()
+                            
                             if current_beat >= target_beat: 
                                 logger.info(f"Trigger MET: on_deck_beat for action '{action_id_for_log}'")
                                 triggered_this_tick = True
@@ -505,7 +767,7 @@ class AudioEngine:
                             # Reset the flag
                             deck._loop_just_completed = False
                             deck._completed_loop_action_id = None
-                else: 
+                else:
                     logger.warning(f"Action '{action_id_for_log}' in _pending_on_beat_actions has unexpected trigger type: '{trigger_type}'. Removing.")
                     triggered_this_tick = True 
                 
@@ -529,6 +791,57 @@ class AudioEngine:
         
         self.is_processing_script_actions = False 
         logger.debug(f"Engine loop finished. Pending actions: {len(self._pending_on_beat_actions)}")
+
+    def _print_beat_indicator(self):
+        """Print a clear beat indicator showing current status of all decks"""
+        try:
+            # Get current time
+            current_time = time.time()
+            time_str = time.strftime("%M:%S", time.gmtime(current_time)) + f".{int((current_time % 1) * 1000):03d}"
+            
+            # Build deck status strings
+            deck_statuses = []
+            current_beat_changed = False
+            
+            for deck_id, deck in self.decks.items():
+                if deck.is_active():
+                    current_beat = deck.get_current_beat_count()
+                    total_beats = len(deck.beat_timestamps) if hasattr(deck, 'beat_timestamps') and deck.beat_timestamps is not None else 0
+                    bpm = deck.bpm if hasattr(deck, 'bpm') else 0
+                    
+                    # Check if beat changed since last print
+                    last_beat = getattr(self, f'_last_beat_{deck_id}', -1)
+                    if int(current_beat) != int(last_beat):
+                        current_beat_changed = True
+                        setattr(self, f'_last_beat_{deck_id}', int(current_beat))
+                    
+                    # Build deck status string
+                    deck_status = f"{deck_id}: {current_beat:.0f}/{total_beats} (BPM: {bpm:.2f})"
+                    
+                    # Add loop status if active
+                    if hasattr(deck, '_loop_active') and deck._loop_active:
+                        loop_done = deck._loop_repetitions_done if hasattr(deck, '_loop_repetitions_done') else 0
+                        loop_total = deck._loop_repetitions_total if hasattr(deck, '_loop_repetitions_total') else 0
+                        if loop_total is not None:
+                            deck_status += f" [Loop: {loop_done}/{loop_total}]"
+                        else:
+                            deck_status += " [Loop: ∞]"
+                    
+                    deck_statuses.append(deck_status)
+                else:
+                    deck_statuses.append(f"{deck_id}: inactive")
+            
+            # Only print if a beat changed
+            if current_beat_changed:
+                # Get pending actions count
+                pending_actions = len(self._pending_on_beat_actions)
+                
+                # Print the beat indicator
+                deck_info = " | ".join(deck_statuses)
+                print(f"[BEAT] {deck_info} | Time: {time_str} | Actions: {pending_actions} pending")
+            
+        except Exception as e:
+            logger.debug(f"Error printing beat indicator: {e}")
 
 
     def _execute_action(self, action_dict):
@@ -569,6 +882,14 @@ class AudioEngine:
             elif command == "play":
                 if not deck_id: logger.warning("'play' missing deck_id. Skipping."); return
                 deck = self._get_or_create_deck(deck_id)
+                
+                # Set volume if specified
+                if "volume" in parameters:
+                    volume = float(parameters["volume"])
+                    volume = max(0.0, min(1.0, volume))  # Clamp to 0.0-1.0 range
+                    deck.set_volume(volume)
+                    logger.debug(f"Set volume for deck {deck_id} to {volume}")
+                
                 deck.play(start_at_beat=parameters.get("start_at_beat"), 
                           start_at_cue_name=parameters.get("start_at_cue_name"))
 
@@ -685,6 +1006,11 @@ class AudioEngine:
                 deck = self._get_or_create_deck(deck_id)
                 target_bpm = float(action_dict.get("parameters", {}).get("target_bpm"))
                 deck.set_tempo(target_bpm)
+            elif command == "set_pitch":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                semitones = float(action_dict.get("parameters", {}).get("semitones"))
+                deck.set_pitch(semitones)
             
             elif command == "set_volume":
                 deck_id = action_dict.get("deck_id")
@@ -719,29 +1045,52 @@ class AudioEngine:
                 duration_seconds = float(params.get("duration_seconds", 1.0))
                 deck.fade_eq(target_low=target_low, target_mid=target_mid, target_high=target_high, duration_seconds=duration_seconds)
             
-            elif command == "play_scratch_sample":
-                if not deck_id: logger.warning("'play_scratch_sample' missing deck_id. Skipping."); return
-                deck = self._get_or_create_deck(deck_id)
+            elif command == "play_sample":
                 params = action_dict.get("parameters", {})
-                sample_filepath = params.get("sample_filepath")
+                sample_id = params.get("sample_id")
                 volume = float(params.get("volume", 1.0))
+                key_match_deck = params.get("key_match_deck")
+                repetitions = params.get("repetitions")  # New parameter for looping
                 
-                if not sample_filepath:
-                    logger.warning("'play_scratch_sample' missing 'sample_filepath' in parameters. Skipping.")
+                if not sample_id:
+                    logger.warning("'play_sample' missing 'sample_id'. Skipping.")
                     return
                 
-                # Resolve sample path
-                if self.app_config and not os.path.isabs(sample_filepath):
-                    constructed_path = os.path.join(self.app_config.PROJECT_ROOT_DIR, "samples", sample_filepath)
-                    if os.path.exists(constructed_path):
-                        sample_filepath = constructed_path
-                    else:
-                        logger.warning(f"Scratch sample '{sample_filepath}' not found in samples directory. Trying as is.")
-                
-                logger.debug(f"Playing scratch sample: {sample_filepath}")
-                success = deck.play_scratch_sample(sample_filepath=sample_filepath, volume=volume)
+                # Global playback with optional key matching and looping
+                logger.debug(f"Playing sample globally: {sample_id} (volume: {volume}, key_match: {key_match_deck}, repetitions: {repetitions})")
+                success = self._play_global_sample(sample_id=sample_id, volume=volume, key_match_deck=key_match_deck, repetitions=repetitions)
                 if not success:
-                    logger.warning(f"Failed to play scratch sample: {sample_filepath}")
+                    logger.warning(f"Failed to play global sample: {sample_id}")
+            
+            elif command == "stop_sample":
+                # Stop any currently playing global samples
+                if hasattr(self, '_global_scratch_sample_active'):
+                    self._global_scratch_sample_active = False
+                    self._global_sample_loop_active = False
+                    self._global_sample_loop_repetitions = None
+                    self._global_sample_loop_repetitions_done = 0
+                logger.debug("Stopped global sample playback")
+            
+            elif command == "load_sample":
+                sample_filepath = parameters.get("sample_filepath")
+                sample_id = parameters.get("sample_id")
+                pitch_semitones = parameters.get("pitch_semitones")
+                
+                if not sample_filepath:
+                    logger.error("load_sample: Missing sample_filepath parameter")
+                    return False
+                
+                if not sample_id:
+                    logger.error("load_sample: Missing sample_id parameter")
+                    return False
+                
+                # Global sample - store in engine for pre-processing
+                if not hasattr(self, '_global_samples'):
+                    self._global_samples = {}
+                self._global_samples[sample_id] = {
+                    'filepath': sample_filepath,
+                    'pitch_semitones': pitch_semitones
+                }
             
             elif command == "crossfade":
                 params = action_dict.get("parameters", {})
@@ -756,7 +1105,17 @@ class AudioEngine:
                 from_deck.fade_volume(0.0, duration_seconds)
                 to_deck.fade_volume(1.0, duration_seconds)
                 
-                logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s")
+                # Schedule the source deck to stop after the fade completes
+                def stop_source_deck():
+                    from_deck.stop()
+                    logger.debug(f"Crossfade complete: stopped {from_deck_id}")
+                
+                # Schedule the stop after the fade duration
+                import threading
+                timer = threading.Timer(duration_seconds, stop_source_deck)
+                timer.start()
+                
+                logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s (will stop {from_deck_id} after fade)")
             
             elif command == "bpm_match":
                 params = action_dict.get("parameters", {})
@@ -776,7 +1135,20 @@ class AudioEngine:
                     logger.error(f"Invalid BPM for bpm_match")
                     return
                 
-                # Only perform tempo matching (BPM match)
+                # Check if the required tempo change is cached
+                cache_filepath = follow_deck._get_tempo_cache_filepath(reference_bpm)
+                if not cache_filepath or not os.path.exists(cache_filepath):
+                    logger.warning(f"BPM match: tempo cache not found for {follow_deck_id} at {reference_bpm} BPM")
+                    logger.info(f"Processing tempo {reference_bpm} BPM on-demand (JIT)...")
+                    
+                    # JIT processing - process the missing tempo variant immediately
+                    if self._jit_process_tempo(follow_deck, reference_bpm):
+                        logger.info(f"Successfully processed tempo {reference_bpm} BPM on-demand")
+                    else:
+                        logger.error(f"JIT processing failed for {follow_deck_id} at {reference_bpm} BPM")
+                        return
+                
+                # Only perform tempo matching (BPM match) - this will load from cache
                 follow_deck.set_tempo(reference_bpm)
                 logger.info(f"BPM match complete: {follow_deck_id} synchronized. New BPM: {follow_deck.bpm}")
             
@@ -828,6 +1200,112 @@ class AudioEngine:
         for deck in self.decks.values():
             if deck.is_active(): return True
         return False
+
+    def _play_global_sample(self, sample_id, volume=1.0, key_match_deck=None, repetitions=None):
+        """Play a pre-processed global sample with optional key matching and looping"""
+        try:
+            # Check if sample exists in cache
+            if not hasattr(self, '_global_sample_cache'):
+                logger.error(f"AudioEngine - Global sample cache not initialized")
+                return False
+            
+            if sample_id not in self._global_sample_cache:
+                logger.error(f"AudioEngine - Sample '{sample_id}' not found in cache. Available samples: {list(self._global_sample_cache.keys())}")
+                return False
+            
+            # Get the cached sample
+            sample_audio = self._global_sample_cache[sample_id].copy()
+            
+            # Apply key matching if requested
+            if key_match_deck:
+                if key_match_deck not in self.decks:
+                    logger.error(f"AudioEngine - Key match deck '{key_match_deck}' not found")
+                    return False
+                
+                deck = self.decks[key_match_deck]
+                track_key_info = deck.get_track_key()
+                track_key = track_key_info['key']
+                
+                # Calculate pitch shift needed for key matching
+                # This would require analyzing the sample's key first
+                # For now, we'll implement a simple key matching system
+                logger.info(f"AudioEngine - Key matching sample '{sample_id}' to deck '{key_match_deck}' (track key: {track_key})")
+                
+                # TODO: Implement key matching logic here
+                # For now, just log that key matching was requested
+                logger.warning(f"AudioEngine - Key matching not yet implemented for sample '{sample_id}'")
+            
+            # Apply volume (no hardcoded reduction)
+            sample_audio *= volume
+            
+            # Apply looping if specified
+            if repetitions is not None:
+                if repetitions == "infinite":
+                    repetitions = None # essentia's loop_samples expects None for infinite
+                else:
+                    try:
+                        repetitions = int(repetitions)
+                        if repetitions <= 0:
+                            repetitions = None # essentia's loop_samples expects None for non-positive
+                    except ValueError:
+                        logger.warning(f"Invalid 'repetitions' value for 'play_sample': {repetitions}. Defaulting to infinite.")
+                        repetitions = None
+
+            if repetitions is not None:
+                # Store for global playback
+                self._global_scratch_sample_audio = sample_audio
+                self._global_scratch_sample_position = 0
+                self._global_scratch_sample_active = True
+                self._global_sample_loop_active = True
+                self._global_sample_loop_repetitions = repetitions
+                self._global_sample_loop_repetitions_done = 0
+                
+                logger.debug(f"AudioEngine - Playing global sample with loop: {sample_id} (volume: {volume}, key_match: {key_match_deck}, repetitions: {repetitions})")
+                return True
+            else:
+                # Store for global playback
+                self._global_scratch_sample_audio = sample_audio
+                self._global_scratch_sample_position = 0
+                self._global_scratch_sample_active = True
+                
+                logger.debug(f"AudioEngine - Playing global sample: {sample_id} (volume: {volume}, key_match: {key_match_deck})")
+                return True
+            
+        except Exception as e:
+            logger.error(f"AudioEngine - Error playing global sample '{sample_id}': {e}")
+            return False
+
+    def _load_global_sample(self, sample_filepath):
+        """Load a sample globally for playback"""
+        try:
+            import essentia.standard as es
+            import librosa
+            import numpy as np
+            
+            # Load the sample audio
+            loader = es.MonoLoader(filename=sample_filepath)
+            sample_audio = loader()
+            sample_sr = int(loader.paramValue('sampleRate'))
+            
+            # Resample if needed to match standard sample rate (44100)
+            if sample_sr != 44100:
+                sample_audio = librosa.resample(
+                    sample_audio,
+                    orig_sr=sample_sr,
+                    target_sr=44100
+                )
+            
+            # Store for global playback
+            self._global_scratch_sample_audio = sample_audio
+            self._global_scratch_sample_position = 0
+            self._global_scratch_sample_active = True
+            
+            logger.debug(f"AudioEngine - Loaded global scratch sample: {os.path.basename(sample_filepath)}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"AudioEngine - Error loading global scratch sample: {e}")
+            return False
 
 
 if __name__ == '__main__':

@@ -18,6 +18,15 @@ def setup_logging(log_level_str='INFO'):
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+    
+    # Suppress verbose logging from third-party libraries
+    if log_level_str.upper() == 'DEBUG':
+        # Keep numba at INFO level to avoid bytecode dumps
+        logging.getLogger('numba').setLevel(logging.INFO)
+        # Suppress other verbose libraries
+        logging.getLogger('librosa').setLevel(logging.WARNING)
+        logging.getLogger('essentia').setLevel(logging.WARNING)
+    
     return logging.getLogger(__name__)
 
 
@@ -73,8 +82,7 @@ def run_dj_gemini():
 
     logger.info("Ensuring necessary directories exist...")
     try:
-        app_config.ensure_dir_exists(app_config.ANALYSIS_DATA_DIR)
-        app_config.ensure_dir_exists(app_config.BEATS_CACHE_DIR)
+        app_config.ensure_dir_exists(app_config.CACHE_DIR)
         app_config.ensure_dir_exists(app_config.AUDIO_TRACKS_DIR)
         app_config.ensure_dir_exists(app_config.MIX_CONFIGS_DIR)
         logger.info("Directory check complete.")
@@ -102,7 +110,9 @@ def run_dj_gemini():
                 script_path_to_load = path_in_project_root
 
     if not audio_engine.load_script_from_file(script_path_to_load):
-        logger.error(f"Failed to load script '{script_path_to_load}'. Exiting.")
+        logger.error(f"Failed to load script '{script_path_to_load}'.")
+        logger.error("If you see cache validation errors, run preprocessing first:")
+        logger.error(f"  python preprocess.py {args.json_script_path}")
         return
 
     try:
@@ -121,8 +131,7 @@ def run_dj_gemini():
             
             # Reduce status logging frequency
             if loop_count % 50 == 0 or not engine_is_dispatching_actions:
-                pending_triggers_count = len(getattr(audio_engine, '_pending_on_beat_actions', []))
-                logger.debug(f"Main - Status: EngineDispatching={engine_is_dispatching_actions}, DecksActive={decks_are_active}, PendingActions={pending_triggers_count}")
+                pass
 
             # Exit condition
             if not engine_is_dispatching_actions and not decks_are_active:
@@ -133,10 +142,6 @@ def run_dj_gemini():
             # Timeout check
             if args.max_wait_after_script > 0 and (time.time() - wait_start_time) > args.max_wait_after_script:
                 logger.warning(f"Max wait time of {args.max_wait_after_script}s reached.")
-                if hasattr(audio_engine, '_pending_on_beat_actions') and audio_engine._pending_on_beat_actions:
-                    logger.debug(f"Still {len(audio_engine._pending_on_beat_actions)} pending actions on timeout:")
-                    for pa_idx, pa in enumerate(audio_engine._pending_on_beat_actions):
-                        logger.debug(f"  Pending {pa_idx+1}: ID='{pa.get('id','N/A')}', CMD='{pa.get('command')}', Deck='{pa.get('deck_id','N/A')}', Trigger={pa.get('trigger')}")
                 break
             time.sleep(0.5)
         logger.info("Monitoring loop finished.")

@@ -27,11 +27,16 @@ class AudioAnalyzer:
                 logger.error(f"AudioAnalyzer - Could not create cache directory {self.cache_dir}: {e}")
 
     def _get_beats_cache_filepath(self, audio_filepath):
-        """Generates a cache filepath for beat/bpm analysis data."""
-        basename = os.path.basename(audio_filepath)
-        # Example: starships.mp3 -> starships.mp3.beats (if extension is .beats)
-        cache_file = basename + self.beats_cache_file_extension 
-        return os.path.join(self.cache_dir, cache_file)
+        """Generates a cache filepath for beat/bpm analysis data using new structure."""
+        # Import here to avoid circular imports
+        try:
+            import config as app_config
+            return app_config.get_beats_cache_filepath(audio_filepath)
+        except ImportError:
+            # Fallback to old method if config not available
+            basename = os.path.basename(audio_filepath)
+            cache_file = basename + self.beats_cache_file_extension 
+            return os.path.join(self.cache_dir, cache_file)
 
     def _get_cue_filepath(self, audio_filepath):
         """
@@ -91,7 +96,14 @@ class AudioAnalyzer:
                 logger.error(f"AudioAnalyzer - Could not load/parse beats cache {beats_cache_filepath}: {e}. Re-analyzing.")
                 analysis_data = None
         
-        if analysis_data is None: 
+        if analysis_data is None:
+            # Ensure song cache directory exists for new structure
+            try:
+                import config as app_config
+                song_cache_dir = app_config.get_song_cache_dir(audio_filepath)
+                app_config.ensure_dir_exists(song_cache_dir)
+            except ImportError:
+                pass 
             logger.debug(f"AudioAnalyzer - No valid beats cache for {os.path.basename(audio_filepath)}. Performing new beat/bpm analysis.")
             try:
                 logger.debug("AudioAnalyzer - Loading audio with Essentia's MonoLoader...")

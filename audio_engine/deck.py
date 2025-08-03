@@ -6,6 +6,7 @@ import time
 import queue 
 import json 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger(__name__)
 import essentia.standard as es
 import numpy as np
@@ -25,6 +26,7 @@ DECK_CMD_DEACTIVATE_LOOP = "DEACTIVATE_LOOP"
 DECK_CMD_SHUTDOWN = "SHUTDOWN"
 DECK_CMD_STOP_AT_BEAT = "STOP_AT_BEAT"
 DECK_CMD_SET_TEMPO = "SET_TEMPO"
+DECK_CMD_SET_PITCH = "SET_PITCH"
 DECK_CMD_SET_VOLUME = "SET_VOLUME"
 DECK_CMD_FADE_VOLUME = "FADE_VOLUME"
 
@@ -32,9 +34,10 @@ DECK_CMD_FADE_VOLUME = "FADE_VOLUME"
 SCRATCH_CUT_FRAMES = 0  # Disabled for debugging
 
 class Deck:
-    def __init__(self, deck_id, analyzer_instance):
+    def __init__(self, deck_id, analyzer_instance, engine_instance=None):
         self.deck_id = deck_id
         self.analyzer = analyzer_instance
+        self.engine = engine_instance  # Reference to the engine for global samples
         logger.debug(f"Deck {self.deck_id} - Initializing...")
 
         self.filepath = None
@@ -53,6 +56,9 @@ class Deck:
         self.command_queue = queue.Queue()
         self.audio_thread_stop_event = threading.Event()
         self.audio_thread = threading.Thread(target=self._audio_management_loop, daemon=True)
+        
+        # Thread pool for heavy processing tasks
+        self._processing_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"Deck{deck_id}")
 
         self._stream_lock = threading.Lock() 
         self._current_playback_frame_for_display = 0 
@@ -135,6 +141,7 @@ class Deck:
         self._fade_start_eq_high = None
         self._fade_start_time_eq = None
         self._fade_duration_eq = None
+        self._fade_pending_eq = False
 
         # Buffer-synchronized EQ changes to eliminate clicking
         self._eq_pending_low = None
@@ -230,10 +237,9 @@ class Deck:
         """Apply EQ filtering to audio chunk with gain smoothing"""
         logger.debug(f"Deck {self.deck_id} - apply_eq called, chunk shape: {audio_chunk.shape}")
         
-        if (not self._eq_filters_initialized or
-            (self._eq_low == 1.0 and self._eq_mid == 1.0 and self._eq_high == 1.0)):
-            logger.debug(f"Deck {self.deck_id} - No EQ applied (neutral or not initialized)")
-            return audio_chunk  # No EQ applied
+        # TEMPORARILY DISABLED: EQ processing to fix audio output
+        logger.debug(f"Deck {self.deck_id} - EQ temporarily disabled, returning unprocessed audio")
+        return audio_chunk
         
         try:
             # Ensure audio_chunk is 1D for processing
@@ -366,8 +372,9 @@ class Deck:
             original_frame = int(self.beat_timestamps[beat - 1] * self.sample_rate)
             self.original_beat_positions[beat] = original_frame
         
-        # Store original BPM
+        # Store original BPM and beat timestamps for tempo scaling
         self.original_bpm = self.bpm
+        self.original_beat_timestamps = self.beat_timestamps.copy()  # Store original timestamps
 
         try:
             logger.debug(f"Deck {self.deck_id} - Loading audio samples with MonoLoader...")
@@ -395,6 +402,7 @@ class Deck:
             self._current_playback_frame_for_display = 0 
             self._user_wants_to_play = False 
             self._loop_active = False 
+        
         logger.info(f"Deck {self.deck_id} - Track '{os.path.basename(audio_filepath)}' data sent to audio thread. BPM: {self.bpm:.2f}")
         return True
 
@@ -414,12 +422,22 @@ class Deck:
                 interpolated_frame = original_frame + (next_frame - original_frame) * beat_frac
                 original_frame = int(interpolated_frame)
             
+            # Calculate current tempo ratio for scaling
             if self._tempo_ramp_active and self._current_tempo_ratio != 1.0:
-                scaled_frame = int(original_frame / self._current_tempo_ratio)
-                logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ratio: {self._current_tempo_ratio:.3f})")
+                # Use ramp tempo ratio
+                tempo_ratio = self._current_tempo_ratio
+                scaled_frame = int(original_frame / tempo_ratio)
+                logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (ramp ratio: {tempo_ratio:.3f})")
                 return scaled_frame
-            else:
-                return original_frame
+            elif hasattr(self, 'original_bpm') and self.original_bpm > 0:
+                # Use regular tempo ratio
+                tempo_ratio = self.bpm / self.original_bpm
+                if abs(tempo_ratio - 1.0) > 0.001:  # Only scale if significantly different
+                    scaled_frame = int(original_frame / tempo_ratio)
+                    logger.debug(f"Deck {self.deck_id} - Beat {beat_number}: original frame {original_frame} → scaled frame {scaled_frame} (tempo ratio: {tempo_ratio:.3f})")
+                    return scaled_frame
+            
+            return original_frame
         else:
             logger.warning(f"Deck {self.deck_id} - Beat {beat_number} not found in original positions")
             return 0
@@ -437,33 +455,22 @@ class Deck:
 
     def get_current_beat_count(self):
         """Get current beat count, accounting for ramp adjustments"""
-        logger.debug(f"Deck {self.deck_id} - get_current_beat_count() called")
-        
         # Add timeout to prevent infinite hangs
         import time
         start_time = time.time()
         
         with self._stream_lock:
-            logger.debug(f"Deck {self.deck_id} - Got stream lock")
-            
             if self.audio_thread_data is None or self.sample_rate == 0 or len(self.beat_timestamps) == 0:
-                logger.debug(f"Deck {self.deck_id} - Early return: data={self.audio_thread_data is None}, sr={self.sample_rate}, beats={len(self.beat_timestamps)}")
                 return 0 
             
-            logger.debug(f"Deck {self.deck_id} - About to calculate current time")
             current_time_seconds = self._current_playback_frame_for_display / float(self.sample_rate)
-            logger.debug(f"Deck {self.deck_id} - Current time: {current_time_seconds:.3f}s")
             
             # Use ramp-adjusted beat timestamps if in ramp
             if self._tempo_ramp_active and self._ramp_beat_timestamps is not None:
-                logger.debug(f"Deck {self.deck_id} - Using ramp beat timestamps")
                 beat_timestamps_to_use = self._ramp_beat_timestamps
             else:
-                logger.debug(f"Deck {self.deck_id} - Using original beat timestamps")
                 beat_timestamps_to_use = self.beat_timestamps
                 
-            logger.debug(f"Deck {self.deck_id} - About to call searchsorted")
-            
             # Add timeout check
             if time.time() - start_time > 1.0:  # 1 second timeout
                 logger.error(f"Deck {self.deck_id} - Timeout in get_current_beat_count()")
@@ -472,7 +479,6 @@ class Deck:
             try:
                 # Use side='left' to get the current beat (not the next beat)
                 beat_count = np.searchsorted(beat_timestamps_to_use, current_time_seconds, side='left')
-                logger.debug(f"Deck {self.deck_id} - Beat count: {beat_count}")
                 return beat_count
             except Exception as e:
                 logger.error(f"Deck {self.deck_id} - Exception in searchsorted: {e}")
@@ -686,129 +692,143 @@ class Deck:
         }))
 
     def _get_tempo_cache_filepath(self, target_bpm):
-        """Generate cache filepath for tempo-processed audio"""
-        import hashlib
-        # Create a unique filename based on original file and target BPM
-        # Use the analyzer's cache directory
-        cache_key = f"{self.deck_id}_{target_bpm:.1f}"
-        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        return os.path.join(self.analyzer.cache_dir, f"tempo_{cache_hash}.npy")
+        """Generate cache filepath for tempo-processed audio using new structure"""
+        if not self.filepath:
+            return None
+        try:
+            import config as app_config
+            return app_config.get_tempo_cache_filepath(self.filepath, target_bpm)
+        except ImportError:
+            # Fallback to old method
+            import hashlib
+            original_filename = os.path.splitext(os.path.basename(self.filepath))[0]
+            cache_key = f"{original_filename}_{target_bpm:.1f}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            return os.path.join(self.analyzer.cache_dir, f"{original_filename}.tempo_{cache_hash}.npy")
+
+    def _get_pitch_cache_filepath(self, semitones):
+        """Generate cache filepath for pitch-processed audio using new structure"""
+        if not self.filepath:
+            return None
+        try:
+            import config as app_config
+            return app_config.get_pitch_cache_filepath(self.filepath, semitones)
+        except ImportError:
+            # Fallback to old method
+            import hashlib
+            original_filename = os.path.splitext(os.path.basename(self.filepath))[0]
+            cache_key = f"{original_filename}_{semitones}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            return os.path.join(self.analyzer.cache_dir, f"{original_filename}.pitch_{cache_hash}.npy")
+
+
+
 
     def set_tempo(self, target_bpm):
-        """Set playback tempo to exact BPM target using Rubber Band"""
-        logger.info(f"Deck {self.deck_id} - Engine requests SET_TEMPO. Target BPM: {target_bpm}")
+        """Set playback tempo using pre-processed cached audio (cache-only)"""
+        logger.info(f"Deck {self.deck_id} - Setting tempo to {target_bpm} BPM")
         
         if self.total_frames == 0:
             logger.error(f"Deck {self.deck_id} - Cannot set tempo: track not loaded.")
-            return
+            return False
         
-        # Calculate tempo ratio
-        tempo_ratio = target_bpm / self.original_bpm
-        logger.debug(f"Deck {self.deck_id} - Calculated tempo ratio {tempo_ratio:.3f}")
-        
-        # Check cache first
+        # Load from cache (cache-only approach)
         cache_filepath = self._get_tempo_cache_filepath(target_bpm)
-        if os.path.exists(cache_filepath):
-            logger.debug(f"Deck {self.deck_id} - Loading Rubber Band cache...")
-            try:
-                processed_audio = np.load(cache_filepath)
-                with self._stream_lock:
-                    self.audio_thread_data = processed_audio
-                    self.audio_thread_total_samples = len(processed_audio)
-                    # CRITICAL: Update the BPM to the target BPM
-                    self.bpm = target_bpm
-                    # Scale the beat timestamps to match the new tempo
-                    self._scale_beat_positions(tempo_ratio)
-                logger.debug(f"Deck {self.deck_id} - Loaded cached tempo {target_bpm}")
-                return
-            except Exception as e:
-                logger.warning(f"Deck {self.deck_id} - Failed to load cache: {e}")
+        if not cache_filepath or not os.path.exists(cache_filepath):
+            logger.error(f"Deck {self.deck_id} - Tempo cache not found for {target_bpm} BPM")
+            logger.error(f"Expected cache file: {cache_filepath}")
+            logger.error(f"Run preprocessing first: python preprocess.py <script.json>")
+            return False
         
-        # Process with Rubber Band
-        logger.debug(f"Deck {self.deck_id} - Processing with Rubber Band...")
         try:
-            import pyrubberband as pyrb
+            logger.debug(f"Deck {self.deck_id} - Loading tempo cache...")
+            processed_audio = np.load(cache_filepath)
             
-            # Debug: Check what sample rate we have
-            logger.debug(f"Deck {self.deck_id} - Audio thread sample rate: {self.audio_thread_sample_rate} (type: {type(self.audio_thread_sample_rate)})")
-            logger.debug(f"Deck {self.deck_id} - Main sample rate: {self.sample_rate} (type: {type(self.sample_rate)})")
-            logger.debug(f"Deck {self.deck_id} - Tempo ratio: {tempo_ratio} (type: {type(tempo_ratio)})")
-            logger.debug(f"Deck {self.deck_id} - Audio data shape: {self.audio_thread_data.shape if (self.audio_thread_data is not None and hasattr(self.audio_thread_data, 'shape')) else 'no shape'}")
-            logger.debug(f"Deck {self.deck_id} - Audio data type: {type(self.audio_thread_data)}")
-            
-            # Use the audio thread sample rate to match the audio data
-            # If audio_thread_sample_rate is not available, fall back to main sample_rate
-            sample_rate_to_use = self.audio_thread_sample_rate if self.audio_thread_sample_rate is not None else self.sample_rate
-            sample_rate_to_use = int(sample_rate_to_use)
-            
-            logger.debug(f"Deck {self.deck_id} - Using sample rate: {sample_rate_to_use}")
-            
-            # Ensure audio data is the right format for pyrubberband
-            if self.audio_thread_data is None:
-                logger.error(f"Deck {self.deck_id} - No audio data available for tempo processing")
-                return
-                
-            # Convert to float32 if needed
-            audio_data = self.audio_thread_data.astype(np.float32)
-            
-            # Let's try the correct pyrubberband function signature
-            # According to the docs, it should be: pyrb.time_stretch(y, rate, sr)
-            # But let's also try with explicit keyword arguments
-            processed_audio = pyrb.time_stretch(
-                y=audio_data,
-                rate=float(tempo_ratio),
-                sr=sample_rate_to_use
-            )
-            
-            # Save to cache
-            np.save(cache_filepath, processed_audio)
-            
-            # Update audio data and scale positions
             with self._stream_lock:
                 self.audio_thread_data = processed_audio
                 self.audio_thread_total_samples = len(processed_audio)
-                # CRITICAL: Update the BPM to the target BPM
+                # Update the BPM to the target BPM
                 self.bpm = target_bpm
                 # Scale the beat timestamps to match the new tempo
-                self._scale_beat_positions(tempo_ratio)
+                self._scale_beat_positions(target_bpm / self.original_bpm)
             
-            logger.info(f"Deck {self.deck_id} - Rubber Band processing complete, BPM now {self.bpm}")
+            logger.info(f"Deck {self.deck_id} - Successfully loaded tempo {target_bpm} BPM from cache")
+            return True
             
         except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Rubber Band processing failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+            logger.error(f"Deck {self.deck_id} - Failed to load tempo cache: {e}")
+            return False
+
+    def set_pitch(self, semitones):
+        """Set playback pitch using pre-processed cached audio (cache-only)"""
+        logger.info(f"Deck {self.deck_id} - Setting pitch to {semitones} semitones")
+        
+        if self.total_frames == 0:
+            logger.error(f"Deck {self.deck_id} - Cannot set pitch: track not loaded.")
+            return False
+        
+        # Load from cache (cache-only approach)
+        cache_filepath = self._get_pitch_cache_filepath(semitones)
+        if not cache_filepath or not os.path.exists(cache_filepath):
+            logger.error(f"Deck {self.deck_id} - Pitch cache not found for {semitones} semitones")
+            logger.error(f"Expected cache file: {cache_filepath}")
+            logger.error(f"Run preprocessing first: python preprocess.py <script.json>")
+            return False
+        
+        try:
+            logger.debug(f"Deck {self.deck_id} - Loading pitch cache...")
+            processed_audio = np.load(cache_filepath)
+            self._apply_pitch_shift_result(processed_audio, semitones)
+            logger.info(f"Deck {self.deck_id} - Successfully loaded pitch {semitones} semitones from cache")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to load pitch cache: {e}")
+            return False
+
+
+
+    def _apply_pitch_shift_result(self, processed_audio, semitones):
+        """Apply pitch shift result in main thread"""
+        logger.info(f"Deck {self.deck_id} - MAIN THREAD: Applying pitch shift result...")
+        with self._stream_lock:
+            # Store current position as a ratio to maintain it across audio changes
+            current_position_ratio = self._current_playback_frame_for_display / len(self.audio_thread_data) if (self.audio_thread_data is not None and len(self.audio_thread_data) > 0) else 0
+            
+            old_audio_length = len(self.audio_thread_data) if self.audio_thread_data is not None else 0
+            self.audio_thread_data = processed_audio
+            self.audio_thread_total_samples = len(processed_audio)
+            
+            # Restore position in the new audio data
+            new_position = int(current_position_ratio * len(processed_audio))
+            self._current_playback_frame_for_display = new_position
+            logger.info(f"Deck {self.deck_id} - MAIN THREAD: Audio data updated: {old_audio_length} -> {len(processed_audio)} frames, position: {new_position} (ratio: {current_position_ratio:.3f})")
+            logger.info(f"Deck {self.deck_id} - MAIN THREAD: Pitch shift applied successfully! Audio now playing at new pitch.")
 
     def _scale_beat_positions(self, tempo_ratio):
         """Scale all beat positions, cue points, and loop positions to match the new tempo"""
         logger.debug(f"Deck {self.deck_id} - Scaling positions by tempo ratio {tempo_ratio:.3f}")
         
-        # Scale beat timestamps - CORRECTED: divide by tempo ratio when speeding up
-        if hasattr(self, 'beat_timestamps') and len(self.beat_timestamps) > 0:
-            self.beat_timestamps = self.beat_timestamps / tempo_ratio
-            logger.debug(f"Deck {self.deck_id} - Scaled {len(self.beat_timestamps)} beat timestamps")
+        # Scale beat timestamps - FIXED: use original timestamps to avoid cumulative scaling
+        if hasattr(self, 'original_beat_timestamps') and len(self.original_beat_timestamps) > 0:
+            self.beat_timestamps = self.original_beat_timestamps / tempo_ratio
+            logger.debug(f"Deck {self.deck_id} - Scaled {len(self.beat_timestamps)} beat timestamps from original")
         
-        # Scale cue points - CORRECTED: divide by tempo ratio
+        # Scale cue points - FIXED: multiply by tempo ratio
         if hasattr(self, 'cue_points') and self.cue_points:
             scaled_cue_points = {}
             for cue_name, cue_data in self.cue_points.items():
                 if 'start_beat' in cue_data:
-                    # Scale the beat position - CORRECTED: divide by tempo ratio
+                    # Scale the beat position - FIXED: multiply by tempo ratio
                     scaled_cue_points[cue_name] = {
-                        'start_beat': cue_data['start_beat'] / tempo_ratio
+                        'start_beat': cue_data['start_beat'] * tempo_ratio
                     }
             self.cue_points = scaled_cue_points
             logger.debug(f"Deck {self.deck_id} - Scaled {len(self.cue_points)} cue points")
         
-        # Update original beat positions for loop calculations - CORRECTED: divide by tempo ratio
-        if hasattr(self, 'original_beat_positions') and self.original_beat_positions:
-            scaled_positions = {}
-            for beat, frame in self.original_beat_positions.items():
-                # Scale the frame position - CORRECTED: divide by tempo ratio
-                scaled_positions[beat] = int(frame / tempo_ratio)
-            self.original_beat_positions = scaled_positions
-            logger.debug(f"Deck {self.deck_id} - Scaled {len(self.original_beat_positions)} beat positions")
+        # Don't modify original_beat_positions - they should stay original!
+        # The get_frame_from_beat method will handle tempo scaling when needed
+        logger.debug(f"Deck {self.deck_id} - Keeping original beat positions unchanged for tempo scaling")
 
     def set_volume(self, volume):
         """Set deck volume (0.0 to 1.0)"""
@@ -873,6 +893,16 @@ class Deck:
             if high is not None and abs(high - self._eq_high) > 1e-6:
                 eq_changed = True
             if eq_changed:
+                # Disable any active fade when starting smoothing
+                self._fade_target_eq_low = None
+                self._fade_target_eq_mid = None
+                self._fade_target_eq_high = None
+                self._fade_start_eq_low = None
+                self._fade_start_eq_mid = None
+                self._fade_start_eq_high = None
+                self._fade_start_time_eq = None
+                self._fade_duration_eq = None
+                
                 # Start smoothing from current values to new targets
                 self._eq_smoothing_start = {
                     'low': self._eq_low,
@@ -893,16 +923,19 @@ class Deck:
     def fade_eq(self, target_low=None, target_mid=None, target_high=None, duration_seconds=1.0):
         """Fade EQ levels over time"""
         with self._stream_lock:
+            # Disable any active smoothing when starting a fade
+            self._eq_smoothing_active = False
+            
+            # Store target values but don't start fade yet
             self._fade_target_eq_low = target_low
             self._fade_target_eq_mid = target_mid
             self._fade_target_eq_high = target_high
-            self._fade_start_eq_low = self._eq_low
-            self._fade_start_eq_mid = self._eq_mid
-            self._fade_start_eq_high = self._eq_high
-            self._fade_start_time_eq = time.time()
             self._fade_duration_eq = duration_seconds
             
-            logger.debug(f"Deck {self.deck_id} - EQ fade started: {duration_seconds}s")
+            # Mark fade as pending - will start at next buffer boundary
+            self._fade_pending_eq = True
+            
+            logger.debug(f"Deck {self.deck_id} - EQ fade queued: {duration_seconds}s")
 
     def get_current_eq(self):
         """Get current EQ levels"""
@@ -915,6 +948,15 @@ class Deck:
 
     def _update_eq_fade(self):
         """Update EQ based on active fade"""
+        # Check if fade is pending and start it at buffer boundary
+        if self._fade_pending_eq:
+            self._fade_start_eq_low = self._eq_low
+            self._fade_start_eq_mid = self._eq_mid
+            self._fade_start_eq_high = self._eq_high
+            self._fade_start_time_eq = time.time()
+            self._fade_pending_eq = False
+            logger.debug(f"Deck {self.deck_id} - EQ fade started at buffer boundary")
+            
         if (self._fade_target_eq_low is None and 
             self._fade_target_eq_mid is None and 
             self._fade_target_eq_high is None):
@@ -926,6 +968,8 @@ class Deck:
             
         current_time = time.time()
         elapsed = current_time - self._fade_start_time_eq
+        
+        # REMOVED: Previous value storage - no longer needed
         
         if elapsed >= self._fade_duration_eq:
             # Fade complete
@@ -948,18 +992,27 @@ class Deck:
             
             logger.debug(f"Deck {self.deck_id} - EQ fade complete: Low={self._eq_low:.2f}, Mid={self._eq_mid:.2f}, High={self._eq_high:.2f}")
         else:
-            # Calculate current EQ during fade
+            # Calculate current EQ during fade with micro-interpolation
             progress = elapsed / self._fade_duration_eq
+            
+            # Apply smooth curve to reduce artifacts
+            # Use S-curve (smoothstep) for more natural transitions
+            smooth_progress = 3 * progress ** 2 - 2 * progress ** 3
             
             if (self._fade_target_eq_low is not None and 
                 self._fade_start_eq_low is not None):
-                self._eq_low = self._fade_start_eq_low + (self._fade_target_eq_low - self._fade_start_eq_low) * progress
+                self._eq_low = self._fade_start_eq_low + (self._fade_target_eq_low - self._fade_start_eq_low) * smooth_progress
             if (self._fade_target_eq_mid is not None and 
                 self._fade_start_eq_mid is not None):
-                self._eq_mid = self._fade_start_eq_mid + (self._fade_target_eq_mid - self._fade_start_eq_mid) * progress
+                self._eq_mid = self._fade_start_eq_mid + (self._fade_target_eq_mid - self._fade_start_eq_mid) * smooth_progress
             if (self._fade_target_eq_high is not None and 
                 self._fade_start_eq_high is not None):
-                self._eq_high = self._fade_start_eq_high + (self._fade_target_eq_high - self._fade_start_eq_high) * progress
+                self._eq_high = self._fade_start_eq_high + (self._fade_target_eq_high - self._fade_start_eq_high) * smooth_progress
+        
+        # REMOVED: Filter state reset - it was causing artifacts
+        # The IIR filters maintain their own state continuity
+
+    # TEMPORARILY REMOVED: _apply_eq_with_gradual_activation method to fix hang
 
     def _update_tempo_ramp(self, current_time=None):
         """Update tempo based on active ramp - USE TIME-BASED PROGRESS"""
@@ -1242,14 +1295,10 @@ class Deck:
                         'action_id': data.get('action_id')
                     }
                     
-                    # Log the first 10 sample values at the loop start for debugging
+                    # Log loop activation info without dumping arrays
                     start_frame = data['start_frame']
                     if self.audio_thread_data is not None:
-                        sample_preview = self.audio_thread_data[start_frame:start_frame+10]
-                        last_sample_before = self.audio_thread_data[start_frame-1] if start_frame > 0 else None
-                        first_sample = self.audio_thread_data[start_frame] if len(self.audio_thread_data) > start_frame else None
-                        logger.debug(f"[LOOP ACTIVATION SAMPLES] Frame {start_frame}: {sample_preview}")
-                        logger.debug(f"[LOOP ACTIVATION SAMPLES] Last sample before loop: {last_sample_before}, First sample at loop: {first_sample}")
+                        logger.debug(f"[LOOP ACTIVATION] Frame {start_frame}: Loop activated")
 
                     with self._stream_lock:
                         # LOOP STATE IS ALREADY SET - just update playback pointer
@@ -1293,6 +1342,13 @@ class Deck:
                     target_bpm = data.get('target_bpm')
                     if target_bpm is not None:
                         self.set_tempo(target_bpm)
+                elif command == DECK_CMD_SET_PITCH:
+                    logger.debug(f"Deck {self.deck_id} AudioThread - Processing SET_PITCH")
+                    semitones = data.get('semitones')
+                    if semitones is not None:
+                        logger.info(f"Deck {self.deck_id} AudioThread - Starting pitch shift to {semitones} semitones")
+                        self.set_pitch(semitones)
+                        logger.info(f"Deck {self.deck_id} AudioThread - Pitch shift completed")
                 elif command == DECK_CMD_SET_VOLUME:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing SET_VOLUME")
                     volume = data.get('volume')
@@ -1590,29 +1646,121 @@ class Deck:
                 audio_chunk = self.apply_eq(audio_chunk)
                 logger.debug(f"Deck {self.deck_id} CB - EQ applied successfully, output shape: {audio_chunk.shape}")
                 
-                # REMOVED: Crossfade logic that was masking the real issue
+                # Mix with scratch sample if active
+                if scratch_sample_audio is not None:
+                    # Ensure both audio chunks have correct shape for mixing
+                    if audio_chunk.ndim == 1:
+                        audio_chunk = audio_chunk.reshape(-1, 1)
+                    if scratch_sample_audio.ndim == 1:
+                        scratch_sample_audio = scratch_sample_audio.reshape(-1, 1)
+                    
+                    # Apply fade-in/fade-out to prevent clicks
+                    fade_samples = min(64, len(scratch_sample_audio) // 8)  # 64 samples or 1/8 of sample length
+                    
+                    # Fade in at the beginning
+                    if self._scratch_sample_position < fade_samples:
+                        fade_factor = self._scratch_sample_position / fade_samples
+                        scratch_sample_audio[:fade_samples] *= fade_factor
+                    
+                    # Fade out at the end
+                    if self._scratch_sample_audio is not None:
+                        remaining_samples = len(self._scratch_sample_audio) - self._scratch_sample_position
+                        if remaining_samples <= fade_samples:
+                            fade_factor = remaining_samples / fade_samples
+                            scratch_sample_audio[-fade_samples:] *= fade_factor
+                    
+                    # Mix the audio with gentle limiting
+                    mixed_audio = audio_chunk + scratch_sample_audio * 0.7  # Reduce sample volume slightly
+                    
+                    # Gentle limiting to prevent clipping
+                    max_val = np.max(np.abs(mixed_audio))
+                    if max_val > 0.95:
+                        mixed_audio = mixed_audio / max_val * 0.95
+                    
+                    audio_chunk = mixed_audio
+                
+                # Mix with global scratch sample if active (from engine)
+                if hasattr(self, 'engine') and self.engine and hasattr(self.engine, '_global_scratch_sample_active') and self.engine._global_scratch_sample_active:
+                    if hasattr(self.engine, '_global_scratch_sample_audio') and self.engine._global_scratch_sample_audio is not None:
+                        # Get the portion of the global sample we need
+                        remaining_samples = len(self.engine._global_scratch_sample_audio) - self.engine._global_scratch_sample_position
+                        if remaining_samples > 0:
+                            # Calculate how many samples we can output
+                            samples_to_output = min(frames, remaining_samples)
+                            global_sample_audio = self.engine._global_scratch_sample_audio[
+                                self.engine._global_scratch_sample_position:self.engine._global_scratch_sample_position + samples_to_output
+                            ]
+                            
+                            # Pad with zeros if needed
+                            if len(global_sample_audio) < frames:
+                                padding = np.zeros(frames - len(global_sample_audio), dtype=np.float32)
+                                global_sample_audio = np.concatenate([global_sample_audio, padding])
+                            
+                            self.engine._global_scratch_sample_position += samples_to_output
+                            
+                            # Check if global sample is finished
+                            if self.engine._global_scratch_sample_position >= len(self.engine._global_scratch_sample_audio):
+                                # Handle global sample looping
+                                if hasattr(self.engine, '_global_sample_loop_active') and self.engine._global_sample_loop_active:
+                                    self.engine._global_sample_loop_repetitions_done += 1
+                                    reps_total = self.engine._global_sample_loop_repetitions if self.engine._global_sample_loop_repetitions is not None else float('inf')
+                                    
+                                    if self.engine._global_sample_loop_repetitions_done < reps_total:
+                                        # More repetitions to go - loop back to start
+                                        self.engine._global_scratch_sample_position = 0
+                                        logger.debug(f"Deck {self.deck_id} - Global sample loop repetition {self.engine._global_sample_loop_repetitions_done}/{reps_total}")
+                                    else:
+                                        # Loop complete - stop the sample
+                                        self.engine._global_scratch_sample_active = False
+                                        self.engine._global_sample_loop_active = False
+                                        logger.debug(f"Deck {self.deck_id} - Global sample loop complete, stopping")
+                                else:
+                                    # No looping - just stop
+                                    self.engine._global_scratch_sample_active = False
+                                    logger.debug(f"Deck {self.deck_id} - Global scratch sample finished")
+                            
+                            # Ensure both audio chunks have correct shape for mixing
+                            if audio_chunk.ndim == 1:
+                                audio_chunk = audio_chunk.reshape(-1, 1)
+                            if global_sample_audio.ndim == 1:
+                                global_sample_audio = global_sample_audio.reshape(-1, 1)
+                            
+                            # Apply fade-in/fade-out to prevent clicks
+                            fade_samples = min(64, len(global_sample_audio) // 8)  # 64 samples or 1/8 of sample length
+                            
+                            # Fade in at the beginning
+                            if self.engine._global_scratch_sample_position < fade_samples:
+                                fade_factor = self.engine._global_scratch_sample_position / fade_samples
+                                global_sample_audio[:fade_samples] *= fade_factor
+                            
+                            # Fade out at the end
+                            if self.engine._global_scratch_sample_audio is not None:
+                                remaining_samples = len(self.engine._global_scratch_sample_audio) - self.engine._global_scratch_sample_position
+                                if remaining_samples <= fade_samples:
+                                    fade_factor = remaining_samples / fade_samples
+                                    global_sample_audio[-fade_samples:] *= fade_factor
+                            
+                            # Mix the audio with gentle limiting
+                            mixed_audio = audio_chunk + global_sample_audio * 0.6  # Reduce global sample volume more
+                            
+                            # Gentle limiting to prevent clipping
+                            max_val = np.max(np.abs(mixed_audio))
+                            if max_val > 0.95:
+                                mixed_audio = mixed_audio / max_val * 0.95
+                            
+                            audio_chunk = mixed_audio
+                        else:
+                            # Global sample is finished
+                            self.engine._global_scratch_sample_active = False
+                            if hasattr(self.engine, '_global_sample_loop_active'):
+                                self.engine._global_sample_loop_active = False
+                            logger.debug(f"Deck {self.deck_id} - Global scratch sample finished")
                 
                 # Ensure audio_chunk has the correct shape for output
                 # outdata expects shape (frames, channels) but audio_chunk might be (frames,)
                 if audio_chunk.ndim == 1:
                     # Convert 1D array to 2D array with 1 channel
                     audio_chunk = audio_chunk.reshape(-1, 1)
-                
-                # Mix with scratch sample if active
-                if scratch_sample_audio is not None:
-                    # Ensure scratch sample has correct shape
-                    if scratch_sample_audio.ndim == 1:
-                        scratch_sample_audio = scratch_sample_audio.reshape(-1, 1)
-                    
-                    # Mix the audio (simple addition with potential clipping)
-                    mixed_audio = audio_chunk + scratch_sample_audio
-                    
-                    # Simple limiting to prevent clipping
-                    max_val = np.max(np.abs(mixed_audio))
-                    if max_val > 1.0:
-                        mixed_audio = mixed_audio / max_val * 0.95  # Leave some headroom
-                    
-                    audio_chunk = mixed_audio
                 
                 # REMOVED: Split buffer logic that was causing artifacts
                 
@@ -1675,6 +1823,10 @@ class Deck:
                     logger.warning(f"WARNING: Deck {self.deck_id} - Forcing abort/close on lingering stream.")
                     stream.abort(ignore_errors=True); stream.close(ignore_errors=True)
                 except Exception as e_close: logger.error(f"ERROR: Deck {self.deck_id} - Exception during forced stream close: {e_close}")
+        # Shutdown thread pool executor
+        if hasattr(self, '_processing_executor'):
+            self._processing_executor.shutdown(wait=True)
+        
         logger.debug(f"DEBUG: Deck {self.deck_id} - Shutdown complete.")
 
     def _apply_eq_smoothing(self):
@@ -1725,10 +1877,10 @@ class Deck:
         logger.info(f"Deck {self.deck_id} - Scratch started: duration={self._scratch_duration_frames} frames, pattern={self._scratch_pattern}, window={self._scratch_window_frames} frames, cut={SCRATCH_CUT_FRAMES} frames")
 
     def get_track_key(self):
-        """Get the detected key of the current track"""
+        """Get the current track's key information"""
         return {
-            'key': self.key if hasattr(self, 'key') else 'unknown',
-            'confidence': self.key_confidence if hasattr(self, 'key_confidence') else 0.0
+            'key': getattr(self, 'key', 'unknown'),
+            'confidence': getattr(self, 'key_confidence', 0.0)
         }
 
     def load_scratch_sample(self, sample_filepath):
@@ -1765,118 +1917,9 @@ class Deck:
             logger.error(f"Deck {self.deck_id} - Error loading scratch sample {sample_filepath}: {e}")
             return False
 
-    def _calculate_pitch_shift(self, sample_key, track_key):
-        """Calculate the pitch shift needed to match sample key to track key"""
-        if sample_key == 'unknown' or track_key == 'unknown':
-            return 0.0  # No shift if we can't determine keys
-        
-        # Define the circle of fifths for key relationships
-        major_keys = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'F', 'Bb', 'Eb', 'Ab']
-        minor_keys = ['Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m', 'Dm', 'Gm', 'Cm', 'Fm']
-        
-        def parse_key(key_str):
-            """Parse key string like 'C major' or 'A minor'"""
-            parts = key_str.split()
-            if len(parts) >= 2:
-                note = parts[0]
-                scale = parts[1].lower()
-                if scale == 'minor':
-                    return f"{note}m"
-                else:
-                    return note
-            return key_str
-        
-        sample_note = parse_key(sample_key)
-        track_note = parse_key(track_key)
-        
-        # Find semitone difference
-        if sample_note in major_keys and track_note in major_keys:
-            sample_idx = major_keys.index(sample_note)
-            track_idx = major_keys.index(track_note)
-            semitones = (track_idx - sample_idx) % 12
-            if semitones > 6:
-                semitones -= 12  # Prefer downward shifts
-        elif sample_note in minor_keys and track_note in minor_keys:
-            sample_idx = minor_keys.index(sample_note)
-            track_idx = minor_keys.index(track_note)
-            semitones = (track_idx - sample_idx) % 12
-            if semitones > 6:
-                semitones -= 12
-        else:
-            # Different scales - use relative major/minor relationships
-            semitones = 0  # For now, no shift for different scales
-        
-        return semitones
 
-    def _apply_pitch_shift(self, audio, semitones, sample_rate):
-        """Apply pitch shift to audio using librosa"""
-        if semitones == 0:
-            return audio
-        
-        try:
-            # Use librosa's pitch shift
-            shifted_audio = librosa.effects.pitch_shift(
-                audio, 
-                sr=sample_rate, 
-                n_steps=semitones
-            )
-            logger.debug(f"Deck {self.deck_id} - Applied pitch shift: {semitones} semitones")
-            return shifted_audio
-        except Exception as e:
-            logger.warning(f"Deck {self.deck_id} - Pitch shift failed: {e}, using original audio")
-            return audio
 
-    def play_scratch_sample(self, sample_filepath=None, volume=1.0):
-        """Play a scratch sample with automatic key matching"""
-        if sample_filepath and not hasattr(self, '_scratch_sample'):
-            # Load the sample if not already loaded
-            if not self.load_scratch_sample(sample_filepath):
-                return False
-        
-        if not hasattr(self, '_scratch_sample'):
-            logger.error(f"Deck {self.deck_id} - No scratch sample loaded")
-            return False
-        
-        try:
-            # Get current track key
-            track_key_info = self.get_track_key()
-            track_key = track_key_info['key']
-            
-            # Calculate pitch shift
-            semitones = self._calculate_pitch_shift(
-                self._scratch_sample['key'], 
-                track_key
-            )
-            
-            # Apply pitch shift
-            shifted_audio = self._apply_pitch_shift(
-                self._scratch_sample['audio'],
-                semitones,
-                self._scratch_sample['sample_rate']
-            )
-            
-            # Resample if needed to match deck sample rate
-            if self._scratch_sample['sample_rate'] != self.sample_rate:
-                shifted_audio = librosa.resample(
-                    shifted_audio,
-                    orig_sr=self._scratch_sample['sample_rate'],
-                    target_sr=self.sample_rate
-                )
-            
-            # Apply volume
-            shifted_audio *= volume
-            
-            # Store for playback
-            self._scratch_sample_audio = shifted_audio
-            self._scratch_sample_position = 0
-            self._scratch_sample_active = True
-            
-            logger.debug(f"Deck {self.deck_id} - Playing scratch sample: {os.path.basename(self._scratch_sample['filepath'])} (shift: {semitones} semitones)")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Error playing scratch sample: {e}")
-            return False
+
 
 
 if __name__ == '__main__':

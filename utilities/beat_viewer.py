@@ -3,7 +3,7 @@
 play_song.py - Simple audio player with BPM detection, robust seeking, and beat navigation
 
 Dependencies:
-    pip install pydub simpleaudio essentia numpy
+    pip install pydub sounddevice essentia numpy
     # For MP3 support, install ffmpeg (e.g., brew install ffmpeg on macOS)
 """
 
@@ -16,16 +16,17 @@ import threading
 import numpy as np
 import essentia.standard as es
 from pydub import AudioSegment
-import simpleaudio as sa
+import sounddevice as sd
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
 class PlaySongApp:
     def __init__(self, master_window, initial_filepath=None):
         self.master = master_window
-        self.master.title("Play Song - Audio Player")
-        self.master.geometry("600x400")
+        self.master.title("Beat Viewer - Audio Player with EQ")
+        self.master.geometry("900x650")  # Increased width to show all GUI elements
         
         # Audio state
         self.audio_segment = None
@@ -36,16 +37,40 @@ class PlaySongApp:
         self.current_position = 0.0
         self.is_playing = False
         self.file_loaded = False
-        self.play_obj = None
+        self.current_filepath = None
+        
+        # SoundDevice streaming
+        self.stream = None
+        self.audio_data = None
+        self.sample_rate = 0
+        self.current_frame = 0
+        self.total_frames = 0
         self.playback_thread = None
         self.stop_playback = threading.Event()
         self.position_update_id = None
         self._playback_start_time = None
         self._playback_start_pos = 0.0
         self._slider_dragging = False
+        self._stream_lock = threading.Lock()
+        
+        # EQ state
+        self.eq_low = 1.0
+        self.eq_mid = 1.0
+        self.eq_high = 1.0
+        self._eq_filters_initialized = False
+        self._eq_low_filter = None
+        self._eq_mid_filter = None
+        self._eq_high_filter = None
+        self._eq_low_state = None
+        self._eq_mid_state = None
+        self._eq_high_state = None
         
         self._create_widgets()
         self._configure_bindings()
+        
+        # Add tempo scaling support
+        self._original_beat_timestamps = None  # Store original timestamps before scaling
+        self._original_audio_data = None  # Store original audio data before tempo processing
         
         if initial_filepath:
             self.master.after(100, lambda: self._load_audio_file(initial_filepath))
@@ -61,12 +86,33 @@ class PlaySongApp:
         info_frame.pack(fill=tk.X)
         self.bpm_label = tk.Label(info_frame, text="BPM: --", width=15, anchor="w")
         self.bpm_label.pack(side=tk.LEFT, padx=5)
+        
+        # BPM input field
+        bpm_input_frame = tk.Frame(info_frame)
+        bpm_input_frame.pack(side=tk.LEFT, padx=5)
+        tk.Label(bpm_input_frame, text="Set BPM:", font=("Arial", 10)).pack(side=tk.LEFT)
+        self.bpm_var = tk.StringVar(value="")
+        self.bpm_entry = tk.Entry(bpm_input_frame, textvariable=self.bpm_var, width=8, font=("Arial", 10))
+        self.bpm_entry.pack(side=tk.LEFT, padx=2)
+        self.set_bpm_button = tk.Button(bpm_input_frame, text="Set", command=self._set_bpm_from_input, 
+                                       font=("Arial", 10), state=tk.DISABLED)
+        self.set_bpm_button.pack(side=tk.LEFT, padx=2)
+        self.reset_bpm_button = tk.Button(bpm_input_frame, text="Reset", command=self._reset_to_original_bpm,
+                                         font=("Arial", 10), state=tk.DISABLED)
+        self.reset_bpm_button.pack(side=tk.LEFT, padx=2)
+        
         self.duration_label = tk.Label(info_frame, text="Duration: --", width=20, anchor="w")
         self.duration_label.pack(side=tk.LEFT, padx=5)
         self.position_label = tk.Label(info_frame, text="Position: 00:00", width=15, anchor="w")
         self.position_label.pack(side=tk.LEFT, padx=5)
         self.beat_label = tk.Label(info_frame, text="Beat: --", width=15, anchor="w")
         self.beat_label.pack(side=tk.LEFT, padx=5)
+        
+        # Status label for processing feedback
+        status_frame = tk.Frame(self.master, padx=10, pady=2)
+        status_frame.pack(fill=tk.X)
+        self.status_label = tk.Label(status_frame, text="", fg="blue", font=("Arial", 9))
+        self.status_label.pack()
         controls_frame = tk.Frame(self.master, pady=10)
         controls_frame.pack()
         self.play_pause_button = tk.Button(controls_frame, text="Play", width=10, 
@@ -80,6 +126,78 @@ class PlaySongApp:
             variable=self.seek_slider_var, state=tk.DISABLED, length=500
         )
         self.seek_slider.pack(fill=tk.X, expand=True)
+        
+        # EQ Controls
+        eq_frame = tk.Frame(self.master, pady=10)
+        eq_frame.pack(fill=tk.X, padx=10)
+        
+        eq_label = tk.Label(eq_frame, text="EQ Controls:", font=("Arial", 10, "bold"))
+        eq_label.pack(anchor=tk.W)
+        
+        eq_sliders_frame = tk.Frame(eq_frame)
+        eq_sliders_frame.pack(fill=tk.X, pady=5)
+        
+        # Low EQ
+        low_frame = tk.Frame(eq_sliders_frame)
+        low_frame.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        low_label = tk.Label(low_frame, text="Low", font=("Arial", 9))
+        low_label.pack()
+        self.eq_low_var = tk.DoubleVar(value=1.0)
+        self.eq_low_slider = ttk.Scale(
+            low_frame, from_=0.0, to=2.0, orient=tk.VERTICAL,
+            variable=self.eq_low_var, length=100,
+            command=self._on_eq_change
+        )
+        self.eq_low_slider.pack()
+        self.eq_low_value_label = tk.Label(low_frame, text="1.0", font=("Arial", 8))
+        self.eq_low_value_label.pack()
+        
+        # Mid EQ
+        mid_frame = tk.Frame(eq_sliders_frame)
+        mid_frame.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        mid_label = tk.Label(mid_frame, text="Mid", font=("Arial", 9))
+        mid_label.pack()
+        self.eq_mid_var = tk.DoubleVar(value=1.0)
+        self.eq_mid_slider = ttk.Scale(
+            mid_frame, from_=0.0, to=2.0, orient=tk.VERTICAL,
+            variable=self.eq_mid_var, length=100,
+            command=self._on_eq_change
+        )
+        self.eq_mid_slider.pack()
+        self.eq_mid_value_label = tk.Label(mid_frame, text="1.0", font=("Arial", 8))
+        self.eq_mid_value_label.pack()
+        
+        # High EQ
+        high_frame = tk.Frame(eq_sliders_frame)
+        high_frame.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        high_label = tk.Label(high_frame, text="High", font=("Arial", 9))
+        high_label.pack()
+        self.eq_high_var = tk.DoubleVar(value=1.0)
+        self.eq_high_slider = ttk.Scale(
+            high_frame, from_=0.0, to=2.0, orient=tk.VERTICAL,
+            variable=self.eq_high_var, length=100,
+            command=self._on_eq_change
+        )
+        self.eq_high_slider.pack()
+        self.eq_high_value_label = tk.Label(high_frame, text="1.0", font=("Arial", 8))
+        self.eq_high_value_label.pack()
+        
+        # EQ Preset buttons
+        preset_frame = tk.Frame(eq_frame)
+        preset_frame.pack(pady=5)
+        
+        reset_eq_button = tk.Button(preset_frame, text="Reset EQ", command=self._reset_eq)
+        reset_eq_button.pack(side=tk.LEFT, padx=5)
+        
+        drop_vocals_button = tk.Button(preset_frame, text="Drop Vocals", command=self._drop_vocals_preset)
+        drop_vocals_button.pack(side=tk.LEFT, padx=5)
+        
+        boost_bass_button = tk.Button(preset_frame, text="Boost Bass", command=self._boost_bass_preset)
+        boost_bass_button.pack(side=tk.LEFT, padx=5)
+        
+        boost_treble_button = tk.Button(preset_frame, text="Boost Treble", command=self._boost_treble_preset)
+        boost_treble_button.pack(side=tk.LEFT, padx=5)
+        
         instructions_frame = tk.Frame(self.master, pady=10)
         instructions_frame.pack()
         instructions = tk.Label(instructions_frame, 
@@ -106,24 +224,74 @@ class PlaySongApp:
     
     def _load_audio_file(self, filepath):
         try:
+            self.current_filepath = filepath  # Store current filepath
             self.filepath_label.config(text=f"Loading: {os.path.basename(filepath)}...")
             self.master.update_idletasks()
             self.audio_segment = AudioSegment.from_file(filepath)
             self.sample_rate = self.audio_segment.frame_rate
             self.duration_seconds = len(self.audio_segment) / 1000.0
-            # Convert to mono numpy array for Essentia
-            samples = np.array(self.audio_segment.get_array_of_samples()).astype(np.float32)
+            
+            # Use same cache logic as main audio engine
+            # Add project root to path to import config and analyzer
+            import sys
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if project_root not in sys.path:
+                sys.path.append(project_root)
+            
+            try:
+                import config as app_config
+                from audio_engine.audio_analyzer import AudioAnalyzer
+                
+                # Use same analyzer as main engine
+                analyzer = AudioAnalyzer(
+                    cache_dir=app_config.CACHE_DIR,
+                    beats_cache_file_extension=app_config.BEATS_CACHE_FILE_EXTENSION,
+                    beat_tracker_algo_name=app_config.DEFAULT_BEAT_TRACKER_ALGORITHM,
+                    bpm_estimator_algo_name=app_config.DEFAULT_BPM_ESTIMATOR_ALGORITHM
+                )
+                
+                # Analyze track using same logic as main engine
+                analysis_data = analyzer.analyze_track(filepath)
+                if analysis_data:
+                    self.beat_timestamps = np.array(analysis_data.get('beat_timestamps', []))
+                    self.original_bpm = analysis_data.get('bpm', 0)
+                    self.bpm = self.original_bpm
+                    logger.info(f"Beat Viewer - Loaded cached beat data: {len(self.beat_timestamps)} beats, BPM: {self.original_bpm:.1f}")
+                else:
+                    logger.warning(f"Beat Viewer - Failed to analyze track with main engine analyzer")
+                    self._generate_beat_timestamps()
+                    
+            except ImportError as e:
+                logger.warning(f"Beat Viewer - Could not import main engine components: {e}")
+                # Fall back to real-time beat detection
+                self._generate_beat_timestamps()
+            
+            # Prepare audio data for sounddevice streaming
+            self.audio_data = np.array(self.audio_segment.get_array_of_samples()).astype(np.float32)
             if self.audio_segment.channels > 1:
-                samples = samples.reshape((-1, self.audio_segment.channels)).mean(axis=1)
-            samples /= np.iinfo(self.audio_segment.array_type).max
-            beat_tracker = es.BeatTrackerDegara()
-            self.beat_timestamps = beat_tracker(samples)
-            self.bpm = len(self.beat_timestamps) / (self.duration_seconds / 60.0) if self.duration_seconds > 0 else 0
+                self.audio_data = self.audio_data.reshape((-1, self.audio_segment.channels))
+            # Normalize to float32 range (-1.0 to 1.0)
+            if self.audio_segment.sample_width == 2:  # 16-bit
+                self.audio_data /= 32767.0
+            elif self.audio_segment.sample_width == 4:  # 32-bit
+                self.audio_data /= 2147483647.0
+            
+            # Store original audio data for tempo processing
+            self._original_audio_data = self.audio_data.copy()
+            
+            self.total_frames = len(self.audio_data)
+            self.current_frame = 0
             self.current_position = 0.0
             self.is_playing = False
             self.file_loaded = True
             self._playback_start_time = None
             self._playback_start_pos = 0.0
+            
+            # Store original beat timestamps for tempo scaling
+            self._original_beat_timestamps = self.beat_timestamps.copy()
+            
+            # Initialize EQ filters for this track
+            self._initialize_eq_filters()
             self.filepath_label.config(text=f"File: {os.path.basename(filepath)}")
             self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
             self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
@@ -132,6 +300,9 @@ class PlaySongApp:
             self.play_pause_button.config(state=tk.NORMAL)
             self.seek_slider.config(state=tk.NORMAL, to=self.duration_seconds)
             self.seek_slider_var.set(0)
+            self.set_bpm_button.config(state=tk.NORMAL)  # Enable BPM input
+            self.reset_bpm_button.config(state=tk.NORMAL)  # Enable reset button
+            self.bpm_var.set(f"{self.bpm:.1f}")  # Set current BPM in input field
             logger.info(f"Loaded {filepath}: BPM={self.bpm:.1f}, Duration={self.duration_seconds:.2f}s")
         except Exception as e:
             error_msg = f"Error loading file: {str(e)[:100]}"
@@ -148,43 +319,217 @@ class PlaySongApp:
             self._start_playback()
     
     def _start_playback(self):
-        if not self.file_loaded:
+        """Start audio playback with real-time EQ"""
+        if not self.file_loaded or self.is_playing:
             return
+        
         self.is_playing = True
         self.play_pause_button.config(text="Pause")
         self.stop_playback.clear()
         self._playback_start_time = time.time()
         self._playback_start_pos = self.current_position
-        self.playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
-        self.playback_thread.start()
+        
+        # Calculate start frame
+        start_frame = int(self.current_position * self.sample_rate)
+        self.current_frame = start_frame
+        
+        # Start sounddevice stream
+        self.stream = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=self.audio_segment.channels,
+            callback=self._audio_callback,
+            blocksize=256
+        )
+        self.stream.start()
+        
+        # Start position updates
         self._schedule_position_update()
     
     def _pause_playback(self):
+        """Pause audio playback"""
+        if not self.is_playing:
+            return
+        
         self.is_playing = False
         self.play_pause_button.config(text="Play")
         self.stop_playback.set()
-        if self.play_obj:
-            self.play_obj.stop()
+        
+        # Stop the stream
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        
+        # Cancel position updates
         if self.position_update_id:
             self.master.after_cancel(self.position_update_id)
             self.position_update_id = None
     
-    def _playback_loop(self):
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """SoundDevice callback for real-time audio streaming with EQ"""
         try:
-            # Calculate start and end in ms
-            start_ms = int(self.current_position * 1000)
-            segment = self.audio_segment[start_ms:]
-            # Convert to raw audio for simpleaudio
-            raw_data = segment.raw_data
-            num_channels = segment.channels
-            bytes_per_sample = segment.sample_width
-            sample_rate = segment.frame_rate
-            self.play_obj = sa.play_buffer(raw_data, num_channels, bytes_per_sample, sample_rate)
-            # Wait for playback to finish or be stopped
-            while self.play_obj.is_playing() and not self.stop_playback.is_set():
-                time.sleep(0.1)
+            with self._stream_lock:
+                if not self.is_playing or self.audio_data is None:
+                    outdata[:] = 0
+                    return
+                
+                # Check if we have enough audio data
+                if self.current_frame + frames > len(self.audio_data):
+                    # End of audio reached
+                    outdata[:] = 0
+                    self.is_playing = False
+                    return
+                
+                # Get audio chunk
+                audio_chunk = self.audio_data[self.current_frame:self.current_frame + frames].copy()
+                
+                # Apply real-time EQ
+                if self.eq_low != 1.0 or self.eq_mid != 1.0 or self.eq_high != 1.0:
+                    audio_chunk = self._apply_eq_to_chunk(audio_chunk)
+                
+                # Ensure correct shape for output
+                if audio_chunk.ndim == 1:
+                    audio_chunk = audio_chunk.reshape(-1, 1)
+                
+                # Copy to output
+                outdata[:] = audio_chunk
+                
+                # Update frame position
+                self.current_frame += frames
+                self.current_position = self.current_frame / self.sample_rate
+                
         except Exception as e:
-            logger.error(f"Playback error: {e}")
+            logger.error(f"Audio callback error: {e}")
+            outdata[:] = 0
+    
+    def _apply_eq_to_chunk(self, chunk):
+        """Apply real-time EQ using SciPy IIR filters (same as main engine)"""
+        if self.eq_low == 1.0 and self.eq_mid == 1.0 and self.eq_high == 1.0:
+            return chunk  # No EQ applied
+        
+        # Initialize filters if not already done
+        if not hasattr(self, '_eq_filters_initialized'):
+            self._initialize_eq_filters()
+        
+        try:
+            from scipy import signal
+            
+            # Ensure audio_chunk is 1D for processing
+            if chunk.ndim == 2:
+                audio_1d = chunk[:, 0]  # Take first channel
+            else:
+                audio_1d = chunk
+            
+            # Add safety checks for audio data
+            if len(audio_1d) == 0:
+                return chunk
+            
+            # Check for NaN or inf values
+            if np.any(np.isnan(audio_1d)) or np.any(np.isinf(audio_1d)):
+                return chunk
+            
+            if (hasattr(self, '_eq_low_filter') and self._eq_low_filter is not None and 
+                hasattr(self, '_eq_mid_filter') and self._eq_mid_filter is not None and 
+                hasattr(self, '_eq_high_filter') and self._eq_high_filter is not None):
+                
+                # Apply each EQ band with persistent state (same as main engine)
+                try:
+                    low_band, self._eq_low_state = signal.lfilter(
+                        self._eq_low_filter[0], self._eq_low_filter[1], audio_1d, zi=self._eq_low_state)
+                except Exception as e:
+                    low_band = audio_1d.copy() * 0.5  # Fallback
+                    self._eq_low_state = None
+                
+                try:
+                    mid_band, self._eq_mid_state = signal.lfilter(
+                        self._eq_mid_filter[0], self._eq_mid_filter[1], audio_1d, zi=self._eq_mid_state)
+                except Exception as e:
+                    mid_band = audio_1d.copy() * 0.5  # Fallback
+                    self._eq_mid_state = None
+                
+                try:
+                    high_band, self._eq_high_state = signal.lfilter(
+                        self._eq_high_filter[0], self._eq_high_filter[1], audio_1d, zi=self._eq_high_state)
+                except Exception as e:
+                    high_band = audio_1d.copy() * 0.5  # Fallback
+                    self._eq_high_state = None
+
+                # Use direct EQ values - no smoothing (same as main engine)
+                low_val = self.eq_low
+                mid_val = self.eq_mid
+                high_val = self.eq_high
+
+                # DJ-style EQ mixing - direct band mixing (same as main engine)
+                # Each band is mixed with its gain value
+                # When gain is 0, that band contributes nothing
+                eq_audio_1d = (low_band * low_val) + (mid_band * mid_val) + (high_band * high_val)
+                
+            else:
+                # Fallback to simple EQ if filters not available
+                eq_audio_1d = audio_1d * ((self.eq_low + self.eq_mid + self.eq_high) / 3.0)
+            
+            # Check for NaN/inf in output
+            if np.any(np.isnan(eq_audio_1d)) or np.any(np.isinf(eq_audio_1d)):
+                return chunk
+            
+            # Reshape back to original format
+            if chunk.ndim == 2:
+                eq_audio = eq_audio_1d.reshape(-1, 1)
+            else:
+                eq_audio = eq_audio_1d
+            
+            # Clip to prevent distortion
+            eq_audio = np.clip(eq_audio, -1.0, 1.0)
+            
+            return eq_audio
+            
+        except Exception as e:
+            # Fallback to simple gain if anything fails
+            return chunk * ((self.eq_low + self.eq_mid + self.eq_high) / 3.0)
+    
+    def _initialize_eq_filters(self):
+        """Initialize EQ filters using SciPy (same as main engine)"""
+        if self._eq_filters_initialized or self.sample_rate == 0:
+            return
+        
+        try:
+            from scipy import signal
+            
+            # True DJ-style shelving filters (same as main engine)
+            low_shelf_freq = 120.0   # Hz - low shelf frequency
+            high_shelf_freq = 6000.0 # Hz - high shelf frequency
+            mid_low_freq = 400.0     # Hz - mid band low frequency
+            mid_high_freq = 2500.0   # Hz - mid band high frequency
+            
+            nyquist = self.sample_rate / 2.0
+            
+            # True DJ-style EQ filters (same as main engine)
+            # Low: Low shelf filter (affects frequencies below cutoff)
+            # Mid: Peak/Bell filter (affects frequencies around center)
+            # High: High shelf filter (affects frequencies above cutoff)
+            
+            # Low band: frequencies below 120Hz
+            self._eq_low_filter = signal.butter(2, low_shelf_freq/nyquist, btype='low')
+            
+            # Mid band: frequencies between 120-6000Hz
+            self._eq_mid_filter = signal.butter(2, [low_shelf_freq/nyquist, high_shelf_freq/nyquist], btype='band')
+            
+            # High band: frequencies above 6000Hz
+            self._eq_high_filter = signal.butter(2, high_shelf_freq/nyquist, btype='high')
+
+            # Initialize persistent filter state for each band (same as main engine)
+            if self._eq_low_filter is not None:
+                self._eq_low_state = signal.lfilter_zi(self._eq_low_filter[0], self._eq_low_filter[1])
+            if self._eq_mid_filter is not None:
+                self._eq_mid_state = signal.lfilter_zi(self._eq_mid_filter[0], self._eq_mid_filter[1])
+            if self._eq_high_filter is not None:
+                self._eq_high_state = signal.lfilter_zi(self._eq_high_filter[0], self._eq_high_filter[1])
+            
+            self._eq_filters_initialized = True
+            
+        except Exception as e:
+            # Fallback if SciPy not available
+            self._eq_filters_initialized = True
     
     def _schedule_position_update(self):
         if self.is_playing and self.file_loaded:
@@ -194,8 +539,7 @@ class PlaySongApp:
     def _update_position(self):
         if not self.is_playing:
             return
-        elapsed = time.time() - self._playback_start_time if self._playback_start_time else 0
-        self.current_position = min(self._playback_start_pos + elapsed, self.duration_seconds)
+        # Position is updated in the audio callback, just update display
         self._update_position_display()
     
     def _update_position_display(self):
@@ -205,10 +549,16 @@ class PlaySongApp:
         self.position_label.config(text=f"Position: {position_str}")
         if not getattr(self, '_slider_dragging', False):
             self.seek_slider_var.set(self.current_position)
-        # Calculate current beat number
+        # Calculate current beat number (same logic as main engine)
         if self.beat_timestamps.size > 0:
+            # Find which beat we're currently on/after
             current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='right'))
-            self.beat_label.config(text=f"Beat: {current_beat_idx + 1}")
+            # Beat numbers start at 1, not 0, for DJ use
+            beat_number = current_beat_idx + 1
+            # Ensure we don't exceed the total number of beats
+            max_beat = len(self.beat_timestamps) + 1
+            beat_number = min(beat_number, max_beat)
+            self.beat_label.config(text=f"Beat: {beat_number}")
         else:
             self.beat_label.config(text="Beat: --")
     
@@ -244,6 +594,7 @@ class PlaySongApp:
             return
         position_seconds = max(0, min(position_seconds, self.duration_seconds))
         self.current_position = float(position_seconds)
+        self.current_frame = int(self.current_position * self.sample_rate)
         was_playing = self.is_playing
         self._pause_playback()
         if was_playing:
@@ -252,22 +603,413 @@ class PlaySongApp:
         logger.info(f"Seeked to {position_seconds:.2f}s")
     
     def _seek_forward_beat(self, event):
+        """Seek to the next beat position"""
         if not self.file_loaded or not self.beat_timestamps.size:
             return
+        
+        # Find the next beat after current position
         current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='right'))
         if current_beat_idx < len(self.beat_timestamps):
             next_beat_time = self.beat_timestamps[current_beat_idx]
             self._seek_to_position(next_beat_time)
+            logger.debug(f"Beat Viewer - Seeked forward to beat {current_beat_idx + 2}")
     
     def _seek_backward_beat(self, event):
+        """Seek to the previous beat position"""
         if not self.file_loaded or not self.beat_timestamps.size:
             return
+        
+        # Find the previous beat before current position
         current_beat_idx = int(np.searchsorted(self.beat_timestamps, self.current_position, side='left'))
         if current_beat_idx > 0:
             prev_beat_time = self.beat_timestamps[current_beat_idx - 1]
             self._seek_to_position(prev_beat_time)
+            logger.debug(f"Beat Viewer - Seeked backward to beat {current_beat_idx}")
+        elif current_beat_idx == 0 and self.current_position > 0:
+            # If we're at the first beat, go to the beginning
+            self._seek_to_position(0.0)
+            logger.debug(f"Beat Viewer - Seeked to beginning")
+    
+    def _on_eq_change(self, value):
+        """Handle EQ slider changes in real-time"""
+        # Update EQ values immediately
+        self.eq_low = self.eq_low_var.get()
+        self.eq_mid = self.eq_mid_var.get()
+        self.eq_high = self.eq_high_var.get()
+        
+        # Update value labels immediately
+        self.eq_low_value_label.config(text=f"{self.eq_low:.1f}")
+        self.eq_mid_value_label.config(text=f"{self.eq_mid:.1f}")
+        self.eq_high_value_label.config(text=f"{self.eq_high:.1f}")
+        
+        # No playback restart needed - EQ is applied in real-time
+    
+    def _reset_eq(self):
+        """Reset EQ to neutral values"""
+        self.eq_low_var.set(1.0)
+        self.eq_mid_var.set(1.0)
+        self.eq_high_var.set(1.0)
+        self._on_eq_change(None)  # Apply immediately for reset
+    
+    def _scale_beat_timestamps(self, tempo_ratio):
+        """Scale beat timestamps to match tempo changes (same logic as main engine)"""
+        if self._original_beat_timestamps is None:
+            return
+        
+        logger.debug(f"Beat Viewer - Scaling beat timestamps by tempo ratio {tempo_ratio:.3f}")
+        # CRITICAL: When tempo increases, timestamps should DECREASE (audio plays faster)
+        # This keeps beat numbers pointing to the same musical locations
+        self.beat_timestamps = self._original_beat_timestamps / tempo_ratio
+        logger.debug(f"Beat Viewer - Scaled {len(self.beat_timestamps)} beat timestamps")
+    
+    def _jit_process_tempo(self, target_bpm, tempo_ratio):
+        """Just-in-time tempo processing using PyRubberBand"""
+        try:
+            import pyrubberband as pyrb
+            
+            if self._original_audio_data is None:
+                logger.error(f"Beat Viewer - No original audio data available for JIT processing")
+                return False
+            
+            # Disable controls during processing
+            self._disable_controls_for_processing()
+            self.master.update()  # Force UI update to show disabled state
+            
+            logger.info(f"Beat Viewer - Starting JIT tempo processing to {target_bpm} BPM (ratio: {tempo_ratio:.3f})...")
+            
+            # Use stored original audio data (convert to mono for PyRubberBand)
+            original_audio = self._original_audio_data.copy()
+            if original_audio.ndim > 1:
+                # Convert to mono for processing
+                original_audio = original_audio.mean(axis=1)
+            
+            # Ensure proper range (should already be normalized)
+            
+            # Process with PyRubberBand
+            processed_audio = pyrb.time_stretch(original_audio, int(self.sample_rate), tempo_ratio)
+            
+            # Convert back to stereo if needed
+            if self._original_audio_data.ndim > 1:
+                processed_audio = np.column_stack([processed_audio, processed_audio])
+            
+            # Update audio state
+            was_playing = self.is_playing
+            self._pause_playback()
+            
+            self.audio_data = processed_audio.astype(np.float32)
+            self.total_frames = len(self.audio_data)
+            self.duration_seconds = self.total_frames / self.sample_rate
+            
+            # Scale beat timestamps to match new audio length
+            self._scale_beat_timestamps(tempo_ratio)
+            
+            # Update BPM display
+            self.bpm = target_bpm
+            self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+            
+            # Update duration display
+            self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
+            self.seek_slider.config(to=self.duration_seconds)
+            
+            if was_playing:
+                self._start_playback()
+            
+            # Show success status briefly before clearing
+            self.status_label.config(text="✅ Tempo change complete!", fg="green")
+            self.master.update()
+            
+            # Re-enable controls after a brief delay
+            self.master.after(1500, self._enable_controls_after_processing)
+            
+            logger.info(f"Beat Viewer - JIT tempo processing completed successfully")
+            return True
+            
+        except ImportError:
+            logger.error(f"Beat Viewer - PyRubberBand not available for JIT tempo processing")
+            self._enable_controls_after_processing()
+            return False
+        except Exception as e:
+            logger.error(f"Beat Viewer - JIT tempo processing failed: {e}")
+            self._enable_controls_after_processing()
+            return False
+    
+    def set_tempo(self, target_bpm):
+        """Set playback tempo using cached processed audio (same as main engine)"""
+        if self.original_bpm <= 0:
+            logger.warning(f"Beat Viewer - Cannot set tempo: original BPM is {self.original_bpm}")
+            return
+        
+        tempo_ratio = target_bpm / self.original_bpm
+        
+        # Try to load cached tempo-processed audio first
+        try:
+            import config as app_config
+            import sys
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if project_root not in sys.path:
+                sys.path.append(project_root)
+            
+            # Get cached tempo audio filepath
+            cache_filepath = app_config.get_tempo_cache_filepath(self.current_filepath, target_bpm)
+            
+            if cache_filepath and os.path.exists(cache_filepath):
+                # Load cached tempo-processed audio
+                logger.info(f"Beat Viewer - Loading cached tempo {target_bpm} BPM audio")
+                processed_audio = np.load(cache_filepath)
+                
+                # Replace current audio data with tempo-processed version
+                was_playing = self.is_playing
+                self._pause_playback()
+                
+                self.audio_data = processed_audio.astype(np.float32)
+                if self.audio_data.ndim == 1 and self.audio_segment.channels > 1:
+                    # Convert mono to stereo if needed
+                    self.audio_data = np.column_stack([self.audio_data, self.audio_data])
+                
+                self.total_frames = len(self.audio_data)
+                self.duration_seconds = self.total_frames / self.sample_rate
+                
+                # Scale beat timestamps to match new audio length
+                self._scale_beat_timestamps(tempo_ratio)
+                
+                # Update BPM display
+                self.bpm = target_bpm
+                self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+                
+                # Update duration display
+                self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
+                self.seek_slider.config(to=self.duration_seconds)
+                
+                if was_playing:
+                    self._start_playback()
+                
+                logger.info(f"Beat Viewer - Successfully loaded cached tempo {target_bpm} BPM")
+                
+            else:
+                # No cached audio available - try JIT processing
+                logger.info(f"Beat Viewer - No cached tempo {target_bpm} BPM found, attempting JIT processing...")
+                success = self._jit_process_tempo(target_bpm, tempo_ratio)
+                
+                if not success:
+                    logger.warning(f"Beat Viewer - JIT processing failed, only scaling beat timestamps")
+                    # Still scale beat timestamps for beat navigation
+                    self._scale_beat_timestamps(tempo_ratio)
+                
+        except ImportError:
+            logger.warning(f"Beat Viewer - Cannot import config, only scaling beat timestamps")
+            self._scale_beat_timestamps(tempo_ratio)
+        
+        # Update current tempo
+        self.bpm = target_bpm
+        self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+        logger.info(f"Beat Viewer - Tempo changed to {target_bpm:.1f} BPM (ratio: {tempo_ratio:.3f})")
+    
+    def _set_bpm_from_input(self):
+        """Set BPM from the input field"""
+        try:
+            new_bpm = float(self.bpm_var.get())
+            if new_bpm > 0:
+                self.set_tempo(new_bpm)
+                logger.info(f"Beat Viewer - BPM set to {new_bpm:.1f} from input")
+            else:
+                logger.warning(f"Beat Viewer - Invalid BPM value: {new_bpm}")
+        except ValueError:
+            logger.warning(f"Beat Viewer - Invalid BPM input: {self.bpm_var.get()}")
+    
+    def _reset_to_original_bpm(self):
+        """Reset to original BPM and audio"""
+        if self.original_bpm <= 0 or self._original_audio_data is None:
+            logger.warning(f"Beat Viewer - Cannot reset: no original data available")
+            return
+        
+        logger.info(f"Beat Viewer - Resetting to original BPM {self.original_bpm:.1f}")
+        
+        # Restore original audio data
+        was_playing = self.is_playing
+        self._pause_playback()
+        
+        self.audio_data = self._original_audio_data.copy()
+        self.total_frames = len(self.audio_data)
+        self.duration_seconds = self.total_frames / self.sample_rate
+        
+        # Restore original beat timestamps
+        if self._original_beat_timestamps is not None:
+            self.beat_timestamps = self._original_beat_timestamps.copy()
+        
+        # Update BPM display
+        self.bpm = self.original_bpm
+        self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+        self.bpm_var.set("")  # Clear input field
+        
+        # Update duration display
+        self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
+        self.seek_slider.config(to=self.duration_seconds)
+        
+        if was_playing:
+            self._start_playback()
+        
+        logger.info(f"Beat Viewer - Reset to original BPM complete")
+    
+    def _disable_controls_for_processing(self):
+        """Disable UI controls during processing"""
+        self.play_pause_button.config(state=tk.DISABLED)
+        self.set_bpm_button.config(state=tk.DISABLED)
+        self.reset_bpm_button.config(state=tk.DISABLED)
+        self.seek_slider.config(state=tk.DISABLED)
+        self.load_button.config(state=tk.DISABLED)
+        self.status_label.config(text="🔄 Processing tempo change...", fg="blue")
+    
+    def _enable_controls_after_processing(self):
+        """Re-enable UI controls after processing"""
+        if self.file_loaded:
+            self.play_pause_button.config(state=tk.NORMAL)
+            self.set_bpm_button.config(state=tk.NORMAL)
+            self.reset_bpm_button.config(state=tk.NORMAL)
+            self.seek_slider.config(state=tk.NORMAL)
+        self.load_button.config(state=tk.NORMAL)
+        self.status_label.config(text="", fg="blue")  # Clear status
+    
+    def _generate_beat_timestamps(self):
+        """Generate beat timestamps using Essentia (fallback method)"""
+        # Convert to mono numpy array for Essentia (for BPM detection)
+        samples = np.array(self.audio_segment.get_array_of_samples()).astype(np.float32)
+        if self.audio_segment.channels > 1:
+            samples = samples.reshape((-1, self.audio_segment.channels)).mean(axis=1)
+        samples /= np.iinfo(self.audio_segment.array_type).max
+        beat_tracker = es.BeatTrackerDegara()
+        self.beat_timestamps = beat_tracker(samples)
+        self.original_bpm = len(self.beat_timestamps) / (self.duration_seconds / 60.0) if self.duration_seconds > 0 else 0
+        self.bpm = self.original_bpm  # Current BPM (can be changed by tempo scaling)
+        logger.info(f"Beat Viewer - Generated beat timestamps: {len(self.beat_timestamps)} beats, BPM: {self.original_bpm:.1f}")
+    
+    def _apply_eq_to_audio(self, audio_segment):
+        """Apply EQ to an audio segment"""
+        if self.eq_low == 1.0 and self.eq_mid == 1.0 and self.eq_high == 1.0:
+            return audio_segment  # No EQ applied
+        
+        # Convert to numpy array for processing
+        samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32)
+        if audio_segment.channels > 1:
+            samples = samples.reshape((-1, audio_segment.channels))
+        
+        # Apply simple EQ using frequency domain processing
+        # This is a simplified EQ - for more sophisticated EQ, you'd use proper filters
+        sample_rate = audio_segment.frame_rate
+        
+        # Apply EQ by scaling different frequency ranges
+        # Low frequencies (0-250 Hz)
+        if self.eq_low != 1.0:
+            # Simple low-pass filter effect
+            low_gain = self.eq_low
+            if audio_segment.channels == 1:
+                samples = samples * low_gain
+            else:
+                samples = samples * low_gain
+        
+        # Mid frequencies (250-4000 Hz) - apply to all samples for simplicity
+        if self.eq_mid != 1.0:
+            mid_gain = self.eq_mid
+            if audio_segment.channels == 1:
+                samples = samples * mid_gain
+            else:
+                samples = samples * mid_gain
+        
+        # High frequencies (4000+ Hz) - apply to all samples for simplicity
+        if self.eq_high != 1.0:
+            high_gain = self.eq_high
+            if audio_segment.channels == 1:
+                samples = samples * high_gain
+            else:
+                samples = samples * high_gain
+        
+        # Convert back to audio segment
+        if audio_segment.channels == 1:
+            samples = samples.flatten()
+        
+        # Ensure samples are in the correct range
+        samples = np.clip(samples, -1.0, 1.0)
+        
+        # Convert back to the original format
+        if audio_segment.sample_width == 2:  # 16-bit
+            samples = (samples * 32767).astype(np.int16)
+        elif audio_segment.sample_width == 4:  # 32-bit
+            samples = (samples * 2147483647).astype(np.int32)
+        
+        # Create new audio segment
+        from pydub import AudioSegment
+        eq_audio = AudioSegment(
+            samples.tobytes(),
+            frame_rate=sample_rate,
+            sample_width=audio_segment.sample_width,
+            channels=audio_segment.channels
+        )
+        
+        return eq_audio
+    
+    def _apply_eq_to_raw_audio(self, raw_data, num_channels, bytes_per_sample, sample_rate):
+        """Apply real-time EQ to raw audio data"""
+        if self.eq_low == 1.0 and self.eq_mid == 1.0 and self.eq_high == 1.0:
+            return raw_data  # No EQ applied
+        
+        # Convert raw bytes to numpy array
+        if bytes_per_sample == 2:  # 16-bit
+            samples = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32767.0
+        elif bytes_per_sample == 4:  # 32-bit
+            samples = np.frombuffer(raw_data, dtype=np.int32).astype(np.float32) / 2147483647.0
+        else:
+            return raw_data  # Unsupported format
+        
+        # Reshape for multi-channel
+        if num_channels > 1:
+            samples = samples.reshape((-1, num_channels))
+        
+        # Apply simple EQ (this is a simplified version - for better EQ use proper filters)
+        # For now, we'll apply the EQ as a simple gain to the entire signal
+        # In a real implementation, you'd use FFT and apply different gains to frequency bands
+        
+        # Calculate overall EQ gain (average of the three bands)
+        overall_gain = (self.eq_low + self.eq_mid + self.eq_high) / 3.0
+        
+        # Apply gain
+        if num_channels == 1:
+            samples = samples * overall_gain
+        else:
+            samples = samples * overall_gain
+        
+        # Clip to prevent distortion
+        samples = np.clip(samples, -1.0, 1.0)
+        
+        # Convert back to raw bytes
+        if bytes_per_sample == 2:  # 16-bit
+            samples = (samples * 32767).astype(np.int16)
+        elif bytes_per_sample == 4:  # 32-bit
+            samples = (samples * 2147483647).astype(np.int32)
+        
+        return samples.tobytes()
+    
+    def _drop_vocals_preset(self):
+        """Apply vocal-dropping EQ preset"""
+        self.eq_low_var.set(0.2)   # Reduce bass more dramatically
+        self.eq_mid_var.set(0.5)   # Cut mid frequencies (vocals are often in mid range)
+        self.eq_high_var.set(0.1)  # Cut high frequencies (vocals)
+        self._on_eq_change(None)  # Apply immediately for presets
+    
+    def _boost_bass_preset(self):
+        """Apply bass-boosting EQ preset"""
+        self.eq_low_var.set(2.5)   # Boost bass dramatically
+        self.eq_mid_var.set(1.2)   # Slight mid boost
+        self.eq_high_var.set(0.6)  # Reduce high frequencies
+        self._on_eq_change(None)  # Apply immediately for presets
+    
+    def _boost_treble_preset(self):
+        """Apply treble-boosting EQ preset"""
+        self.eq_low_var.set(0.4)   # Reduce bass more
+        self.eq_mid_var.set(0.8)   # Slight mid cut
+        self.eq_high_var.set(2.5)  # Boost high frequencies dramatically
+        self._on_eq_change(None)  # Apply immediately for presets
     
     def on_closing(self):
+        """Clean up resources when closing"""
         self._pause_playback()
         self.master.destroy()
 
