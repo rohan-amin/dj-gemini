@@ -380,9 +380,9 @@ class AudioEngine:
             if command == "load_track":
                 filepath = parameters.get("filepath")
                 if filepath and deck_id:
-                    # Convert relative paths to absolute
+                    # Convert relative paths to absolute (same logic as preprocessing)
                     if not os.path.isabs(filepath):
-                        filepath = os.path.join(self.app_config.AUDIO_TRACKS_DIR, filepath)
+                        filepath = os.path.join(self.app_config.PROJECT_ROOT_DIR, filepath)
                     
                     if deck_id not in required_transformations:
                         required_transformations[deck_id] = {
