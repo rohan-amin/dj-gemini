@@ -26,7 +26,7 @@ class PlaySongApp:
     def __init__(self, master_window, initial_filepath=None):
         self.master = master_window
         self.master.title("Beat Viewer - Audio Player with EQ")
-        self.master.geometry("900x650")  # Increased width to show all GUI elements
+        self.master.geometry("900x800")  # Increased height for tempo and stem controls
         
         # Audio state
         self.audio_segment = None
@@ -71,6 +71,12 @@ class PlaySongApp:
         # Add tempo scaling support
         self._original_beat_timestamps = None  # Store original timestamps before scaling
         self._original_audio_data = None  # Store original audio data before tempo processing
+        
+        # Stem separation support
+        self.stems_available = False
+        self.stems_data = {}  # Dict of stem_name -> np.array
+        self.stem_volumes = {'vocals': 1.0, 'drums': 1.0, 'bass': 1.0, 'other': 1.0}
+        self.stem_isolated = {'vocals': False, 'drums': False, 'bass': False, 'other': False}
         
         if initial_filepath:
             self.master.after(100, lambda: self._load_audio_file(initial_filepath))
@@ -198,6 +204,65 @@ class PlaySongApp:
         boost_treble_button = tk.Button(preset_frame, text="Boost Treble", command=self._boost_treble_preset)
         boost_treble_button.pack(side=tk.LEFT, padx=5)
         
+        # Real-time Tempo Control
+        tempo_frame = tk.Frame(self.master, pady=10)
+        tempo_frame.pack(fill=tk.X, padx=10)
+        
+        tempo_label = tk.Label(tempo_frame, text="Real-time Tempo Control:", font=("Arial", 10, "bold"))
+        tempo_label.pack(anchor=tk.W)
+        
+        tempo_slider_frame = tk.Frame(tempo_frame)
+        tempo_slider_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(tempo_slider_frame, text="Tempo:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self.tempo_var = tk.DoubleVar(value=120.0)
+        self.tempo_slider = ttk.Scale(
+            tempo_slider_frame, from_=60.0, to=180.0, orient=tk.HORIZONTAL,
+            variable=self.tempo_var, length=300,
+            command=self._on_tempo_change
+        )
+        self.tempo_slider.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        self.tempo_value_label = tk.Label(tempo_slider_frame, text="120.0 BPM", font=("Arial", 9))
+        self.tempo_value_label.pack(side=tk.LEFT, padx=5)
+        
+        tempo_buttons_frame = tk.Frame(tempo_frame)
+        tempo_buttons_frame.pack(pady=2)
+        
+        reset_tempo_button = tk.Button(tempo_buttons_frame, text="Reset Tempo", command=self._reset_tempo)
+        reset_tempo_button.pack(side=tk.LEFT, padx=5)
+        
+        # Stem Isolation Controls
+        stems_frame = tk.Frame(self.master, pady=10)
+        stems_frame.pack(fill=tk.X, padx=10)
+        
+        stems_label = tk.Label(stems_frame, text="Stem Isolation Controls:", font=("Arial", 10, "bold"))
+        stems_label.pack(anchor=tk.W)
+        
+        self.stems_status_label = tk.Label(stems_frame, text="Load a file to check for stems...", 
+                                          font=("Arial", 9), fg="gray")
+        self.stems_status_label.pack(anchor=tk.W, pady=2)
+        
+        stems_buttons_frame = tk.Frame(stems_frame)
+        stems_buttons_frame.pack(fill=tk.X, pady=5)
+        
+        # Create stem toggle buttons
+        self.stem_buttons = {}
+        stem_names = ['Vocals', 'Drums', 'Bass', 'Other']
+        stem_keys = ['vocals', 'drums', 'bass', 'other']
+        
+        for i, (name, key) in enumerate(zip(stem_names, stem_keys)):
+            btn = tk.Button(stems_buttons_frame, text=f"Solo {name}", 
+                           command=lambda k=key: self._toggle_stem_isolation(k),
+                           state=tk.DISABLED, width=12)
+            btn.pack(side=tk.LEFT, padx=5)
+            self.stem_buttons[key] = btn
+        
+        # Clear isolation button
+        self.clear_isolation_button = tk.Button(stems_buttons_frame, text="Clear Isolation", 
+                                               command=self._clear_stem_isolation,
+                                               state=tk.DISABLED, width=12)
+        self.clear_isolation_button.pack(side=tk.LEFT, padx=10)
+        
         instructions_frame = tk.Frame(self.master, pady=10)
         instructions_frame.pack()
         instructions = tk.Label(instructions_frame, 
@@ -289,6 +354,14 @@ class PlaySongApp:
             
             # Store original beat timestamps for tempo scaling
             self._original_beat_timestamps = self.beat_timestamps.copy()
+            
+            # Check for and load stems
+            self._load_stems_if_available(filepath)
+            
+            # Set tempo slider to original BPM
+            if hasattr(self, 'original_bpm'):
+                self.tempo_var.set(self.original_bpm)
+                self.tempo_value_label.config(text=f"{self.original_bpm:.1f} BPM")
             
             # Initialize EQ filters for this track
             self._initialize_eq_filters()
@@ -734,75 +807,13 @@ class PlaySongApp:
             return False
     
     def set_tempo(self, target_bpm):
-        """Set playback tempo using cached processed audio (same as main engine)"""
+        """Set playbook tempo using real-time processing only"""
         if self.original_bpm <= 0:
             logger.warning(f"Beat Viewer - Cannot set tempo: original BPM is {self.original_bpm}")
             return
         
-        tempo_ratio = target_bpm / self.original_bpm
-        
-        # Try to load cached tempo-processed audio first
-        try:
-            import config as app_config
-            import sys
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            if project_root not in sys.path:
-                sys.path.append(project_root)
-            
-            # Get cached tempo audio filepath
-            cache_filepath = app_config.get_tempo_cache_filepath(self.current_filepath, target_bpm)
-            
-            if cache_filepath and os.path.exists(cache_filepath):
-                # Load cached tempo-processed audio
-                logger.info(f"Beat Viewer - Loading cached tempo {target_bpm} BPM audio")
-                processed_audio = np.load(cache_filepath)
-                
-                # Replace current audio data with tempo-processed version
-                was_playing = self.is_playing
-                self._pause_playback()
-                
-                self.audio_data = processed_audio.astype(np.float32)
-                if self.audio_data.ndim == 1 and self.audio_segment.channels > 1:
-                    # Convert mono to stereo if needed
-                    self.audio_data = np.column_stack([self.audio_data, self.audio_data])
-                
-                self.total_frames = len(self.audio_data)
-                self.duration_seconds = self.total_frames / self.sample_rate
-                
-                # Scale beat timestamps to match new audio length
-                self._scale_beat_timestamps(tempo_ratio)
-                
-                # Update BPM display
-                self.bpm = target_bpm
-                self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
-                
-                # Update duration display
-                self.duration_label.config(text=f"Duration: {time.strftime('%M:%S', time.gmtime(self.duration_seconds))}")
-                self.seek_slider.config(to=self.duration_seconds)
-                
-                if was_playing:
-                    self._start_playback()
-                
-                logger.info(f"Beat Viewer - Successfully loaded cached tempo {target_bpm} BPM")
-                
-            else:
-                # No cached audio available - try JIT processing
-                logger.info(f"Beat Viewer - No cached tempo {target_bpm} BPM found, attempting JIT processing...")
-                success = self._jit_process_tempo(target_bpm, tempo_ratio)
-                
-                if not success:
-                    logger.warning(f"Beat Viewer - JIT processing failed, only scaling beat timestamps")
-                    # Still scale beat timestamps for beat navigation
-                    self._scale_beat_timestamps(tempo_ratio)
-                
-        except ImportError:
-            logger.warning(f"Beat Viewer - Cannot import config, only scaling beat timestamps")
-            self._scale_beat_timestamps(tempo_ratio)
-        
-        # Update current tempo
-        self.bpm = target_bpm
-        self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
-        logger.info(f"Beat Viewer - Tempo changed to {target_bpm:.1f} BPM (ratio: {tempo_ratio:.3f})")
+        # Always use real-time processing - no more cached tempo files!
+        self._apply_real_time_tempo(target_bpm)
     
     def _set_bpm_from_input(self):
         """Set BPM from the input field"""
@@ -1007,6 +1018,179 @@ class PlaySongApp:
         self.eq_mid_var.set(0.8)   # Slight mid cut
         self.eq_high_var.set(2.5)  # Boost high frequencies dramatically
         self._on_eq_change(None)  # Apply immediately for presets
+    
+    def _on_tempo_change(self, value):
+        """Handle real-time tempo slider changes"""
+        if not self.file_loaded:
+            return
+            
+        target_bpm = float(value)
+        self.tempo_value_label.config(text=f"{target_bpm:.1f} BPM")
+        
+        # Apply tempo change in real-time using PyRubberBand
+        self._apply_real_time_tempo(target_bpm)
+    
+    def _apply_real_time_tempo(self, target_bpm):
+        """Apply tempo change in real-time without caching"""
+        if not hasattr(self, 'original_bpm') or self.original_bpm <= 0:
+            return
+            
+        try:
+            import pyrubberband as pyrb
+            
+            tempo_ratio = target_bpm / self.original_bpm
+            
+            # Use original audio data for processing
+            if self._original_audio_data is not None:
+                logger.info(f"Real-time tempo processing: {target_bpm:.1f} BPM (ratio: {tempo_ratio:.3f})")
+                
+                # Process tempo in real-time
+                processed_audio = pyrb.time_stretch(self._original_audio_data, int(self.sample_rate), tempo_ratio)
+                
+                # Update current audio data
+                with self._stream_lock:
+                    self.audio_data = processed_audio.astype(np.float32)
+                    self.total_frames = len(self.audio_data)
+                
+                # Update beat timestamps
+                self._scale_beat_timestamps(tempo_ratio)
+                
+                # Update current BPM
+                self.bpm = target_bpm
+                self.bpm_label.config(text=f"BPM: {self.bpm:.1f}")
+                
+                logger.info(f"Real-time tempo applied successfully")
+                
+        except ImportError:
+            logger.error("PyRubberBand not available for real-time tempo processing")
+        except Exception as e:
+            logger.error(f"Real-time tempo processing failed: {e}")
+    
+    def _reset_tempo(self):
+        """Reset tempo to original BPM"""
+        if hasattr(self, 'original_bpm'):
+            self.tempo_var.set(self.original_bpm)
+            self._apply_real_time_tempo(self.original_bpm)
+    
+    def _toggle_stem_isolation(self, stem_key):
+        """Toggle isolation for specific stem"""
+        if not self.stems_available:
+            return
+            
+        # Toggle the isolation state
+        self.stem_isolated[stem_key] = not self.stem_isolated[stem_key]
+        
+        # Update button text and state
+        btn = self.stem_buttons[stem_key]
+        if self.stem_isolated[stem_key]:
+            btn.config(text=f"✓ {stem_key.title()}", relief=tk.SUNKEN)
+        else:
+            btn.config(text=f"Solo {stem_key.title()}", relief=tk.RAISED)
+        
+        # Apply stem isolation
+        self._apply_stem_isolation()
+    
+    def _clear_stem_isolation(self):
+        """Clear all stem isolation"""
+        if not self.stems_available:
+            return
+            
+        # Reset all isolation states
+        for stem_key in self.stem_isolated:
+            self.stem_isolated[stem_key] = False
+            
+        # Update all button states
+        for stem_key, btn in self.stem_buttons.items():
+            btn.config(text=f"Solo {stem_key.title()}", relief=tk.RAISED)
+        
+        # Apply changes
+        self._apply_stem_isolation()
+    
+    def _apply_stem_isolation(self):
+        """Apply current stem isolation settings to playback"""
+        if not self.stems_available:
+            return
+            
+        # Check if any stems are isolated
+        any_isolated = any(self.stem_isolated.values())
+        
+        if any_isolated:
+            # Mix only isolated stems
+            mixed_audio = np.zeros_like(self.stems_data['vocals'])
+            
+            for stem_key, is_isolated in self.stem_isolated.items():
+                if is_isolated and stem_key in self.stems_data:
+                    mixed_audio += self.stems_data[stem_key] * self.stem_volumes[stem_key]
+                    
+            logger.info(f"Isolated stems: {[k for k, v in self.stem_isolated.items() if v]}")
+        else:
+            # Mix all stems
+            mixed_audio = np.zeros_like(self.stems_data['vocals'])
+            for stem_key, stem_audio in self.stems_data.items():
+                mixed_audio += stem_audio * self.stem_volumes[stem_key]
+                
+            logger.info("Playing all stems")
+        
+        # Update audio data for playback
+        with self._stream_lock:
+            self.audio_data = mixed_audio.astype(np.float32)
+            self.total_frames = len(self.audio_data)
+    
+    def _load_stems_if_available(self, filepath):
+        """Check for and load stems if available"""
+        try:
+            import config as app_config
+            
+            # Get unified song cache directory
+            song_cache_dir = app_config.get_song_cache_dir(filepath)
+            stems_dir = os.path.join(song_cache_dir, "stems")
+            
+            # Check if stems exist
+            stem_files = {
+                'vocals': os.path.join(stems_dir, 'vocals.npy'),
+                'drums': os.path.join(stems_dir, 'drums.npy'),
+                'bass': os.path.join(stems_dir, 'bass.npy'),
+                'other': os.path.join(stems_dir, 'other.npy')
+            }
+            
+            stems_exist = all(os.path.exists(path) for path in stem_files.values())
+            
+            if stems_exist:
+                logger.info("Loading stems for real-time isolation...")
+                
+                # Load all stems
+                for stem_name, stem_path in stem_files.items():
+                    stem_audio = np.load(stem_path)
+                    self.stems_data[stem_name] = stem_audio.astype(np.float32)
+                
+                self.stems_available = True
+                self.stems_status_label.config(text="✓ Stems available (4 stems loaded)", fg="green")
+                
+                # Enable stem buttons
+                for btn in self.stem_buttons.values():
+                    btn.config(state=tk.NORMAL)
+                self.clear_isolation_button.config(state=tk.NORMAL)
+                
+                logger.info(f"Successfully loaded {len(self.stems_data)} stems")
+                
+            else:
+                self.stems_available = False
+                self.stems_status_label.config(text="No stems found - use preprocessing to generate stems", fg="orange")
+                
+                # Disable stem buttons
+                for btn in self.stem_buttons.values():
+                    btn.config(state=tk.DISABLED)
+                self.clear_isolation_button.config(state=tk.DISABLED)
+                
+        except Exception as e:
+            logger.error(f"Error loading stems: {e}")
+            self.stems_available = False
+            self.stems_status_label.config(text="Error loading stems", fg="red")
+            
+            # Disable stem buttons
+            for btn in self.stem_buttons.values():
+                btn.config(state=tk.DISABLED)
+            self.clear_isolation_button.config(state=tk.DISABLED)
     
     def on_closing(self):
         """Clean up resources when closing"""
