@@ -281,7 +281,7 @@ class FixedBeatViewer:
         self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
         self.stretch_read_pos = 0
         self.last_tempo_ratio = 1.0
-        self.process_chunk_size = 12288  # Larger chunks for smoother RubberBand processing
+        self.process_chunk_size = 8192  # Power of 2 for optimal audio processing alignment
         self.fade_size = 64  # Small fade at chunk boundaries
         self.max_buffer_size = 1048576  # 1MB max buffer to prevent memory issues
         self.buffer_trim_threshold = 786432  # Trim when buffer exceeds 768KB
@@ -1442,8 +1442,9 @@ class FixedBeatViewer:
             # Ensure we have enough processed audio available
             samples_available = len(self.stretch_processed_audio) - self.stretch_read_pos
             
-            # Keep at least 12288 samples buffered ahead for smoother playback
-            if samples_available < frames + 12288:
+            # Keep at least 2x chunk size buffered ahead for smoother playback
+            buffer_ahead = self.process_chunk_size * 2  # 16384 samples
+            if samples_available < frames + buffer_ahead:
                 self._process_more_audio()
                 samples_available = len(self.stretch_processed_audio) - self.stretch_read_pos
             
@@ -1502,21 +1503,52 @@ class FixedBeatViewer:
             # RubberBand ratio is inverse of tempo: higher tempo = lower ratio
             tempo_ratio = 1.0 / self.stretch_processor['tempo_ratio']
             
+            # For the first chunk, add silence padding to give RubberBand clean context
+            if len(self.stretch_processed_audio) == 0:
+                # Add small silence buffer at start for clean initialization
+                silence_padding = np.zeros(256, dtype=np.float32)
+                padded_chunk = np.concatenate([silence_padding, input_chunk])
+            else:
+                padded_chunk = input_chunk
+            
             stretched = rubberband.stretch(
-                input_chunk,
+                padded_chunk,
                 rate=self.sample_rate,
                 ratio=tempo_ratio,
-                crispness=1,  # Lower quality for testing - more stable
-                formants=False,  # Simpler processing
-                precise=False   # Faster processing
+                crispness=2,  # Lower crispness - faster, fewer artifacts
+                formants=False,  # Disable formant preservation to avoid EQ coloration  
+                precise=True   # More precise processing for better quality
             )
             
+            # If this was the first chunk with padding, remove the stretched silence
+            if len(self.stretch_processed_audio) == 0 and len(padded_chunk) > len(input_chunk):
+                # Remove the stretched silence padding from the beginning
+                # RubberBand ratio is time stretch, so stretched silence = 256 * ratio
+                silence_stretched_size = int(256 * (1.0 / tempo_ratio))  # Correct stretched silence length
+                silence_stretched_size = min(silence_stretched_size, len(stretched) // 2)  # Safety check
+                if len(stretched) > silence_stretched_size:
+                    stretched = stretched[silence_stretched_size:]
+            
             if len(stretched) > 0:
-                # Add small crossfade at start only to prevent discontinuities
-                # Tuned to eliminate pops without causing modulation
-                crossfade_size = 32  # Slightly larger for better continuity
-                if len(stretched) > crossfade_size and len(self.stretch_processed_audio) > 0:
-                    # Only fade-in the very beginning of new chunk
+                # Add true overlap-add crossfade to eliminate all discontinuities
+                crossfade_size = min(128, len(stretched) // 64)  # Slightly larger for smoother transitions
+                
+                if len(stretched) > crossfade_size and len(self.stretch_processed_audio) > crossfade_size:
+                    # True overlap-add: fade out end of existing buffer, fade in start of new chunk
+                    fade_out = np.linspace(1.0, 0.0, crossfade_size)
+                    fade_in = np.linspace(0.0, 1.0, crossfade_size)
+                    
+                    # Apply fade out to end of existing buffer
+                    self.stretch_processed_audio[-crossfade_size:] *= fade_out
+                    
+                    # Apply fade in to start of new chunk and add to existing buffer end
+                    stretched[:crossfade_size] *= fade_in
+                    self.stretch_processed_audio[-crossfade_size:] += stretched[:crossfade_size]
+                    
+                    # Remove the overlapped part from new chunk before appending
+                    stretched = stretched[crossfade_size:]
+                elif len(stretched) > crossfade_size and len(self.stretch_processed_audio) > 0:
+                    # Simple fade in if we can't do full overlap
                     fade_curve = np.linspace(0.0, 1.0, crossfade_size)
                     stretched[:crossfade_size] *= fade_curve
                 
