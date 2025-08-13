@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 import scipy.signal as sps
+from scipy.signal import iirpeak, sosfilt
 
 # Add project root to path
 PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -288,6 +289,9 @@ class ThreeBandEQ:
             # Normal mode
             self.low_filter.set_low_shelf(self.low_freq, low_db)
             self.low_filter2.reset()
+        
+        # Update vectorized coefficients when gains change
+        self._compute_vectorized_coefficients()
     
     def process_sample(self, x):
         """Process single sample through all EQ bands with cascaded filters"""
@@ -300,6 +304,47 @@ class ThreeBandEQ:
         
         y = self.high_filter.process_sample(y)
         y = self.high_filter2.process_sample(y)  # Second stage high
+        
+        return y
+    
+    def _compute_vectorized_coefficients(self):
+        """Compute vectorized filter coefficients for scipy lfilter"""
+        # For vectorized processing, we'll create a simplified single-stage 3-band EQ
+        # This trades some quality for massive performance gains in the producer
+        
+        # Get current gain values by examining filter states
+        # We'll approximate the complex cascaded filter with single biquads
+        
+        filters = []
+        
+        # High shelf (approximate)
+        if hasattr(self.high_filter, 'b0') and self.high_filter.b0 != 1.0:
+            b_high = np.array([self.high_filter.b0, self.high_filter.b1, self.high_filter.b2], dtype=np.float64)
+            a_high = np.array([1.0, self.high_filter.a1, self.high_filter.a2], dtype=np.float64)
+            filters.append((b_high, a_high))
+        
+        # Mid peaking (approximate) 
+        if hasattr(self.mid_filter, 'b0') and self.mid_filter.b0 != 1.0:
+            b_mid = np.array([self.mid_filter.b0, self.mid_filter.b1, self.mid_filter.b2], dtype=np.float64)
+            a_mid = np.array([1.0, self.mid_filter.a1, self.mid_filter.a2], dtype=np.float64)
+            filters.append((b_mid, a_mid))
+        
+        # Low shelf (approximate)
+        if hasattr(self.low_filter, 'b0') and self.low_filter.b0 != 1.0:
+            b_low = np.array([self.low_filter.b0, self.low_filter.b1, self.low_filter.b2], dtype=np.float64)
+            a_low = np.array([1.0, self.low_filter.a1, self.low_filter.a2], dtype=np.float64)
+            filters.append((b_low, a_low))
+        
+        self._vectorized_filters = filters
+    
+    def process_block_vectorized(self, x):
+        """Process block of samples using vectorized scipy lfilter - much faster than per-sample"""
+        if not hasattr(self, '_vectorized_filters'):
+            self._compute_vectorized_coefficients()
+        
+        y = x.copy()
+        for b, a in self._vectorized_filters:
+            y = sps.lfilter(b, a, y).astype(np.float32)
         
         return y
     
@@ -338,19 +383,25 @@ class FixedBeatViewer:
         # Thread-safe position tracking
         self._audio_position = 0.0  # Position updated by audio thread
         
+        # Audio device configuration (Issue #5: stereo for better device compatibility)
+        # Set to 1 for mono output, 2 for stereo (duplicated mono)
+        self.device_output_channels = 2  # Most devices prefer stereo
+        
         # Simple tempo control
         self.current_tempo_ratio = 1.0
         self.playback_position = 0.0  # Floating point position for smooth tempo
         self.last_audio_sample = 0.0  # For smoothing discontinuities
         
-        # Ring buffer architecture for thread-safe audio processing
-        self.out_ring = RingBuffer(capacity_frames=self.sample_rate * 4, channels=1)  # ~4s
+        # Ring buffer architecture for thread-safe audio processing  
+        self.out_ring = RingBuffer(capacity_frames=self.sample_rate * 4, channels=self.device_output_channels)  # ~4s
         self._producer_stop = False
         self._had_underflow = False
         self._producer_error = None
+        self._pending_out = None  # Buffer for partial ring writes
         
         # Pitch preservation with buffer management to eliminate periodic pops
         self.stretch_processor = None
+        # Start with empty buffer - will be allocated on first use with generous size
         self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
         self.stretch_buffer_used = 0  # Track how much of the buffer actually contains data
         self.stretch_read_pos = 0
@@ -770,7 +821,7 @@ class FixedBeatViewer:
         # Check for underflow flag (set in callback, handled here)
         if self._had_underflow:
             self._had_underflow = False
-            self._update_status("Audio underflow detected; increasing blocksize or producer rate may help", "orange")
+            self._update_status("Audio underflow detected — consider larger blocksize or less EQ/RB load", "orange")
         
         # Check for producer error flag
         if self._producer_error:
@@ -887,8 +938,7 @@ class FixedBeatViewer:
             self.rubberband_stretcher.set_phase_option(RubberBandOptionPhaseIndependent)
             self.rubberband_stretcher.set_detector_option(RubberBandOptionDetectorPercussive)
             
-            # Reset processing state
-            self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+            # Reset processing state - keep allocated buffer
             self.stretch_buffer_used = 0
             self.stretch_read_pos = 0
             self.stretch_input_pos = int(self.playback_position)  # Start from current playback position
@@ -921,8 +971,7 @@ class FixedBeatViewer:
                 'initialized': True
             }
             
-            # Reset processing state
-            self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+            # Reset processing state - keep allocated buffer
             self.stretch_buffer_used = 0
             self.stretch_read_pos = 0
             self.stretch_input_pos = int(self.playback_position)
@@ -1467,7 +1516,7 @@ class FixedBeatViewer:
             
             # Reset pitch preservation buffers if seeking during playback
             if self.is_playing and self.stretch_processor is not None:
-                self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+                # Keep allocated buffer, just reset positions
                 self.stretch_buffer_used = 0
                 self.stretch_read_pos = 0
                 self.stretch_input_pos = target_frame  # Reset input position to seek target
@@ -1499,10 +1548,24 @@ class FixedBeatViewer:
             self.is_playing = True
             self.play_pause_button.config(text="⏸ Pause")
             
-            # Initialize simple playback
+            # Initialize simple playback - use current slider position
+            # In case user moved slider during pause, get position from slider
+            if self.total_frames > 0:
+                slider_percent = self.seek_slider_var.get()
+                slider_frame = int((slider_percent / 100.0) * self.total_frames)
+                slider_frame = max(0, min(slider_frame, self.total_frames - 1))
+                self.current_frame = slider_frame
+            
             self.playback_position = float(self.current_frame)
             self._audio_position = self.playback_position
             self.last_audio_sample = 0.0
+            
+            # Reset pitch preservation buffers when starting from new position
+            if hasattr(self, 'stretch_processor') and self.stretch_processor is not None:
+                # Keep allocated buffer, just reset positions
+                self.stretch_buffer_used = 0
+                self.stretch_read_pos = 0
+                self.stretch_input_pos = self.current_frame
             
             # Initialize streaming pitch preservation if enabled
             if RUBBERBAND_AVAILABLE and self.preserve_pitch_var.get():
@@ -1518,12 +1581,19 @@ class FixedBeatViewer:
                 if n < frames:
                     # underrun: fill tail with zeros
                     out[n:] = 0.0
-                outdata[:frames, 0] = out[:, 0]
+                
+                if self.device_output_channels == 1:
+                    # Mono output
+                    outdata[:frames, 0] = out[:, 0]
+                else:
+                    # Stereo output - duplicate mono to both channels
+                    outdata[:frames, 0] = out[:, 0]  # Left
+                    outdata[:frames, 1] = out[:, 0]  # Right (same as left)
             
             # Start stream with optimized settings for low latency and reduced callback pressure
             self.stream = sd.OutputStream(
                 samplerate=self.sample_rate,   # OR device SR if you standardize (see Fix B)
-                channels=1,
+                channels=self.device_output_channels,  # Stereo for better device compatibility
                 dtype='float32',
                 latency='low',
                 blocksize=2048,  # 2048 or 4096 gives more headroom
@@ -1588,8 +1658,6 @@ class FixedBeatViewer:
                 return
                 
             # Safety check - ensure buffers exist
-            if not hasattr(self, 'stretch_processed_audio'):
-                self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
             if not hasattr(self, 'stretch_buffer_used'):
                 self.stretch_buffer_used = 0
             if not hasattr(self, 'stretch_read_pos'):
@@ -1725,25 +1793,13 @@ class FixedBeatViewer:
                         self.stretch_processed_audio[fade_start:self.stretch_buffer_used] *= fade_out_curve
                         stretched[:crossfade_size] *= fade_in_curve
                     
-                    # Efficient buffer management
-                    if self.stretch_buffer_used == 0:
-                        initial_size = max(len(stretched), self.process_chunk_size * 8)
-                        self.stretch_processed_audio = np.zeros(initial_size, dtype=np.float32)
-                        self.stretch_processed_audio[:len(stretched)] = stretched
-                        self.stretch_buffer_used = len(stretched)
-                    else:
-                        # Expand buffer if needed
-                        required_size = self.stretch_buffer_used + len(stretched)
-                        if required_size > len(self.stretch_processed_audio):
-                            new_capacity = int(required_size * 1.5)
-                            new_buffer = np.zeros(new_capacity, dtype=np.float32)
-                            new_buffer[:self.stretch_buffer_used] = self.stretch_processed_audio[:self.stretch_buffer_used]
-                            self.stretch_processed_audio = new_buffer
-                        
-                        # Append new data
-                        end_pos = self.stretch_buffer_used
-                        self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
-                        self.stretch_buffer_used += len(stretched)
+                    # Efficient buffer management with power-of-two growth (Issue #3)
+                    self._expand_stretch_buffer_if_needed(stretched)
+                    
+                    # Append new data
+                    end_pos = self.stretch_buffer_used
+                    self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
+                    self.stretch_buffer_used += len(stretched)
                     
                     total_samples += len(stretched)
                 
@@ -1826,23 +1882,12 @@ class FixedBeatViewer:
                     self.stretch_processed_audio[fade_start:self.stretch_buffer_used] *= fade_out_curve
                     stretched[:crossfade_size] *= fade_in_curve
                 
-                # Buffer management (same as streaming)
-                if self.stretch_buffer_used == 0:
-                    initial_size = max(len(stretched), self.process_chunk_size * 4)
-                    self.stretch_processed_audio = np.zeros(initial_size, dtype=np.float32)
-                    self.stretch_processed_audio[:len(stretched)] = stretched
-                    self.stretch_buffer_used = len(stretched)
-                else:
-                    required_size = self.stretch_buffer_used + len(stretched)
-                    if required_size > len(self.stretch_processed_audio):
-                        new_capacity = int(required_size * 1.5)
-                        new_buffer = np.zeros(new_capacity, dtype=np.float32)
-                        new_buffer[:self.stretch_buffer_used] = self.stretch_processed_audio[:self.stretch_buffer_used]
-                        self.stretch_processed_audio = new_buffer
-                    
-                    end_pos = self.stretch_buffer_used
-                    self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
-                    self.stretch_buffer_used += len(stretched)
+                # Buffer management with power-of-two growth (Issue #3)
+                self._expand_stretch_buffer_if_needed(stretched)
+                
+                end_pos = self.stretch_buffer_used
+                self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
+                self.stretch_buffer_used += len(stretched)
                 
                 self.stretch_input_pos += chunk_size
                 logger.debug(f"Fallback processed: {len(stretched)} samples")
@@ -1853,9 +1898,9 @@ class FixedBeatViewer:
     def _process_eq(self, outdata, frames):
         """Apply EQ processing to audio buffer"""
         try:
-            for i in range(frames):
-                # Process each sample through EQ
-                outdata[i, 0] = self.eq_filters.process_sample(outdata[i, 0])
+            # Process entire block through EQ (vectorized for performance)
+            if self.eq_enabled and self.eq_filters:
+                outdata[:frames, 0] = self.eq_filters.process_block_vectorized(outdata[:frames, 0])
         except Exception as e:
             # Set error flag instead of logging in processing thread
             self._producer_error = f"EQ processing error: {e}"
@@ -1873,6 +1918,30 @@ class FixedBeatViewer:
             self.stream.close()
             self.stream = None
     
+    def _expand_stretch_buffer_if_needed(self, stretched_data):
+        """Expand stretch buffer using power-of-two growth to reduce reallocation spikes"""
+        required_size = self.stretch_buffer_used + len(stretched_data)
+        
+        # Check if we need to grow
+        if required_size > len(self.stretch_processed_audio):
+            # Initial allocation or growth needed
+            if self.stretch_buffer_used == 0:
+                # Initial generous allocation (was *8, now *64 for fewer reallocations)
+                initial_size = max(len(stretched_data), self.process_chunk_size * 64)
+                self.stretch_processed_audio = np.zeros(initial_size, dtype=np.float32)
+            else:
+                # Power-of-2 growth policy
+                new_capacity = 1
+                while new_capacity < required_size:
+                    new_capacity <<= 1  # Bit shift is more efficient than *= 2
+                
+                # Cap at max buffer size to prevent runaway growth
+                new_capacity = min(new_capacity, self.max_buffer_size)
+                
+                new_buffer = np.zeros(new_capacity, dtype=np.float32)
+                new_buffer[:self.stretch_buffer_used] = self.stretch_processed_audio[:self.stretch_buffer_used]
+                self.stretch_processed_audio = new_buffer
+
     def _trim_buffer_if_needed(self):
         """Trim processed audio buffer to prevent memory bloat and GC pauses"""
         try:
@@ -1892,6 +1961,7 @@ class FixedBeatViewer:
                 old_used = self.stretch_buffer_used
                 self.stretch_buffer_used = unread_size
                 self.stretch_read_pos -= trim_position
+                # Keep buffer capacity - don't shrink to avoid reallocations
                 
                 # Success - no logging in producer thread
                 
@@ -1911,9 +1981,10 @@ class FixedBeatViewer:
 
         while not self._producer_stop and self.is_playing:
             try:
-                # If ring has plenty, short sleep to yield
-                if self.out_ring.available_data() > WATERMARK:
-                    time.sleep(0.005)
+                # Dynamic backoff for producer pacing (Issue #7)
+                backoff = 0.002 if self.out_ring.available_data() > WATERMARK else 0.0
+                if backoff:
+                    time.sleep(backoff)
                     continue
 
                 # Compute a chunk (choose one path) - check variables safely
@@ -1933,8 +2004,15 @@ class FixedBeatViewer:
                 # Safety
                 np.nan_to_num(chunk, copy=False)
 
-                # Write to ring
-                self.out_ring.write(chunk)
+                # Write to ring with partial write handling
+                to_write = chunk if self._pending_out is None else np.vstack([self._pending_out, chunk])
+                
+                written = self.out_ring.write(to_write)
+                if written < len(to_write):
+                    # Save remainder as pending
+                    self._pending_out = to_write[written:]
+                else:
+                    self._pending_out = None
                 
                 # Trim buffers to prevent memory bloat (moved from callback - Issue #7)
                 self._trim_buffer_if_needed()
@@ -1942,9 +2020,10 @@ class FixedBeatViewer:
             except Exception as e:
                 # Set error flag but keep producer running
                 self._producer_error = str(e)
-                # Write silence to prevent underrun
-                silence_chunk = np.zeros((TARGET_BLOCK, 1), dtype=np.float32)
-                self.out_ring.write(silence_chunk)
+                # Write silence to prevent underrun (emergency - don't use pending buffer)
+                silence_chunk = np.zeros((TARGET_BLOCK, self.device_output_channels), dtype=np.float32)
+                self.out_ring.write(silence_chunk)  # Drop any pending audio in error case
+                self._pending_out = None  # Clear pending on error
                 time.sleep(0.01)  # Brief pause on error
 
     def _produce_chunk_rubberband(self, out_frames):
@@ -2013,23 +2092,30 @@ class FixedBeatViewer:
                     else:
                         chunk_out = full_output
                         
-                    # Apply EQ
+                    # Apply EQ (vectorized for performance)
                     if self.eq_enabled and self.eq_filters:
-                        for i in range(len(chunk_out)):
-                            chunk_out[i] = self.eq_filters.process_sample(chunk_out[i])
+                        chunk_out = self.eq_filters.process_block_vectorized(chunk_out)
                     
                     # Update position
                     self.playback_position += len(chunk_out)
                     
-                    return chunk_out.reshape(-1, 1).astype(np.float32)
+                    # Update position for UI thread - use input position for accurate beat tracking
+                    self._audio_position = float(self.stretch_input_pos)
+                    
+                    # Format for ring buffer output channels
+                    if self.device_output_channels == 1:
+                        return chunk_out.reshape(-1, 1).astype(np.float32)
+                    else:
+                        # Duplicate mono to stereo for ring buffer
+                        return np.column_stack([chunk_out, chunk_out]).astype(np.float32)
             
-            # Fallback to silence
-            return np.zeros((out_frames, 1), dtype=np.float32)
+            # Fallback to silence with correct channel count
+            return np.zeros((out_frames, self.device_output_channels), dtype=np.float32)
             
         except Exception as e:
             # Set error flag instead of logging in processing thread
             self._producer_error = f"RubberBand chunk production error: {e}"
-            return np.zeros((out_frames, 1), dtype=np.float32)
+            return np.zeros((out_frames, self.device_output_channels), dtype=np.float32)
 
     def _produce_chunk_turntable(self, out_frames):
         """Produce audio chunk using vectorized turntable processing (no RubberBand)"""
@@ -2061,14 +2147,22 @@ class FixedBeatViewer:
 
         out = (a * (1.0 - pos_frac) + b * pos_frac).astype(np.float32)
         self.playback_position = float(base + step * out_frames)
+        
+        # Update position for UI thread
+        self._audio_position = self.playback_position
 
-        # Apply EQ if enabled (moved from callback)
+        # Apply EQ if enabled (vectorized for performance)
         if self.eq_enabled and self.eq_filters:
-            for i in range(len(out)):
-                out[i] = self.eq_filters.process_sample(out[i])
+            out = self.eq_filters.process_block_vectorized(out)
 
         np.nan_to_num(out, copy=False)
-        return out.reshape(-1, 1)  # (frames, 1)
+        
+        # Format for ring buffer output channels
+        if self.device_output_channels == 1:
+            return out.reshape(-1, 1)  # (frames, 1)
+        else:
+            # Duplicate mono to stereo for ring buffer
+            return np.column_stack([out, out])  # (frames, 2)
 
     def _update_status(self, message, color="green"):
         """Update status"""
