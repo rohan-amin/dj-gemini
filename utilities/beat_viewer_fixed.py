@@ -16,6 +16,9 @@ import essentia.standard as es
 from pydub import AudioSegment
 import sounddevice as sd
 import logging
+import threading
+import time
+import scipy.signal as sps
 
 # Add project root to path
 PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,6 +61,57 @@ except ImportError:
 PITCH_PRESERVATION_AVAILABLE = RUBBERBAND_STREAMING_AVAILABLE or PYRUBBERBAND_AVAILABLE or LIBROSA_AVAILABLE or RUBBERBAND_AVAILABLE
 
 logger = logging.getLogger(__name__)
+
+class RingBuffer:
+    """Thread-safe ring buffer for audio data"""
+    def __init__(self, capacity_frames, channels=1):
+        self.channels = channels
+        self.cap = int(capacity_frames)
+        self.buf = np.zeros((self.cap, channels), dtype=np.float32)
+        self.w = 0  # write index
+        self.r = 0  # read index
+        self.size = 0
+        self.lock = threading.Lock()
+
+    def write(self, x):
+        """Write audio data to ring buffer. Returns number of frames written."""
+        n = x.shape[0]
+        with self.lock:
+            to_write = min(n, self.cap - self.size)
+            if to_write <= 0:
+                return 0
+            first = min(to_write, self.cap - self.w)
+            self.buf[self.w:self.w+first] = x[:first]
+            second = to_write - first
+            if second:
+                self.buf[0:second] = x[first:first+second]
+            self.w = (self.w + to_write) % self.cap
+            self.size += to_write
+            return to_write
+
+    def read(self, n):
+        """Read n frames from ring buffer. Returns (data, frames_read)."""
+        out = np.zeros((n, self.channels), dtype=np.float32)
+        with self.lock:
+            to_read = min(n, self.size)
+            first = min(to_read, self.cap - self.r)
+            out[:first] = self.buf[self.r:self.r+first]
+            second = to_read - first
+            if second:
+                out[first:first+second] = self.buf[0:second]
+            self.r = (self.r + to_read) % self.cap
+            self.size -= to_read
+        return out, to_read
+    
+    def available_space(self):
+        """Return number of frames that can be written"""
+        with self.lock:
+            return self.cap - self.size
+    
+    def available_data(self):
+        """Return number of frames available to read"""
+        with self.lock:
+            return self.size
 
 class BiquadFilter:
     """Professional biquad filter for real-time EQ processing"""
@@ -288,6 +342,12 @@ class FixedBeatViewer:
         self.current_tempo_ratio = 1.0
         self.playback_position = 0.0  # Floating point position for smooth tempo
         self.last_audio_sample = 0.0  # For smoothing discontinuities
+        
+        # Ring buffer architecture for thread-safe audio processing
+        self.out_ring = RingBuffer(capacity_frames=self.sample_rate * 4, channels=1)  # ~4s
+        self._producer_stop = False
+        self._had_underflow = False
+        self._producer_error = None
         
         # Pitch preservation with buffer management to eliminate periodic pops
         self.stretch_processor = None
@@ -607,6 +667,7 @@ class FixedBeatViewer:
             
             # Set properties
             self.sample_rate = audio_segment.frame_rate
+            
             self.total_frames = len(self.audio_data)
             self.duration_seconds = len(self.audio_data) / self.sample_rate
             self.current_filepath = file_path
@@ -687,6 +748,9 @@ class FixedBeatViewer:
         self.revert_bpm_button.config(state=tk.NORMAL)
         
         self._start_position_updates()
+        
+        # Start periodic audio flag checking
+        self._check_audio_flags()
     
     def _start_position_updates(self):
         """Start position updates"""
@@ -700,6 +764,22 @@ class FixedBeatViewer:
         
         # Always schedule next update regardless of file_loaded state
         self.master.after(50, self._start_position_updates)  # Update more frequently
+    
+    def _check_audio_flags(self):
+        """Check and handle flags set by the audio callback"""
+        # Check for underflow flag (set in callback, handled here)
+        if self._had_underflow:
+            self._had_underflow = False
+            self._update_status("Audio underflow detected; increasing blocksize or producer rate may help", "orange")
+        
+        # Check for producer error flag
+        if self._producer_error:
+            error_msg = self._producer_error
+            self._producer_error = None  # Clear the flag
+            logger.debug(f"Producer loop error: {error_msg}")
+        
+        # Schedule next flag check
+        self.master.after(250, self._check_audio_flags)  # Check every 250ms
     
     def _update_position_display(self):
         """Update position display"""
@@ -1430,41 +1510,30 @@ class FixedBeatViewer:
                     self._init_stretch_processor(self.current_tempo_ratio)
             
             def audio_callback(outdata, frames, time, status):
-                try:
-                    # Check bounds
-                    if int(self.playback_position) >= len(self.audio_data):
-                        outdata.fill(0)
-                        self.master.after(0, self._stop_playback)
-                        return
-                    
-                    # Choose processing mode
-                    if (RUBBERBAND_AVAILABLE and self.preserve_pitch_var.get() and 
-                        self.stretch_processor is not None):
-                        # Use streaming pitch preservation
-                        self._process_streaming_stretch(outdata, frames)
-                    else:
-                        # Use turntable-style tempo scaling
-                        self._process_turntable_style(outdata, frames)
-                    
-                    # Apply EQ if enabled
-                    if self.eq_enabled and self.eq_filters:
-                        self._process_eq(outdata, frames)
-                    
-                    # Update position for UI thread (thread-safe assignment)
-                    self._audio_position = self.playback_position
-                    
-                except Exception as e:
-                    logger.error(f"Audio callback error: {e}")
-                    outdata.fill(0)
+                # No logging/UI here; set flags only
+                if status:
+                    self._had_underflow = True
+
+                out, n = self.out_ring.read(frames)
+                if n < frames:
+                    # underrun: fill tail with zeros
+                    out[n:] = 0.0
+                outdata[:frames, 0] = out[:, 0]
             
-            # Start stream
+            # Start stream with optimized settings for low latency and reduced callback pressure
             self.stream = sd.OutputStream(
-                samplerate=self.sample_rate,
+                samplerate=self.sample_rate,   # OR device SR if you standardize (see Fix B)
                 channels=1,
-                callback=audio_callback,
-                blocksize=1024
+                dtype='float32',
+                latency='low',
+                blocksize=2048,  # 2048 or 4096 gives more headroom
+                callback=audio_callback
             )
             self.stream.start()
+            
+            # Start producer thread to fill ring buffer
+            self._producer_stop = False
+            self._start_producer_thread()
             
         except Exception as e:
             self._update_status(f"Playback failed: {e}", "red")
@@ -1546,7 +1615,7 @@ class FixedBeatViewer:
                 self.playback_position += frames
                 
                 # Keep buffer size manageable to prevent memory bloat
-                self._trim_buffer_if_needed()
+                # self._trim_buffer_if_needed()  # Moved to producer thread (Issue #7)
             else:
                 # Emergency fallback to turntable style to maintain audio
                 logger.debug(f"Stretch underrun, falling back to turntable: {samples_available}/{frames}")
@@ -1568,7 +1637,8 @@ class FixedBeatViewer:
                 return self._process_more_audio_fallback()
                 
         except Exception as e:
-            logger.debug(f"Audio processing error: {e}")
+            # Set error flag instead of logging in processing thread
+            self._producer_error = f"Audio processing error: {e}"
             
     def _process_more_audio_streaming(self):
         """Process audio using proper streaming RubberBand API"""
@@ -1618,10 +1688,11 @@ class FixedBeatViewer:
             # Advance input position by the chunk size we just consumed
             self.stretch_input_pos += chunk_size
             
-            logger.debug(f"✓ Streaming processed: input_pos={self.stretch_input_pos}, buffer_used={self.stretch_buffer_used}")
+            # Success - no logging in processing thread
             
         except Exception as e:
-            logger.debug(f"Streaming audio processing error: {e}")
+            # Set error flag instead of logging in processing thread
+            self._producer_error = f"Streaming processing error: {e}"
     
     def _drain_rubberband_output(self):
         """Drain all available output from RubberBand processor (like working example)"""
@@ -1786,10 +1857,14 @@ class FixedBeatViewer:
                 # Process each sample through EQ
                 outdata[i, 0] = self.eq_filters.process_sample(outdata[i, 0])
         except Exception as e:
-            logger.debug(f"EQ processing error: {e}")
+            # Set error flag instead of logging in processing thread
+            self._producer_error = f"EQ processing error: {e}"
     
     def _stop_playback(self):
         """Stop playback"""
+        # Stop producer thread first
+        self._producer_stop = True
+        
         self.is_playing = False
         self.play_pause_button.config(text="▶ Play")
         
@@ -1818,11 +1893,183 @@ class FixedBeatViewer:
                 self.stretch_buffer_used = unread_size
                 self.stretch_read_pos -= trim_position
                 
-                logger.debug(f"Trimmed buffer: used {old_used} -> {self.stretch_buffer_used} samples, read_pos adjusted by {trim_position}")
+                # Success - no logging in producer thread
                 
         except Exception as e:
-            logger.debug(f"Buffer trim error: {e}")
+            # Set error flag instead of logging in producer thread
+            self._producer_error = f"Buffer trim error: {e}"
     
+    def _start_producer_thread(self):
+        """Start the producer thread to fill ring buffer"""
+        t = threading.Thread(target=self._producer_loop, daemon=True)
+        t.start()
+
+    def _producer_loop(self):
+        """Continuously fill out_ring with processed audio."""
+        TARGET_BLOCK = 8192  # frames per chunk we produce
+        WATERMARK = self.sample_rate // 2  # keep ~0.5s ahead
+
+        while not self._producer_stop and self.is_playing:
+            try:
+                # If ring has plenty, short sleep to yield
+                if self.out_ring.available_data() > WATERMARK:
+                    time.sleep(0.005)
+                    continue
+
+                # Compute a chunk (choose one path) - check variables safely
+                use_rubberband = (RUBBERBAND_STREAMING_AVAILABLE and 
+                                hasattr(self, 'preserve_pitch_var') and self.preserve_pitch_var.get() and
+                                hasattr(self, 'stretch_processor') and self.stretch_processor is not None)
+                
+                if use_rubberband:
+                    chunk = self._produce_chunk_rubberband(TARGET_BLOCK)  # see 3C
+                else:
+                    chunk = self._produce_chunk_turntable(TARGET_BLOCK)   # see 3D
+
+                if chunk is None or len(chunk) == 0:
+                    # end: pad zeros to drain
+                    chunk = np.zeros((TARGET_BLOCK, 1), dtype=np.float32)
+
+                # Safety
+                np.nan_to_num(chunk, copy=False)
+
+                # Write to ring
+                self.out_ring.write(chunk)
+                
+                # Trim buffers to prevent memory bloat (moved from callback - Issue #7)
+                self._trim_buffer_if_needed()
+                
+            except Exception as e:
+                # Set error flag but keep producer running
+                self._producer_error = str(e)
+                # Write silence to prevent underrun
+                silence_chunk = np.zeros((TARGET_BLOCK, 1), dtype=np.float32)
+                self.out_ring.write(silence_chunk)
+                time.sleep(0.01)  # Brief pause on error
+
+    def _produce_chunk_rubberband(self, out_frames):
+        """Produce audio chunk using streaming RubberBand (direct processing)"""
+        try:
+            # Check bounds
+            if self.stretch_input_pos >= len(self.audio_data) - 1:
+                return None
+
+            # Get input chunk size  
+            chunk_size = min(self.process_chunk_size, len(self.audio_data) - self.stretch_input_pos)
+            if chunk_size <= 0:
+                return None
+
+            # Get audio chunk with stem mixing
+            if self.stems_available and self.stem_data:
+                input_chunk = np.zeros(chunk_size, dtype=np.float32)
+                for stem_name, stem_audio in self.stem_data.items():
+                    if self.stretch_input_pos + chunk_size <= len(stem_audio):
+                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        stem_chunk = stem_audio[self.stretch_input_pos:self.stretch_input_pos + chunk_size]
+                        input_chunk += stem_chunk * volume
+            else:
+                if len(self.audio_data.shape) == 1:
+                    input_chunk = self.audio_data[self.stretch_input_pos:self.stretch_input_pos + chunk_size]
+                else:
+                    input_chunk = self.audio_data[self.stretch_input_pos:self.stretch_input_pos + chunk_size, 0]
+
+            # Advance input position
+            self.stretch_input_pos += chunk_size
+
+            # Convert to RubberBand format: (frames, channels)
+            if hasattr(self, 'audio_channels') and self.audio_channels > 1:
+                input_block = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
+            else:
+                input_block = input_chunk.reshape(-1, 1).astype(np.float32)
+
+            # Process with streaming RubberBand
+            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                self.rubberband_stretcher.process(input_block, final=False)
+                
+                # Drain all available output (like the working test file)
+                output_chunks = []
+                while True:
+                    available = self.rubberband_stretcher.available()
+                    if available <= 0:
+                        break
+                    output_block = self.rubberband_stretcher.retrieve(available)
+                    if output_block is None or len(output_block) == 0:
+                        break
+                    # Convert to mono
+                    if hasattr(self, 'audio_channels') and self.audio_channels > 1:
+                        mono_output = np.mean(output_block, axis=1).astype(np.float32)
+                    else:
+                        mono_output = output_block[:, 0].astype(np.float32)
+                    output_chunks.append(mono_output)
+                
+                if output_chunks:
+                    # Concatenate all drained output
+                    full_output = np.concatenate(output_chunks)
+                    
+                    # Take exactly what we need, save rest for next call
+                    if len(full_output) >= out_frames:
+                        chunk_out = full_output[:out_frames]
+                        # Store remainder (would need a class buffer for this - simplified for now)
+                    else:
+                        chunk_out = full_output
+                        
+                    # Apply EQ
+                    if self.eq_enabled and self.eq_filters:
+                        for i in range(len(chunk_out)):
+                            chunk_out[i] = self.eq_filters.process_sample(chunk_out[i])
+                    
+                    # Update position
+                    self.playback_position += len(chunk_out)
+                    
+                    return chunk_out.reshape(-1, 1).astype(np.float32)
+            
+            # Fallback to silence
+            return np.zeros((out_frames, 1), dtype=np.float32)
+            
+        except Exception as e:
+            # Set error flag instead of logging in processing thread
+            self._producer_error = f"RubberBand chunk production error: {e}"
+            return np.zeros((out_frames, 1), dtype=np.float32)
+
+    def _produce_chunk_turntable(self, out_frames):
+        """Produce audio chunk using vectorized turntable processing (no RubberBand)"""
+        step = float(self.current_tempo_ratio)
+        base = float(self.playback_position)
+        pos = base + step * np.arange(out_frames, dtype=np.float32)
+        pos_int = pos.astype(np.int32)
+        max_idx = len(self.audio_data) - 2
+        if max_idx < 1:
+            return None
+        np.clip(pos_int, 0, max_idx, out=pos_int)
+        pos_frac = pos - pos_int
+
+        # Stems mix once per chunk if available
+        if self.stems_available and self.stem_data:
+            # Mix stems around needed integer range
+            start = pos_int.min()
+            stop = min(pos_int.max() + 2, len(self.audio_data))
+            basebuf = np.zeros(stop - start, dtype=np.float32)
+            for name, stem in self.stem_data.items():
+                vol = float(self.stem_volumes.get(name, 1.0))
+                if stop <= len(stem):
+                    basebuf += stem[start:stop] * vol
+            a = basebuf[pos_int - start]
+            b = basebuf[pos_int - start + 1]
+        else:
+            a = self.audio_data[pos_int]
+            b = self.audio_data[pos_int + 1]
+
+        out = (a * (1.0 - pos_frac) + b * pos_frac).astype(np.float32)
+        self.playback_position = float(base + step * out_frames)
+
+        # Apply EQ if enabled (moved from callback)
+        if self.eq_enabled and self.eq_filters:
+            for i in range(len(out)):
+                out[i] = self.eq_filters.process_sample(out[i])
+
+        np.nan_to_num(out, copy=False)
+        return out.reshape(-1, 1)  # (frames, 1)
+
     def _update_status(self, message, color="green"):
         """Update status"""
         self.status_label.config(text=message, fg=color)
