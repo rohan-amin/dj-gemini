@@ -36,13 +36,26 @@ except ImportError:
     LIBROSA_AVAILABLE = False
 
 try:
+    from rubberband_ctypes import (
+        RubberBand, REALTIME_DEFAULT,
+        RubberBandOptionTransientsCrisp, RubberBandOptionTransientsSmooth,
+        RubberBandOptionPhaseIndependent, RubberBandOptionPhaseLaminar,
+        RubberBandOptionDetectorPercussive, RubberBandOptionDetectorSoft,
+    )
+    RUBBERBAND_STREAMING_AVAILABLE = True
+    print("RubberBand streaming ctypes wrapper loaded successfully!")
+except ImportError as e:
+    RUBBERBAND_STREAMING_AVAILABLE = False
+    print(f"RubberBand streaming not available: {e}")
+
+try:
     import rubberband
     RUBBERBAND_AVAILABLE = True
     print("Native RubberBand library loaded successfully!")
 except ImportError:
     RUBBERBAND_AVAILABLE = False
 
-PITCH_PRESERVATION_AVAILABLE = PYRUBBERBAND_AVAILABLE or LIBROSA_AVAILABLE or RUBBERBAND_AVAILABLE
+PITCH_PRESERVATION_AVAILABLE = RUBBERBAND_STREAMING_AVAILABLE or PYRUBBERBAND_AVAILABLE or LIBROSA_AVAILABLE or RUBBERBAND_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -279,9 +292,11 @@ class FixedBeatViewer:
         # Pitch preservation with buffer management to eliminate periodic pops
         self.stretch_processor = None
         self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+        self.stretch_buffer_used = 0  # Track how much of the buffer actually contains data
         self.stretch_read_pos = 0
+        self.stretch_input_pos = 0  # Track where we are in the source audio for RubberBand
         self.last_tempo_ratio = 1.0
-        self.process_chunk_size = 8192  # Power of 2 for optimal audio processing alignment
+        self.process_chunk_size = 2048  # Smaller chunks to reduce RubberBand stateless artifacts
         self.fade_size = 64  # Small fade at chunk boundaries
         self.max_buffer_size = 1048576  # 1MB max buffer to prevent memory issues
         self.buffer_trim_threshold = 786432  # Trim when buffer exceeds 768KB
@@ -727,11 +742,28 @@ class FixedBeatViewer:
         old_ratio = self.current_tempo_ratio
         self.current_tempo_ratio = tempo_ratio
         
-        # Initialize streaming pitch preservation if needed
-        if RUBBERBAND_AVAILABLE and self.preserve_pitch_var.get() and self.file_loaded:
-            if abs(tempo_ratio - self.last_tempo_ratio) > 0.01:  # Only reinitialize if ratio changed significantly
-                self._init_stretch_processor(tempo_ratio)
-                logger.info(f"Pitch preservation ENABLED with tempo ratio: {tempo_ratio:.2f}")
+        # Initialize or update streaming pitch preservation if needed
+        if (RUBBERBAND_STREAMING_AVAILABLE or RUBBERBAND_AVAILABLE) and self.preserve_pitch_var.get() and self.file_loaded:
+            if abs(tempo_ratio - self.last_tempo_ratio) > 0.01:  # Only update if ratio changed significantly
+                
+                # Check if we can update existing streaming processor
+                if (hasattr(self, 'rubberband_stretcher') and 
+                    self.rubberband_stretcher and 
+                    self.stretch_processor and 
+                    self.stretch_processor.get('streaming', False)):
+                    
+                    # Update existing streaming processor - much more efficient!
+                    new_time_ratio = 1.0 / tempo_ratio
+                    self.rubberband_stretcher.set_time_ratio(new_time_ratio)
+                    self.stretch_processor['tempo_ratio'] = tempo_ratio
+                    self.stretch_processor['time_ratio'] = new_time_ratio
+                    self.last_tempo_ratio = tempo_ratio
+                    logger.info(f"✓ Updated streaming tempo ratio: {tempo_ratio:.2f} (time_ratio: {new_time_ratio:.3f})")
+                    
+                else:
+                    # Initialize new processor
+                    self._init_stretch_processor(tempo_ratio)
+                    logger.info(f"Pitch preservation ENABLED with tempo ratio: {tempo_ratio:.2f}")
         else:
             self.stretch_processor = None
             if self.preserve_pitch_var.get():
@@ -740,25 +772,86 @@ class FixedBeatViewer:
         logger.debug(f"Tempo changed: ratio={tempo_ratio:.2f}, new_bpm={new_bpm:.1f}")
     
     def _init_stretch_processor(self, tempo_ratio):
-        """Initialize streaming pitch preservation processor"""
-        if not RUBBERBAND_AVAILABLE or self.audio_data is None:
+        """Initialize streaming pitch preservation processor with proper RubberBand streaming API"""
+        if not RUBBERBAND_STREAMING_AVAILABLE or self.audio_data is None:
+            logger.warning("Falling back to old RubberBand API")
+            return self._init_stretch_processor_fallback(tempo_ratio)
+        
+        try:
+            # Clean up existing processor
+            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                self.rubberband_stretcher.close()
+            
+            # Calculate proper time ratio (inverse of tempo for RubberBand)
+            # For faster playback (tempo_ratio > 1.0), time_ratio < 1.0
+            time_ratio = 1.0 / tempo_ratio
+            
+            # Create streaming RubberBand processor  
+            # Check if we have stereo or mono audio
+            audio_channels = 2 if len(self.audio_data.shape) > 1 and self.audio_data.shape[1] == 2 else 1
+            if len(self.audio_data.shape) == 1:
+                audio_channels = 1  # Definitely mono
+            
+            self.rubberband_stretcher = RubberBand(
+                sample_rate=int(self.sample_rate),
+                channels=audio_channels,
+                options=REALTIME_DEFAULT,
+                time_ratio=time_ratio,
+                pitch_scale=1.0  # Keep pitch unchanged
+            )
+            
+            self.audio_channels = audio_channels  # Store for later use
+            
+            # Optimize for different audio types - default to crisp for general use
+            self.rubberband_stretcher.set_transients_option(RubberBandOptionTransientsCrisp)
+            self.rubberband_stretcher.set_phase_option(RubberBandOptionPhaseIndependent)
+            self.rubberband_stretcher.set_detector_option(RubberBandOptionDetectorPercussive)
+            
+            # Reset processing state
+            self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+            self.stretch_buffer_used = 0
+            self.stretch_read_pos = 0
+            self.stretch_input_pos = int(self.playback_position)  # Start from current playback position
+            self.last_tempo_ratio = tempo_ratio
+            
+            # Set up processor metadata
+            self.stretch_processor = {
+                'tempo_ratio': tempo_ratio,
+                'time_ratio': time_ratio,
+                'streaming': True,
+                'initialized': True
+            }
+            
+            logger.info(f"✓ Streaming pitch processor initialized (tempo: {tempo_ratio:.2f}, time_ratio: {time_ratio:.3f})")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize streaming pitch processor: {e}")
+            logger.info("Falling back to old RubberBand API")
+            return self._init_stretch_processor_fallback(tempo_ratio)
+    
+    def _init_stretch_processor_fallback(self, tempo_ratio):
+        """Fallback to old stateless RubberBand API"""
+        if not RUBBERBAND_AVAILABLE:
             return
         
         try:
             self.stretch_processor = {
                 'tempo_ratio': tempo_ratio,
+                'streaming': False,
                 'initialized': True
             }
             
             # Reset processing state
             self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+            self.stretch_buffer_used = 0
             self.stretch_read_pos = 0
+            self.stretch_input_pos = int(self.playback_position)
             self.last_tempo_ratio = tempo_ratio
             
-            logger.info(f"Streaming pitch processor initialized (ratio: {tempo_ratio:.2f})")
+            logger.info(f"Fallback pitch processor initialized (ratio: {tempo_ratio:.2f})")
             
         except Exception as e:
-            logger.error(f"Failed to initialize stretch processor: {e}")
+            logger.error(f"Failed to initialize fallback pitch processor: {e}")
             self.stretch_processor = None
     
     def _set_bpm_from_input(self):
@@ -1241,7 +1334,14 @@ class FixedBeatViewer:
             self._update_status("Pitch preservation enabled", "green")
             logger.info(f"Pitch preservation enabled (ratio: {self.current_tempo_ratio:.2f})")
         else:
-            # Clean disable
+            # Clean disable - cleanup streaming processor
+            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                try:
+                    self.rubberband_stretcher.close()
+                except:
+                    pass
+                self.rubberband_stretcher = None
+            
             self.stretch_processor = None
             self._update_status("Pitch preservation disabled", "orange") 
             logger.info("Pitch preservation disabled")
@@ -1288,7 +1388,9 @@ class FixedBeatViewer:
             # Reset pitch preservation buffers if seeking during playback
             if self.is_playing and self.stretch_processor is not None:
                 self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+                self.stretch_buffer_used = 0
                 self.stretch_read_pos = 0
+                self.stretch_input_pos = target_frame  # Reset input position to seek target
                 logger.debug(f"Reset pitch buffers after seek to frame {target_frame}")
             
             # Update position display immediately
@@ -1369,60 +1471,43 @@ class FixedBeatViewer:
             logger.error(f"Playback failed: {e}")
     
     def _process_turntable_style(self, outdata, frames):
-        """Turntable-style processing (pitch changes with tempo)"""
-        advance_rate = self.current_tempo_ratio
-        
-        # Use stems if available, otherwise original audio
+        """Turntable-style processing (pitch changes with tempo) - VECTORIZED"""
+        advance_rate = float(self.current_tempo_ratio)
+
+        # If you have stems, mix them ONCE per block into a temp buffer (vectorized)
+        src = None
         if self.stems_available and self.stem_data:
-            for i in range(frames):
-                pos_int = int(self.playback_position)
-                if pos_int >= len(self.audio_data) - 1:
-                    outdata[i:, 0] = 0
-                    break
-                
-                # Mix stems at current position
-                mixed_sample = 0.0
-                for stem_name, stem_audio in self.stem_data.items():
-                    if pos_int < len(stem_audio) - 1:
-                        volume = self.stem_volumes.get(stem_name, 1.0)
-                        
-                        # Always process stems, even at zero volume, to ensure proper mixing
-                        # Linear interpolation for stem
-                        pos_frac = self.playback_position - pos_int
-                        stem_sample_a = stem_audio[pos_int]
-                        stem_sample_b = stem_audio[pos_int + 1]
-                        stem_sample = stem_sample_a * (1.0 - pos_frac) + stem_sample_b * pos_frac
-                        
-                        # Apply individual stem EQ (always exists - passthrough when disabled)
-                        # Ensure filter exists for this stem
-                        if stem_name not in self.stem_eq_filters:
-                            eq_filter = ThreeBandEQ(self.sample_rate)
-                            eq_filter.reset()
-                            eq_filter.set_gains(0.0, 0.0, 0.0)  # Start at passthrough
-                            self.stem_eq_filters[stem_name] = eq_filter
-                        
-                        stem_sample = self.stem_eq_filters[stem_name].process_sample(stem_sample)
-                        
-                        # Apply volume (including zero volume for muted stems)
-                        mixed_sample += stem_sample * volume
-                
-                outdata[i, 0] = mixed_sample
-                self.playback_position += advance_rate
+            # Mix stems at current integer frame positions (no Python loops)
+            pos0 = int(self.playback_position)
+            pos1 = min(pos0 + frames + 2, len(self.audio_data))
+            src = np.zeros(pos1 - pos0, dtype=np.float32)
+            for stem_name, stem_audio in self.stem_data.items():
+                vol = float(self.stem_volumes.get(stem_name, 1.0))
+                if pos1 <= len(stem_audio):
+                    src += stem_audio[pos0:pos1] * vol
         else:
-            # Original processing without stems
-            for i in range(frames):
-                pos_int = int(self.playback_position)
-                if pos_int >= len(self.audio_data) - 1:
-                    outdata[i:, 0] = 0
-                    break
-                
-                # Linear interpolation
-                pos_frac = self.playback_position - pos_int
-                sample_a = self.audio_data[pos_int]
-                sample_b = self.audio_data[pos_int + 1]
-                outdata[i, 0] = sample_a * (1.0 - pos_frac) + sample_b * pos_frac
-                
-                self.playback_position += advance_rate
+            src = self.audio_data
+
+        # Vectorized interpolation positions
+        base = float(self.playback_position)
+        pos = base + advance_rate * np.arange(frames, dtype=np.float32)
+        pos_int = pos.astype(np.int32)
+        max_idx = len(src) - 2
+        if max_idx < 1:
+            outdata[:frames, 0] = 0.0
+            return
+        np.clip(pos_int, 0, max_idx, out=pos_int)
+        pos_frac = pos - pos_int
+
+        a = src[pos_int]
+        b = src[pos_int + 1]
+        out = a * (1.0 - pos_frac) + b * pos_frac  # (frames,)
+
+        # Safety: avoid NaN/inf/denormals
+        np.nan_to_num(out, copy=False)
+
+        outdata[:frames, 0] = out
+        self.playback_position = float(base + advance_rate * frames)
     
     def _process_streaming_stretch(self, outdata, frames):
         """Simple streaming pitch preservation with smart buffer management"""
@@ -1436,17 +1521,19 @@ class FixedBeatViewer:
             # Safety check - ensure buffers exist
             if not hasattr(self, 'stretch_processed_audio'):
                 self.stretch_processed_audio = np.zeros(0, dtype=np.float32)
+            if not hasattr(self, 'stretch_buffer_used'):
+                self.stretch_buffer_used = 0
             if not hasattr(self, 'stretch_read_pos'):
                 self.stretch_read_pos = 0
                 
             # Ensure we have enough processed audio available
-            samples_available = len(self.stretch_processed_audio) - self.stretch_read_pos
+            samples_available = self.stretch_buffer_used - self.stretch_read_pos
             
             # Keep at least 2x chunk size buffered ahead for smoother playback
             buffer_ahead = self.process_chunk_size * 2  # 16384 samples
             if samples_available < frames + buffer_ahead:
                 self._process_more_audio()
-                samples_available = len(self.stretch_processed_audio) - self.stretch_read_pos
+                samples_available = self.stretch_buffer_used - self.stretch_read_pos
             
             # Copy from processed audio buffer
             if samples_available >= frames:
@@ -1454,12 +1541,11 @@ class FixedBeatViewer:
                 self.stretch_read_pos += frames
                 
                 # CRITICAL: Advance playback position for UI tracking
-                # We need to advance by the tempo ratio to track original audio position
-                advance_rate = self.current_tempo_ratio
-                position_advance = frames * advance_rate
-                self.playback_position += position_advance
+                # For pitch preservation, position should advance 1:1 with output samples
+                # because playback_position represents the output timeline, not input consumption
+                self.playback_position += frames
                 
-                # Trim buffer periodically to prevent memory bloat and GC pauses
+                # Keep buffer size manageable to prevent memory bloat
                 self._trim_buffer_if_needed()
             else:
                 # Emergency fallback to turntable style to maintain audio
@@ -1471,110 +1557,227 @@ class FixedBeatViewer:
             self._process_turntable_style(outdata, frames)
     
     def _process_more_audio(self):
-        """Process more audio with very large chunks to minimize pops"""
+        """Process more audio using streaming RubberBand API"""
         try:
-            current_pos = int(self.playback_position)
+            # Check if we're using streaming API
+            if (hasattr(self, 'rubberband_stretcher') and 
+                self.stretch_processor and 
+                self.stretch_processor.get('streaming', False)):
+                return self._process_more_audio_streaming()
+            else:
+                return self._process_more_audio_fallback()
+                
+        except Exception as e:
+            logger.debug(f"Audio processing error: {e}")
+            
+    def _process_more_audio_streaming(self):
+        """Process audio using proper streaming RubberBand API"""
+        try:
+            current_pos = self.stretch_input_pos
             chunk_size = self.process_chunk_size
             
             # Check bounds
             if current_pos >= len(self.audio_data) - chunk_size:
                 return
             
-            # Get large chunk for stable processing - TEMPORARILY DISABLE STEM EQ FOR TESTING
+            # Get audio chunk with proper channel handling
             if self.stems_available and self.stem_data:
-                # Mix stems for this chunk WITHOUT individual EQ processing (for testing)
+                # Mix stems for this chunk
                 input_chunk = np.zeros(chunk_size, dtype=np.float32)
                 for stem_name, stem_audio in self.stem_data.items():
                     if current_pos + chunk_size <= len(stem_audio):
                         volume = self.stem_volumes.get(stem_name, 1.0)
                         stem_chunk = stem_audio[current_pos:current_pos + chunk_size]
-                        
-                        # SKIP EQ processing to test if that's causing artifacts
-                        
                         input_chunk += stem_chunk * volume
             else:
                 # Use original audio if no stems available
+                if len(self.audio_data.shape) == 1:
+                    # Mono audio
+                    input_chunk = self.audio_data[current_pos:current_pos + chunk_size]
+                else:
+                    # Stereo audio - take left channel or average both channels
+                    input_chunk = self.audio_data[current_pos:current_pos + chunk_size, 0]
+            
+            if len(input_chunk) < chunk_size:
+                return
+            
+            # Convert to proper format for streaming RubberBand: (frames, channels)
+            if self.audio_channels == 1:
+                # Mono: (frames,) -> (frames, 1)
+                input_block = input_chunk.reshape(-1, 1).astype(np.float32)
+            else:
+                # Stereo: duplicate mono to stereo (frames,) -> (frames, 2)
+                input_block = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
+            
+            # Feed to RubberBand streaming processor
+            self.rubberband_stretcher.process(input_block, final=False)
+            
+            # CRITICAL: Use proper drain pattern like working example
+            self._drain_rubberband_output()
+            
+            # Advance input position by the chunk size we just consumed
+            self.stretch_input_pos += chunk_size
+            
+            logger.debug(f"✓ Streaming processed: input_pos={self.stretch_input_pos}, buffer_used={self.stretch_buffer_used}")
+            
+        except Exception as e:
+            logger.debug(f"Streaming audio processing error: {e}")
+    
+    def _drain_rubberband_output(self):
+        """Drain all available output from RubberBand processor (like working example)"""
+        try:
+            total_samples = 0
+            n = self.rubberband_stretcher.available()
+            while n > 0:
+                # Retrieve processed audio: (frames, channels)
+                output_block = self.rubberband_stretcher.retrieve(n)
+                if output_block is None or len(output_block) == 0:
+                    break
+                
+                # Convert to mono for our processing pipeline
+                if self.audio_channels == 1:
+                    stretched = output_block[:, 0].astype(np.float32)
+                else:
+                    # Average stereo to mono for now (could be improved)
+                    stretched = np.mean(output_block, axis=1).astype(np.float32)
+                
+                if len(stretched) > 0:
+                    # Minimal crossfade for streaming (much smaller since RubberBand handles continuity)
+                    crossfade_size = min(32, len(stretched) // 32)
+                    
+                    if len(stretched) > crossfade_size and self.stretch_buffer_used >= crossfade_size:
+                        # Light equal-power crossfade
+                        fade_out_curve = np.cos(np.linspace(0, np.pi/2, crossfade_size))
+                        fade_in_curve = np.sin(np.linspace(0, np.pi/2, crossfade_size))
+                        
+                        fade_start = self.stretch_buffer_used - crossfade_size
+                        self.stretch_processed_audio[fade_start:self.stretch_buffer_used] *= fade_out_curve
+                        stretched[:crossfade_size] *= fade_in_curve
+                    
+                    # Efficient buffer management
+                    if self.stretch_buffer_used == 0:
+                        initial_size = max(len(stretched), self.process_chunk_size * 8)
+                        self.stretch_processed_audio = np.zeros(initial_size, dtype=np.float32)
+                        self.stretch_processed_audio[:len(stretched)] = stretched
+                        self.stretch_buffer_used = len(stretched)
+                    else:
+                        # Expand buffer if needed
+                        required_size = self.stretch_buffer_used + len(stretched)
+                        if required_size > len(self.stretch_processed_audio):
+                            new_capacity = int(required_size * 1.5)
+                            new_buffer = np.zeros(new_capacity, dtype=np.float32)
+                            new_buffer[:self.stretch_buffer_used] = self.stretch_processed_audio[:self.stretch_buffer_used]
+                            self.stretch_processed_audio = new_buffer
+                        
+                        # Append new data
+                        end_pos = self.stretch_buffer_used
+                        self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
+                        self.stretch_buffer_used += len(stretched)
+                    
+                    total_samples += len(stretched)
+                
+                # Check for more available data
+                n = self.rubberband_stretcher.available()
+            
+            if total_samples > 0:
+                logger.debug(f"✓ Drained {total_samples} samples from RubberBand")
+            
+        except Exception as e:
+            logger.debug(f"Drain error: {e}")
+            
+    def _process_more_audio_fallback(self):
+        """Fallback to old stateless RubberBand processing"""
+        try:
+            current_pos = self.stretch_input_pos
+            chunk_size = self.process_chunk_size
+            
+            # Drift detection and correction
+            expected_buffer_size = self.stretch_buffer_used - self.stretch_read_pos
+            if expected_buffer_size < 0:
+                logger.warning(f"Buffer position drift detected: read_pos={self.stretch_read_pos}, buffer_used={self.stretch_buffer_used}")
+                self.stretch_read_pos = max(0, self.stretch_buffer_used - chunk_size)
+                return
+            
+            # Check bounds
+            if current_pos >= len(self.audio_data) - chunk_size:
+                return
+            
+            # Get audio chunk (same as streaming version)
+            if self.stems_available and self.stem_data:
+                input_chunk = np.zeros(chunk_size, dtype=np.float32)
+                for stem_name, stem_audio in self.stem_data.items():
+                    if current_pos + chunk_size <= len(stem_audio):
+                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        stem_chunk = stem_audio[current_pos:current_pos + chunk_size]
+                        input_chunk += stem_chunk * volume
+            else:
                 input_chunk = self.audio_data[current_pos:current_pos + chunk_size]
             
             if len(input_chunk) < chunk_size:
                 return
             
-            # Process with RubberBand - use highest quality for large chunks
-            # RubberBand ratio is inverse of tempo: higher tempo = lower ratio
+            # Process with old stateless RubberBand
             tempo_ratio = 1.0 / self.stretch_processor['tempo_ratio']
             
-            # For the first chunk, add silence padding to give RubberBand clean context
-            if len(self.stretch_processed_audio) == 0:
-                # Add small silence buffer at start for clean initialization
+            # Add padding for first chunk
+            if self.stretch_buffer_used == 0:
                 silence_padding = np.zeros(256, dtype=np.float32)
                 padded_chunk = np.concatenate([silence_padding, input_chunk])
             else:
                 padded_chunk = input_chunk
             
+            import rubberband
             stretched = rubberband.stretch(
                 padded_chunk,
                 rate=self.sample_rate,
                 ratio=tempo_ratio,
-                crispness=2,  # Lower crispness - faster, fewer artifacts
-                formants=False,  # Disable formant preservation to avoid EQ coloration  
-                precise=True   # More precise processing for better quality
+                crispness=2,
+                formants=False,
+                precise=True
             )
             
-            # If this was the first chunk with padding, remove the stretched silence
-            if len(self.stretch_processed_audio) == 0 and len(padded_chunk) > len(input_chunk):
-                # Remove the stretched silence padding from the beginning
-                # RubberBand ratio is time stretch, so stretched silence = 256 * ratio
-                silence_stretched_size = int(256 * (1.0 / tempo_ratio))  # Correct stretched silence length
-                silence_stretched_size = min(silence_stretched_size, len(stretched) // 2)  # Safety check
+            # Remove stretched silence from first chunk
+            if self.stretch_buffer_used == 0 and len(padded_chunk) > len(input_chunk):
+                silence_stretched_size = int(256 * tempo_ratio)
+                silence_stretched_size = min(silence_stretched_size, len(stretched) // 2)
                 if len(stretched) > silence_stretched_size:
                     stretched = stretched[silence_stretched_size:]
             
             if len(stretched) > 0:
-                # Add true overlap-add crossfade to eliminate all discontinuities
-                crossfade_size = min(128, len(stretched) // 64)  # Slightly larger for smoother transitions
+                # Apply crossfading and buffer management (same as before)
+                crossfade_size = min(128, len(stretched) // 32)
                 
-                if len(stretched) > crossfade_size and len(self.stretch_processed_audio) > crossfade_size:
-                    # True overlap-add: fade out end of existing buffer, fade in start of new chunk
-                    fade_out = np.linspace(1.0, 0.0, crossfade_size)
-                    fade_in = np.linspace(0.0, 1.0, crossfade_size)
+                if len(stretched) > crossfade_size and self.stretch_buffer_used >= crossfade_size:
+                    fade_out_curve = np.cos(np.linspace(0, np.pi/2, crossfade_size))
+                    fade_in_curve = np.sin(np.linspace(0, np.pi/2, crossfade_size))
                     
-                    # Apply fade out to end of existing buffer
-                    self.stretch_processed_audio[-crossfade_size:] *= fade_out
-                    
-                    # Apply fade in to start of new chunk and add to existing buffer end
-                    stretched[:crossfade_size] *= fade_in
-                    self.stretch_processed_audio[-crossfade_size:] += stretched[:crossfade_size]
-                    
-                    # Remove the overlapped part from new chunk before appending
-                    stretched = stretched[crossfade_size:]
-                elif len(stretched) > crossfade_size and len(self.stretch_processed_audio) > 0:
-                    # Simple fade in if we can't do full overlap
-                    fade_curve = np.linspace(0.0, 1.0, crossfade_size)
-                    stretched[:crossfade_size] *= fade_curve
+                    fade_start = self.stretch_buffer_used - crossfade_size
+                    self.stretch_processed_audio[fade_start:self.stretch_buffer_used] *= fade_out_curve
+                    stretched[:crossfade_size] *= fade_in_curve
                 
-                # Pre-allocate to avoid memory fragmentation from repeated concatenation
-                if len(self.stretch_processed_audio) == 0:
-                    self.stretch_processed_audio = stretched.copy()
+                # Buffer management (same as streaming)
+                if self.stretch_buffer_used == 0:
+                    initial_size = max(len(stretched), self.process_chunk_size * 4)
+                    self.stretch_processed_audio = np.zeros(initial_size, dtype=np.float32)
+                    self.stretch_processed_audio[:len(stretched)] = stretched
+                    self.stretch_buffer_used = len(stretched)
                 else:
-                    # Use more efficient append method
-                    old_size = len(self.stretch_processed_audio)
-                    new_size = old_size + len(stretched)
+                    required_size = self.stretch_buffer_used + len(stretched)
+                    if required_size > len(self.stretch_processed_audio):
+                        new_capacity = int(required_size * 1.5)
+                        new_buffer = np.zeros(new_capacity, dtype=np.float32)
+                        new_buffer[:self.stretch_buffer_used] = self.stretch_processed_audio[:self.stretch_buffer_used]
+                        self.stretch_processed_audio = new_buffer
                     
-                    # Pre-allocate new array
-                    new_buffer = np.empty(new_size, dtype=np.float32)
-                    new_buffer[:old_size] = self.stretch_processed_audio
-                    new_buffer[old_size:] = stretched
-                    
-                    self.stretch_processed_audio = new_buffer
+                    end_pos = self.stretch_buffer_used
+                    self.stretch_processed_audio[end_pos:end_pos + len(stretched)] = stretched
+                    self.stretch_buffer_used += len(stretched)
                 
-                # Position advancement is now handled in _process_streaming_stretch()
-                # based on actual audio output, not chunk processing
-                
-                logger.debug(f"Processed {len(stretched)} samples with fades, buffer size: {len(self.stretch_processed_audio)}")
+                self.stretch_input_pos += chunk_size
+                logger.debug(f"Fallback processed: {len(stretched)} samples")
             
         except Exception as e:
-            logger.debug(f"Audio processing error: {e}")
-            # Don't crash, just skip this processing attempt
+            logger.debug(f"Fallback audio processing error: {e}")
     
     def _process_eq(self, outdata, frames):
         """Apply EQ processing to audio buffer"""
@@ -1598,21 +1801,24 @@ class FixedBeatViewer:
     def _trim_buffer_if_needed(self):
         """Trim processed audio buffer to prevent memory bloat and GC pauses"""
         try:
-            current_buffer_size = len(self.stretch_processed_audio)
-            
             # Only trim if buffer is getting large and we have a significant read position
-            if (current_buffer_size > self.buffer_trim_threshold and 
+            if (self.stretch_buffer_used > self.buffer_trim_threshold and 
                 self.stretch_read_pos > self.process_chunk_size):
                 
                 # Keep unread data plus some safety margin
                 safety_margin = self.process_chunk_size // 2
                 trim_position = max(0, self.stretch_read_pos - safety_margin)
                 
-                # Trim the buffer by keeping only unread data
-                self.stretch_processed_audio = self.stretch_processed_audio[trim_position:]
+                # Shift unread data to beginning of buffer
+                unread_size = self.stretch_buffer_used - trim_position
+                self.stretch_processed_audio[:unread_size] = self.stretch_processed_audio[trim_position:self.stretch_buffer_used]
+                
+                # Update tracking variables
+                old_used = self.stretch_buffer_used
+                self.stretch_buffer_used = unread_size
                 self.stretch_read_pos -= trim_position
                 
-                logger.debug(f"Trimmed buffer: {current_buffer_size} -> {len(self.stretch_processed_audio)} samples, read_pos adjusted by {trim_position}")
+                logger.debug(f"Trimmed buffer: used {old_used} -> {self.stretch_buffer_used} samples, read_pos adjusted by {trim_position}")
                 
         except Exception as e:
             logger.debug(f"Buffer trim error: {e}")
