@@ -19,7 +19,7 @@ import logging
 import threading
 import time
 import scipy.signal as sps
-from scipy.signal import iirpeak, sosfilt
+from scipy.signal import iirpeak, sosfilt, lfilter_zi
 
 # Add project root to path
 PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -243,6 +243,15 @@ class ThreeBandEQ:
         self.mid_freq = 1000   # 1kHz  
         self.low_freq = 100    # 100Hz
         
+        # Vectorized path state (for process_block_vectorized)
+        self._vectorized_filters = []     # list of (b, a)
+        self._vec_zi = []                 # list of zi arrays per filter
+        self._pending_filters = None      # for smooth updates
+        self._pending_zi = None
+        self._xfade_samples = int(0.010 * self.sample_rate)  # 10 ms crossfade
+        self._xfade_remaining = 0
+        self._needs_priming = True        # prime state on first block to avoid thump
+        
         # Track current gains for kill mode detection
         self.current_high_gain = 0.0
         self.current_mid_gain = 0.0
@@ -308,45 +317,132 @@ class ThreeBandEQ:
         return y
     
     def _compute_vectorized_coefficients(self):
-        """Compute vectorized filter coefficients for scipy lfilter"""
-        # For vectorized processing, we'll create a simplified single-stage 3-band EQ
-        # This trades some quality for massive performance gains in the producer
-        
-        # Get current gain values by examining filter states
-        # We'll approximate the complex cascaded filter with single biquads
-        
+        """Compute/approximate single-stage filters and schedule smooth update."""
         filters = []
-        
-        # High shelf (approximate)
+
+        # High shelf (approx) ----------------------------------
         if hasattr(self.high_filter, 'b0') and self.high_filter.b0 != 1.0:
             b_high = np.array([self.high_filter.b0, self.high_filter.b1, self.high_filter.b2], dtype=np.float64)
             a_high = np.array([1.0, self.high_filter.a1, self.high_filter.a2], dtype=np.float64)
             filters.append((b_high, a_high))
-        
-        # Mid peaking (approximate) 
+
+        # Mid peaking (approx) ---------------------------------
         if hasattr(self.mid_filter, 'b0') and self.mid_filter.b0 != 1.0:
             b_mid = np.array([self.mid_filter.b0, self.mid_filter.b1, self.mid_filter.b2], dtype=np.float64)
             a_mid = np.array([1.0, self.mid_filter.a1, self.mid_filter.a2], dtype=np.float64)
             filters.append((b_mid, a_mid))
-        
-        # Low shelf (approximate)
+
+        # Low shelf (approx) -----------------------------------
         if hasattr(self.low_filter, 'b0') and self.low_filter.b0 != 1.0:
             b_low = np.array([self.low_filter.b0, self.low_filter.b1, self.low_filter.b2], dtype=np.float64)
             a_low = np.array([1.0, self.low_filter.a1, self.low_filter.a2], dtype=np.float64)
             filters.append((b_low, a_low))
-        
-        self._vectorized_filters = filters
+
+        self._schedule_vectorized_update(filters)
     
-    def process_block_vectorized(self, x):
-        """Process block of samples using vectorized scipy lfilter - much faster than per-sample"""
-        if not hasattr(self, '_vectorized_filters'):
-            self._compute_vectorized_coefficients()
-        
-        y = x.copy()
+    def _schedule_vectorized_update(self, new_filters):
+        """Prepare a smooth transition to new filter coefficients."""
+        # Build zi arrays for new filters
+        new_zi = []
+        for b, a in new_filters:
+            # zi length is max(len(a), len(b)) - 1
+            L = max(len(a), len(b)) - 1
+            new_zi.append(np.zeros(L, dtype=np.float64))
+
+        # If we have no current filters, just swap in (no xfade needed)
+        if not self._vectorized_filters:
+            self._vectorized_filters = new_filters
+            self._vec_zi = new_zi
+            self._xfade_remaining = 0
+            return
+
+        # Otherwise, schedule a crossfade
+        self._pending_filters = new_filters
+        self._pending_zi = new_zi
+        # Keep current filters running; blend over _xfade_samples at output
+        self._xfade_remaining = max(self._xfade_samples, 1)
+    
+    def _prime_state(self, first_sample_value: float = 0.0):
+        """Prime zi to steady-state using the first sample to avoid startup thump."""
+        if not self._vectorized_filters:
+            return
+        zis = []
         for b, a in self._vectorized_filters:
-            y = sps.lfilter(b, a, y).astype(np.float32)
-        
-        return y
+            try:
+                zi = lfilter_zi(b, a) * float(first_sample_value)
+            except Exception:
+                L = max(len(a), len(b)) - 1
+                zi = np.zeros(L, dtype=np.float64)
+            zis.append(zi)
+        self._vec_zi = zis
+    
+    def process_block_vectorized(self, x: np.ndarray) -> np.ndarray:
+        """Stateful, block-based EQ with smooth coefficient updates."""
+        if not self._vectorized_filters:
+            # Ensure we have something; fall back to passthrough
+            return x.astype(np.float32, copy=True)
+
+        # Prime state on first block or after EQ enable/seek to avoid thump
+        if self._needs_priming and len(x) > 0:
+            self._prime_state(float(x[0]))
+            self._needs_priming = False
+
+        # Always work in float64 internally for IIR stability; cast back at end
+        xin = x.astype(np.float64, copy=False)
+
+        def run_chain(xin, filters, zi_list):
+            y = xin
+            # Update zi per stage
+            for i, (b, a) in enumerate(filters):
+                if i >= len(zi_list) or zi_list[i] is None:
+                    L = max(len(a), len(b)) - 1
+                    zi_list[i] = np.zeros(L, dtype=np.float64)
+                y, zi_list[i] = sps.lfilter(b, a, y, zi=zi_list[i])
+            return y
+
+        # Case 1: no pending change — just run the current chain
+        if self._pending_filters is None or self._xfade_remaining <= 0:
+            y = run_chain(xin, self._vectorized_filters, self._vec_zi)
+            return y.astype(np.float32)
+
+        # Case 2: we are in a crossfade window — run both chains and blend
+        n = len(xin)
+        # Split the block into (xfade part) + (steady part) if needed
+        nxf = min(self._xfade_remaining, n)
+
+        # Prepare per-block zi copies so we don't corrupt long-term state while blending
+        vec_zi_tmp = [zi.copy() if zi is not None else None for zi in self._vec_zi]
+        pend_zi_tmp = [zi.copy() if zi is not None else None for zi in self._pending_zi]
+
+        # First, run whole block through both chains (on temp zi)
+        y_old = run_chain(xin, self._vectorized_filters, vec_zi_tmp)
+        y_new = run_chain(xin, self._pending_filters,   pend_zi_tmp)
+
+        # Crossfade for the first nxf samples
+        if nxf > 0:
+            w = np.linspace(0.0, 1.0, nxf, dtype=np.float64)  # 0→1
+            y = y_old.copy()
+            y[:nxf] = (1.0 - w) * y_old[:nxf] + w * y_new[:nxf]
+            # For the remainder (if any), use y_new
+            if nxf < n:
+                y[nxf:] = y_new[nxf:]
+            self._xfade_remaining -= nxf
+        else:
+            y = y_new
+
+        # Commit the temp zi of the appropriate chain to become the new long-term state:
+        if self._xfade_remaining <= 0:
+            # Crossfade finished — adopt new filters and their end-of-block zi
+            self._vectorized_filters = self._pending_filters
+            self._vec_zi = pend_zi_tmp
+            self._pending_filters = None
+            self._pending_zi = None
+        else:
+            # In the middle of a fade — advance both chains' zi so next block continues correctly
+            self._vec_zi = vec_zi_tmp
+            self._pending_zi = pend_zi_tmp
+
+        return y.astype(np.float32)
     
     def reset(self):
         """Reset all filter states"""
@@ -356,6 +452,14 @@ class ThreeBandEQ:
         self.mid_filter2.reset()
         self.low_filter.reset()
         self.low_filter2.reset()
+        
+        # Reset vectorized filter states
+        if hasattr(self, '_vec_zi'):
+            self._vec_zi.clear()
+        if hasattr(self, '_pending_zi'):
+            self._pending_zi = None
+        # Prime state after reset to avoid thump
+        self._needs_priming = True
 
 class FixedBeatViewer:
     def __init__(self, master_window, initial_filepath=None):
@@ -418,6 +522,7 @@ class FixedBeatViewer:
         self.eq_mid_gain = 1.0
         self.eq_low_gain = 1.0
         self.eq_filters = None
+        self._eq_debounce_id = None  # For debouncing rapid slider changes
         
         # Stem State
         self.stems_available = False
@@ -1042,6 +1147,8 @@ class FixedBeatViewer:
             # Initialize EQ processor
             self.eq_filters = ThreeBandEQ(self.sample_rate)
             self._update_eq_from_sliders()
+            # Prime state to avoid thump on first block
+            self.eq_filters._needs_priming = True
             logger.info("EQ enabled")
         else:
             self.eq_filters = None
@@ -1049,26 +1156,39 @@ class FixedBeatViewer:
         
         self._update_status(f"EQ {'enabled' if self.eq_enabled else 'disabled'}", "orange")
     
+    def _on_eq_slider_change(self, *_):
+        """Debounce rapid EQ slider changes to reduce crossfade frequency"""
+        if self._eq_debounce_id is not None:
+            self.master.after_cancel(self._eq_debounce_id)
+        # Recompute filters after 20ms of inactivity (~50Hz max update rate)
+        self._eq_debounce_id = self.master.after(20, self._apply_eq_slider_now)
+    
+    def _apply_eq_slider_now(self):
+        """Apply debounced EQ slider changes"""
+        self._eq_debounce_id = None
+        if self.eq_filters:
+            self._update_eq_from_sliders()  # Existing method that calls _compute_vectorized_coefficients()
+    
     def _on_eq_high_change(self, value):
         """Handle high EQ slider change"""
         gain_db = float(value)
         self.eq_high_display.config(text=f"{gain_db:+.1f}dB")
         if self.eq_enabled and self.eq_filters:
-            self._update_eq_from_sliders()
+            self._on_eq_slider_change()  # Debounced update
     
     def _on_eq_mid_change(self, value):
         """Handle mid EQ slider change"""
         gain_db = float(value)
         self.eq_mid_display.config(text=f"{gain_db:+.1f}dB")
         if self.eq_enabled and self.eq_filters:
-            self._update_eq_from_sliders()
+            self._on_eq_slider_change()  # Debounced update
     
     def _on_eq_low_change(self, value):
         """Handle low EQ slider change"""
         gain_db = float(value)
         self.eq_low_display.config(text=f"{gain_db:+.1f}dB")
         if self.eq_enabled and self.eq_filters:
-            self._update_eq_from_sliders()
+            self._on_eq_slider_change()  # Debounced update
     
     def _update_eq_from_sliders(self):
         """Update EQ filters from slider values"""
@@ -1521,6 +1641,10 @@ class FixedBeatViewer:
                 self.stretch_read_pos = 0
                 self.stretch_input_pos = target_frame  # Reset input position to seek target
                 logger.debug(f"Reset pitch buffers after seek to frame {target_frame}")
+            
+            # Prime EQ state after seek to avoid thump
+            if self.eq_enabled and self.eq_filters:
+                self.eq_filters._needs_priming = True
             
             # Update position display immediately
             self._update_position_display()
