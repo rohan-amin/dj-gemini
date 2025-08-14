@@ -461,6 +461,280 @@ class ThreeBandEQ:
         # Prime state after reset to avoid thump
         self._needs_priming = True
 
+class ToneEQ3:
+    """
+    Serial 3-band tone EQ: low shelf, mid peaking, high shelf.
+    - Stateful across blocks (per-stage zi)
+    - Smooth parameter updates via short crossfade (default 10 ms)
+    - Designed for per-stem shaping (not a kill EQ)
+    """
+    def __init__(self, sample_rate: int, xfade_ms: float = 10.0):
+        self.sr = int(sample_rate)
+        self._xfade = int(max(1, xfade_ms * 1e-3 * self.sr))
+        self._left = 0
+        self._cur = self._design(0.0, 0.0, 0.0, 200, 1000, 0.7, 4000)
+        self._pend = None
+
+    def set_params_db(self, low_db: float, mid_db: float, high_db: float,
+                      f_low: float = 200, f_mid: float = 1000, q_mid: float = 0.7, f_high: float = 4000):
+        self._pend = self._design(low_db, mid_db, high_db, f_low, f_mid, q_mid, f_high)
+        self._left = self._xfade
+
+    def process_block(self, x: np.ndarray) -> np.ndarray:
+        xin = x.astype(np.float64, copy=False).reshape(-1)
+        if self._pend is not None and self._left > 0:
+            n = len(xin); nxf = min(self._left, n)
+            y0 = self._run(xin, self._cur, copy_state=True)
+            y1 = self._run(xin, self._pend, copy_state=True)
+            if nxf > 0:
+                w = np.linspace(0.0, 1.0, nxf, dtype=np.float64)
+                y = y0.copy()
+                y[:nxf] = (1.0 - w) * y0[:nxf] + w * y1[:nxf]
+                if nxf < n: y[nxf:] = y1[nxf:]
+                self._left -= nxf
+            else:
+                y = y1
+            if self._left <= 0:
+                self._cur = self._pend; self._pend = None
+        else:
+            y = self._run(xin, self._cur, copy_state=False)
+        return y.astype(np.float32).reshape(-1, 1)
+
+    # ---- internals ----
+    def _design(self, low_db, mid_db, high_db, f_low, f_mid, q_mid, f_high):
+        def shelf_low(db, fc):
+            A = 10**(db/40.0)
+            w0 = 2*np.pi*fc/self.sr; cosw = np.cos(w0); sinw = np.sin(w0)
+            S = np.sqrt(2)
+            alpha = sinw/2*np.sqrt((A+1/A)*(1/S -1)+2)
+            b0 =    A*((A+1) - (A-1)*cosw + 2*np.sqrt(A)*alpha)
+            b1 =  2*A*((A-1) - (A+1)*cosw)
+            b2 =    A*((A+1) - (A-1)*cosw - 2*np.sqrt(A)*alpha)
+            a0 =        (A+1) + (A-1)*cosw + 2*np.sqrt(A)*alpha
+            a1 =   -2*((A-1) + (A+1)*cosw)
+            a2 =        (A+1) + (A-1)*cosw - 2*np.sqrt(A)*alpha
+            return sps.tf2sos([b0/a0,b1/a0,b2/a0],[1.0,a1/a0,a2/a0])
+        def peak(db, fc, Q):
+            A = 10**(db/40.0); w0 = 2*np.pi*fc/self.sr
+            alpha = np.sin(w0)/(2*Q); cosw = np.cos(w0)
+            b0 = 1 + alpha*A; b1 = -2*cosw; b2 = 1 - alpha*A
+            a0 = 1 + alpha/A; a1 = -2*cosw; a2 = 1 - alpha/A
+            return sps.tf2sos([b0/a0,b1/a0,b2/a0],[1.0,a1/a0,a2/a0])
+        def shelf_high(db, fc):
+            A = 10**(db/40.0)
+            w0 = 2*np.pi*fc/self.sr; cosw = np.cos(w0); sinw = np.sin(w0)
+            S = np.sqrt(2)
+            alpha = sinw/2*np.sqrt((A+1/A)*(1/S -1)+2)
+            b0 =    A*((A+1) + (A-1)*cosw + 2*np.sqrt(A)*alpha)
+            b1 = -2*A*((A-1) + (A+1)*cosw)
+            b2 =    A*((A+1) + (A-1)*cosw - 2*np.sqrt(A)*alpha)
+            a0 =        (A+1) - (A-1)*cosw + 2*np.sqrt(A)*alpha
+            a1 =    2*((A-1) - (A+1)*cosw)
+            a2 =        (A+1) - (A-1)*cosw - 2*np.sqrt(A)*alpha
+            return sps.tf2sos([b0/a0,b1/a0,b2/a0],[1.0,a1/a0,a2/a0])
+
+        sosL = shelf_low (low_db,  f_low)
+        sosM = peak      (mid_db,  f_mid, q_mid)
+        sosH = shelf_high(high_db, f_high)
+
+        return {
+            "sos": [sosL, sosM, sosH],
+            "zi":  [sps.sosfilt_zi(sosL)*0.0, sps.sosfilt_zi(sosM)*0.0, sps.sosfilt_zi(sosH)*0.0]
+        }
+
+    def _run(self, xin: np.ndarray, cfg: dict, copy_state: bool) -> np.ndarray:
+        y = xin
+        for i, sos in enumerate(cfg["sos"]):
+            zi = cfg["zi"][i].copy() if copy_state else cfg["zi"][i]
+            y, zi = sps.sosfilt(sos, y, zi=zi)
+            if not copy_state:
+                cfg["zi"][i] = zi
+        return y
+
+class IsolatorEQ:
+    """
+    DJ-style master isolator:
+      - Parallel bands split by Linkwitz–Riley 24 dB/oct crossovers (LR4)
+      - Per-band linear gains (0.0 = kill)
+      - Persistent zi state; crossfaded coefficient updates (default 20 ms)
+    """
+    def __init__(self, sample_rate: int, f_lo: float = 200.0, f_hi: float = 2000.0, xfade_ms: float = 20.0):
+        self.sr = int(sample_rate)
+        self.f_lo = float(f_lo)
+        self.f_hi = float(f_hi)
+        self.g_low = 1.0; self.g_mid = 1.0; self.g_high = 1.0
+
+        self._xfade = int(max(1, xfade_ms * 1e-3 * self.sr))
+        self._left = 0
+        self._pending = None
+        
+        # Wet/dry crossfading for clickless ON/OFF toggle
+        self._wet = 1.0                  # 1.0 = EQ on (wet), 0.0 = bypass (dry)
+        self._wet_target = 1.0
+        self._wet_left = 0               # samples left in wet/dry crossfade
+        self._wet_xfade = int(0.010 * self.sr)  # 10 ms
+        
+        # Smooth band-gain changes to eliminate zipper noise
+        self._g = np.array([1.0, 1.0, 1.0], dtype=np.float64)   # smoothed gains L/M/H
+        self._gt = np.array([1.0, 1.0, 1.0], dtype=np.float64)  # targets
+        self._g_alpha = np.exp(-1.0 / (0.005 * self.sr))        # ~5 ms time constant
+
+        # current filters (sos) and zi
+        self._sos_low_lp  = None; self._zi_low_lp  = None
+        self._sos_mid_hp  = None; self._zi_mid_hp  = None
+        self._sos_mid_lp  = None; self._zi_mid_lp  = None
+        self._sos_high_hp = None; self._zi_high_hp = None
+
+        self._set_filters(self._design(self.f_lo, self.f_hi))
+
+    def set_gains_db(self, low_db: float, mid_db: float, high_db: float):
+        self.g_low  = 0.0 if np.isneginf(low_db)  else 10**(low_db  / 20.0)
+        self.g_mid  = 0.0 if np.isneginf(mid_db)  else 10**(mid_db  / 20.0)
+        self.g_high = 0.0 if np.isneginf(high_db) else 10**(high_db / 20.0)
+        
+        # Update smoothed gain targets
+        self._gt = np.array([self.g_low, self.g_mid, self.g_high], dtype=np.float64)
+
+    def set_kill(self, low=False, mid=False, high=False):
+        if low:  self.g_low  = 0.0
+        if mid:  self.g_mid  = 0.0
+        if high: self.g_high = 0.0
+        
+        # Update smoothed gain targets
+        self._gt = np.array([self.g_low, self.g_mid, self.g_high], dtype=np.float64)
+
+    def set_crossovers(self, f_lo: float, f_hi: float):
+        f_lo = float(f_lo); f_hi = float(f_hi)
+        if f_lo <= 20 or f_hi >= self.sr/2 - 50 or f_lo >= f_hi:
+            return
+        self.f_lo, self.f_hi = f_lo, f_hi
+        self._pending = self._design(self.f_lo, self.f_hi)
+        self._left = self._xfade
+    
+    def set_enabled(self, enabled: bool):
+        """Enable/disable EQ with clickless wet/dry crossfading."""
+        self._wet_target = 1.0 if enabled else 0.0
+        self._wet_left = self._wet_xfade
+
+    def process_block(self, x: np.ndarray) -> np.ndarray:
+        """x: (N,) or (N,1) -> (N,1) float32, clickless."""
+        xin = x[:, 0] if (x.ndim == 2 and x.shape[1] == 1) else x
+        xin = xin.astype(np.float64, copy=False)
+
+        # Smooth gains sample-by-sample to eliminate zipper noise
+        n = len(xin)
+        alpha = self._g_alpha
+        g_traj = np.empty((n, 3), dtype=np.float64)
+        g = self._g.copy()
+        for i in range(n):
+            g = alpha * g + (1 - alpha) * self._gt
+            g_traj[i] = g
+        self._g = g  # keep last value for next block
+
+        if self._pending is not None and self._left > 0:
+            n = len(xin)
+            nxf = min(self._left, n)
+
+            # Run BOTH chains and ADVANCE their states for continuity
+            y_old = self._run_inplace(xin, self._current_dict(), g_traj)
+            y_new = self._run_inplace(xin, self._pending, g_traj)
+
+            if nxf > 0:
+                w = np.linspace(0.0, 1.0, nxf, dtype=np.float64)
+                y = y_old.copy()
+                y[:nxf] = (1.0 - w) * y_old[:nxf] + w * y_new[:nxf]
+                if nxf < n:
+                    y[nxf:] = y_new[nxf:]
+                self._left -= nxf
+            else:
+                y = y_new
+
+            # When fade completes, adopt pending filters as current
+            if self._left <= 0:
+                self._set_filters(self._pending)
+                self._pending = None
+        else:
+            # Normal path: advance current chain state
+            y = self._run_inplace(xin, self._current_dict(), g_traj)
+
+        y = y.astype(np.float32).reshape(-1, 1)
+        np.nan_to_num(y, copy=False)
+        
+        # Wet/dry crossfading for clickless ON/OFF toggle
+        if self._wet_left > 0:
+            n = y.shape[0]
+            nxf = min(self._wet_left, n)
+            if nxf > 0:
+                # linear ramp from current wet to target
+                ramp = np.linspace(self._wet, self._wet_target, nxf, dtype=np.float32).reshape(-1, 1)
+                y[:nxf, 0] = ramp[:, 0] * y[:nxf, 0] + (1.0 - ramp[:, 0]) * xin[:nxf].astype(np.float32)
+                if nxf < n:
+                    y[nxf:, 0] = (self._wet_target * y[nxf:, 0] +
+                                  (1.0 - self._wet_target) * xin[nxf:].astype(np.float32))
+                self._wet = float(ramp[-1, 0])
+                self._wet_left -= nxf
+        else:
+            # fully at target wet or dry
+            if self._wet_target == 0.0:
+                # bypass: return dry
+                y[:, 0] = xin.astype(np.float32)
+            self._wet = self._wet_target
+        
+        return y
+
+    # ---- internals ----
+    def _design(self, f_lo: float, f_hi: float) -> dict:
+        def lr4_low(fc):
+            sos = sps.butter(2, fc, btype='low', fs=self.sr, output='sos'); return np.vstack([sos, sos])
+        def lr4_high(fc):
+            sos = sps.butter(2, fc, btype='high', fs=self.sr, output='sos'); return np.vstack([sos, sos])
+
+        sos_low_lp  = lr4_low(f_lo)
+        sos_mid_hp  = lr4_high(f_lo)
+        sos_mid_lp  = lr4_low(f_hi)
+        sos_high_hp = lr4_high(f_hi)
+
+        return {
+            "low_lp":  (sos_low_lp,  [sps.sosfilt_zi(sos_low_lp ) * 0.0]),
+            "mid_hp":  (sos_mid_hp,  [sps.sosfilt_zi(sos_mid_hp ) * 0.0]),
+            "mid_lp":  (sos_mid_lp,  [sps.sosfilt_zi(sos_mid_lp ) * 0.0]),
+            "high_hp": (sos_high_hp, [sps.sosfilt_zi(sos_high_hp) * 0.0]),
+        }
+
+    def _current_dict(self) -> dict:
+        return {
+            "low_lp":  (self._sos_low_lp,  self._zi_low_lp),
+            "mid_hp":  (self._sos_mid_hp,  self._zi_mid_hp),
+            "mid_lp":  (self._sos_mid_lp,  self._zi_mid_lp),
+            "high_hp": (self._sos_high_hp, self._zi_high_hp),
+        }
+
+    def _set_filters(self, d: dict):
+        (self._sos_low_lp,  self._zi_low_lp)  = d["low_lp"]
+        (self._sos_mid_hp,  self._zi_mid_hp)  = d["mid_hp"]
+        (self._sos_mid_lp,  self._zi_mid_lp)  = d["mid_lp"]
+        (self._sos_high_hp, self._zi_high_hp) = d["high_hp"]
+
+    def _run_inplace(self, xin: np.ndarray, d: dict, g_traj: np.ndarray = None) -> np.ndarray:
+        """Run filter chain in-place, advancing zi stored in dict d."""
+        sos_low_lp,  zi_low_lp  = d["low_lp"]
+        sos_mid_hp,  zi_mid_hp  = d["mid_hp"]
+        sos_mid_lp,  zi_mid_lp  = d["mid_lp"]
+        sos_high_hp, zi_high_hp = d["high_hp"]
+
+        # Advance states IN PLACE (critical to avoid clicks)
+        low,  zi_low_lp[0]  = sps.sosfilt(sos_low_lp,  xin, zi=zi_low_lp[0])
+        midt, zi_mid_hp[0]  = sps.sosfilt(sos_mid_hp,  xin, zi=zi_mid_hp[0])
+        mid,  zi_mid_lp[0]  = sps.sosfilt(sos_mid_lp,  midt, zi=zi_mid_lp[0])
+        high, zi_high_hp[0] = sps.sosfilt(sos_high_hp, xin, zi=zi_high_hp[0])
+
+        # Use time-varying gains if provided, otherwise use fixed gains
+        if g_traj is not None:
+            y = g_traj[:, 0] * low + g_traj[:, 1] * mid + g_traj[:, 2] * high
+        else:
+            y = self.g_low * low + self.g_mid * mid + self.g_high * high
+        return y
+
 class FixedBeatViewer:
     def __init__(self, master_window, initial_filepath=None):
         self.master = master_window
@@ -528,7 +802,6 @@ class FixedBeatViewer:
         self.eq_high_gain = 1.0    # Linear gain (1.0 = 0dB)
         self.eq_mid_gain = 1.0
         self.eq_low_gain = 1.0
-        self.eq_filters = None
         self._eq_debounce_id = None  # For debouncing rapid slider changes
         
         # Stem State
@@ -536,7 +809,25 @@ class FixedBeatViewer:
         self.stem_data = {}  # {'vocals': np.array, 'drums': np.array, ...}
         self.stem_volumes = {'vocals': 1.0, 'drums': 1.0, 'bass': 1.0, 'other': 1.0}
         self.stem_eq_enabled = {'vocals': False, 'drums': False, 'bass': False, 'other': False}
-        self.stem_eq_filters = {}  # stem_name -> ThreeBandEQ instance
+        self.stem_eq_filters = {}  # stem_name -> ThreeBandEQ instance (legacy)
+        
+        # Professional EQ System (per the other AI's design)
+        # Per-stem tone EQs for musical shaping
+        self.stem_tone_eqs = {
+            'vocals': ToneEQ3(self.sample_rate),
+            'drums': ToneEQ3(self.sample_rate),
+            'bass': ToneEQ3(self.sample_rate),
+            'other': ToneEQ3(self.sample_rate)
+        }
+        
+        # Master isolator EQ for frequency isolation and kills
+        self.master_isolator = IsolatorEQ(self.sample_rate, f_lo=200.0, f_hi=2000.0)
+        
+        # EQ enable flags for debugging
+        self.enable_stem_eqs = False  # Disable per-stem EQs for now (has issues)
+        
+        # Master EQ now has clickless ON/OFF toggle
+        self.master_isolator.set_enabled(True)  # Enable with wet/dry crossfading
         
         self._create_ui()
         self._configure_bindings()
@@ -753,7 +1044,13 @@ class FixedBeatViewer:
                                      bg='lightgray', troughcolor='white')
         self.eq_high_slider.pack()
         
-        tk.Label(high_frame, text="KILL", font=('Arial', 8, 'bold'), fg='red').pack()
+        # Kill button for high band
+        self.eq_high_kill_var = tk.BooleanVar(value=False)
+        self.eq_high_kill_btn = tk.Button(high_frame, text="KILL", 
+                                        command=lambda: self._toggle_eq_kill('high'),
+                                        font=('Arial', 8, 'bold'), fg='red', width=6)
+        self.eq_high_kill_btn.pack()
+        
         self.eq_high_display = tk.Label(high_frame, text="0.0dB", 
                                       font=('Arial', 9, 'bold'), fg='red')
         self.eq_high_display.pack()
@@ -779,7 +1076,13 @@ class FixedBeatViewer:
                                     bg='lightgray', troughcolor='white')
         self.eq_mid_slider.pack()
         
-        tk.Label(mid_frame, text="KILL", font=('Arial', 8, 'bold'), fg='red').pack()
+        # Kill button for mid band
+        self.eq_mid_kill_var = tk.BooleanVar(value=False)
+        self.eq_mid_kill_btn = tk.Button(mid_frame, text="KILL", 
+                                       command=lambda: self._toggle_eq_kill('mid'),
+                                       font=('Arial', 8, 'bold'), fg='red', width=6)
+        self.eq_mid_kill_btn.pack()
+        
         self.eq_mid_display = tk.Label(mid_frame, text="0.0dB", 
                                      font=('Arial', 9, 'bold'), fg='green')
         self.eq_mid_display.pack()
@@ -805,7 +1108,13 @@ class FixedBeatViewer:
                                     bg='lightgray', troughcolor='white')
         self.eq_low_slider.pack()
         
-        tk.Label(low_frame, text="KILL", font=('Arial', 8, 'bold'), fg='red').pack()
+        # Kill button for low band
+        self.eq_low_kill_var = tk.BooleanVar(value=False)
+        self.eq_low_kill_btn = tk.Button(low_frame, text="KILL", 
+                                       command=lambda: self._toggle_eq_kill('low'),
+                                       font=('Arial', 8, 'bold'), fg='red', width=6)
+        self.eq_low_kill_btn.pack()
+        
         self.eq_low_display = tk.Label(low_frame, text="0.0dB", 
                                      font=('Arial', 9, 'bold'), fg='blue')
         self.eq_low_display.pack()
@@ -1218,14 +1527,13 @@ class FixedBeatViewer:
         self.eq_enabled = self.eq_enabled_var.get()
         
         if self.eq_enabled and self.file_loaded:
-            # Initialize EQ processor
-            self.eq_filters = ThreeBandEQ(self.sample_rate)
+            # Enable master isolator EQ with wet/dry crossfading
+            self.master_isolator.set_enabled(True)
             self._update_eq_from_sliders()
-            # Prime state to avoid thump on first block
-            self.eq_filters._needs_priming = True
             logger.info("EQ enabled")
         else:
-            self.eq_filters = None
+            # Disable master isolator EQ with wet/dry crossfading
+            self.master_isolator.set_enabled(False)
             logger.info("EQ disabled")
         
         self._update_status(f"EQ {'enabled' if self.eq_enabled else 'disabled'}", "orange")
@@ -1240,38 +1548,39 @@ class FixedBeatViewer:
     def _apply_eq_slider_now(self):
         """Apply debounced EQ slider changes"""
         self._eq_debounce_id = None
-        if self.eq_filters:
-            self._update_eq_from_sliders()  # Existing method that calls _compute_vectorized_coefficients()
+        # Always apply slider changes to master isolator
+        self._update_eq_from_sliders()
     
     def _on_eq_high_change(self, value):
         """Handle high EQ slider change"""
         gain_db = float(value)
         self.eq_high_display.config(text=f"{gain_db:+.1f}dB")
-        if self.eq_enabled and self.eq_filters:
+        if self.eq_enabled:
             self._on_eq_slider_change()  # Debounced update
     
     def _on_eq_mid_change(self, value):
         """Handle mid EQ slider change"""
         gain_db = float(value)
         self.eq_mid_display.config(text=f"{gain_db:+.1f}dB")
-        if self.eq_enabled and self.eq_filters:
+        if self.eq_enabled:
             self._on_eq_slider_change()  # Debounced update
     
     def _on_eq_low_change(self, value):
         """Handle low EQ slider change"""
         gain_db = float(value)
         self.eq_low_display.config(text=f"{gain_db:+.1f}dB")
-        if self.eq_enabled and self.eq_filters:
+        if self.eq_enabled:
             self._on_eq_slider_change()  # Debounced update
     
     def _update_eq_from_sliders(self):
         """Update EQ filters from slider values"""
-        if self.eq_filters:
-            high_db = self.eq_high_var.get()
-            mid_db = self.eq_mid_var.get()
-            low_db = self.eq_low_var.get()
-            self.eq_filters.set_gains(high_db, mid_db, low_db)
-            logger.debug(f"EQ updated: H={high_db:+.1f}dB, M={mid_db:+.1f}dB, L={low_db:+.1f}dB")
+        high_db = self.eq_high_var.get()
+        mid_db = self.eq_mid_var.get()
+        low_db = self.eq_low_var.get()
+        
+        # Update master isolator EQ with smooth gain changes
+        self.master_isolator.set_gains_db(low_db, mid_db, high_db)
+        logger.debug(f"Master EQ updated: H={high_db:+.1f}dB, M={mid_db:+.1f}dB, L={low_db:+.1f}dB")
     
     def _reset_eq(self):
         """Reset all EQ sliders to 0dB"""
@@ -1283,8 +1592,18 @@ class FixedBeatViewer:
         self.eq_mid_display.config(text="0.0dB")
         self.eq_low_display.config(text="0.0dB")
         
-        if self.eq_enabled and self.eq_filters:
-            self.eq_filters.set_gains(0.0, 0.0, 0.0)
+        # Reset all kill switches
+        self.eq_high_kill_var.set(False)
+        self.eq_mid_kill_var.set(False)
+        self.eq_low_kill_var.set(False)
+        
+        self.eq_high_kill_btn.config(bg='SystemButtonFace')
+        self.eq_mid_kill_btn.config(bg='SystemButtonFace')
+        self.eq_low_kill_btn.config(bg='SystemButtonFace')
+        
+        # Reset master isolator EQ to flat
+        self.master_isolator.set_gains_db(0.0, 0.0, 0.0)
+        self.master_isolator.set_kill(False, False, False)
         
         self._update_status("EQ reset to flat", "orange")
     
@@ -1293,18 +1612,54 @@ class FixedBeatViewer:
         if band == 'high':
             self.eq_high_var.set(0.0)
             self.eq_high_display.config(text="0.0dB")
+            self.eq_high_kill_var.set(False)
+            self.eq_high_kill_btn.config(bg='SystemButtonFace')
         elif band == 'mid':
             self.eq_mid_var.set(0.0)
             self.eq_mid_display.config(text="0.0dB")
+            self.eq_mid_kill_var.set(False)
+            self.eq_mid_kill_btn.config(bg='SystemButtonFace')
         elif band == 'low':
             self.eq_low_var.set(0.0)
             self.eq_low_display.config(text="0.0dB")
+            self.eq_low_kill_var.set(False)
+            self.eq_low_kill_btn.config(bg='SystemButtonFace')
         
-        # Update EQ filters
-        if self.eq_enabled and self.eq_filters:
-            self._update_eq_from_sliders()
+        # Update all EQ filters and kill switches
+        self._update_eq_from_sliders()
+        self._update_eq_kill_switches()
         
         self._update_status(f"EQ {band} band reset", "orange")
+    
+    def _toggle_eq_kill(self, band):
+        """Toggle kill switch for individual EQ band"""
+        if band == 'high':
+            kill_active = not self.eq_high_kill_var.get()
+            self.eq_high_kill_var.set(kill_active)
+            self.eq_high_kill_btn.config(bg='red' if kill_active else 'SystemButtonFace')
+        elif band == 'mid':
+            kill_active = not self.eq_mid_kill_var.get()
+            self.eq_mid_kill_var.set(kill_active)
+            self.eq_mid_kill_btn.config(bg='red' if kill_active else 'SystemButtonFace')
+        elif band == 'low':
+            kill_active = not self.eq_low_kill_var.get()
+            self.eq_low_kill_var.set(kill_active)
+            self.eq_low_kill_btn.config(bg='red' if kill_active else 'SystemButtonFace')
+        else:
+            return
+        
+        # Apply all current kill switch states to master isolator
+        self._update_eq_kill_switches()
+        
+        self._update_status(f"EQ {band} band {'killed' if kill_active else 'restored'}", "orange")
+    
+    def _update_eq_kill_switches(self):
+        """Update master isolator with current kill switch states"""
+        low_kill = self.eq_low_kill_var.get()
+        mid_kill = self.eq_mid_kill_var.get()
+        high_kill = self.eq_high_kill_var.get()
+        
+        self.master_isolator.set_kill(low_kill, mid_kill, high_kill)
     
     def _get_stems_cache_dir(self, audio_filepath):
         """Get the stems cache directory for an audio file using config"""
@@ -1719,9 +2074,7 @@ class FixedBeatViewer:
                 self.stretch_input_pos = target_frame  # Reset input position to seek target
                 logger.debug(f"Reset pitch buffers after seek to frame {target_frame}")
             
-            # Prime EQ state after seek to avoid thump
-            if self.eq_enabled and self.eq_filters:
-                self.eq_filters._needs_priming = True
+            # EQ state handled automatically by master_isolator
             
             # Update position display immediately
             self._update_position_display()
@@ -1933,12 +2286,20 @@ class FixedBeatViewer:
             
             # Get audio chunk with proper channel handling
             if self.stems_available and self.stem_data:
-                # Mix stems for this chunk
+                # Mix stems for this chunk with per-stem EQ processing
                 input_chunk = np.zeros(chunk_size, dtype=np.float32)
                 for stem_name, stem_audio in self.stem_data.items():
                     if current_pos + chunk_size <= len(stem_audio):
-                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        # Get raw stem chunk
                         stem_chunk = stem_audio[current_pos:current_pos + chunk_size]
+                        
+                        # Apply per-stem tone EQ (ToneEQ3) - optional for debugging
+                        if self.enable_stem_eqs and stem_name in self.stem_tone_eqs:
+                            stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                            stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                        
+                        # Apply stem volume
+                        volume = self.stem_volumes.get(stem_name, 1.0)
                         input_chunk += stem_chunk * volume
             else:
                 # Use original audio if no stems available
@@ -2196,9 +2557,8 @@ class FixedBeatViewer:
     def _process_eq(self, outdata, frames):
         """Apply EQ processing to audio buffer"""
         try:
-            # Process entire block through EQ (vectorized for performance)
-            if self.eq_enabled and self.eq_filters:
-                outdata[:frames, 0] = self.eq_filters.process_block_vectorized(outdata[:frames, 0])
+            # EQ processing handled by master_isolator in main processing chain
+            pass
         except Exception as e:
             # Set error flag instead of logging in processing thread
             self._producer_error = f"EQ processing error: {e}"
@@ -2347,13 +2707,21 @@ class FixedBeatViewer:
             if chunk_size <= 0:
                 return None
 
-            # Get audio chunk with stem mixing
+            # Get audio chunk with stem mixing and per-stem EQ processing
             if self.stems_available and self.stem_data:
                 input_chunk = np.zeros(chunk_size, dtype=np.float32)
                 for stem_name, stem_audio in self.stem_data.items():
                     if self.stretch_input_pos + chunk_size <= len(stem_audio):
-                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        # Get raw stem chunk
                         stem_chunk = stem_audio[self.stretch_input_pos:self.stretch_input_pos + chunk_size]
+                        
+                        # Apply per-stem tone EQ (ToneEQ3) - optional for debugging
+                        if self.enable_stem_eqs and stem_name in self.stem_tone_eqs:
+                            stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                            stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                        
+                        # Apply stem volume
+                        volume = self.stem_volumes.get(stem_name, 1.0)
                         input_chunk += stem_chunk * volume
             else:
                 if len(self.audio_data.shape) == 1:
@@ -2474,9 +2842,7 @@ class FixedBeatViewer:
                 else:
                     chunk_out = full_output
                     
-                # Apply EQ (vectorized for performance)
-                if self.eq_enabled and self.eq_filters:
-                    chunk_out = self.eq_filters.process_block_vectorized(chunk_out)
+                # EQ processing handled by master_isolator in main processing chain
                 
                 # Safety sanitization
                 np.nan_to_num(chunk_out, copy=False)
@@ -2486,6 +2852,16 @@ class FixedBeatViewer:
                 
                 # Update position for UI thread - use input position for accurate beat tracking
                 self._audio_position = float(self.stretch_input_pos)
+                
+                # Apply master isolator EQ processing (with clickless ON/OFF)
+                try:
+                    chunk_out_eq = self.master_isolator.process_block(chunk_out)
+                    chunk_out = chunk_out_eq.flatten()  # Convert (N,1) back to (N,)
+                except Exception as e:
+                    # Log error but don't crash audio processing
+                    if not hasattr(self, '_eq_error_logged'):
+                        logger.error(f"Master EQ processing error: {e}")
+                        self._eq_error_logged = True
                 
                 # Format for ring buffer output channels
                 if self.device_output_channels == 1:
@@ -2537,9 +2913,15 @@ class FixedBeatViewer:
         # Update position for UI thread
         self._audio_position = self.playback_position
 
-        # Apply EQ if enabled (vectorized for performance)
-        if self.eq_enabled and self.eq_filters:
-            out = self.eq_filters.process_block_vectorized(out)
+        # Apply master isolator EQ processing (with clickless ON/OFF)
+        try:
+            out_eq = self.master_isolator.process_block(out)
+            out = out_eq.flatten()  # Convert (N,1) back to (N,)
+        except Exception as e:
+            # Log error but don't crash audio processing
+            if not hasattr(self, '_eq_error_logged_tb'):
+                logger.error(f"Master EQ processing error (turntable): {e}")
+                self._eq_error_logged_tb = True
 
         np.nan_to_num(out, copy=False)
         
