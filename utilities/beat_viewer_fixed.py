@@ -481,6 +481,10 @@ class ToneEQ3:
         self._left = self._xfade
 
     def process_block(self, x: np.ndarray) -> np.ndarray:
+        # Check if EQ is flat (all gains near 0dB) - bypass processing if so
+        if self._is_flat():
+            return x.astype(np.float32).reshape(-1, 1)
+        
         xin = x.astype(np.float64, copy=False).reshape(-1)
         if self._pend is not None and self._left > 0:
             n = len(xin); nxf = min(self._left, n)
@@ -499,6 +503,16 @@ class ToneEQ3:
         else:
             y = self._run(xin, self._cur, copy_state=False)
         return y.astype(np.float32).reshape(-1, 1)
+    
+    def _is_flat(self) -> bool:
+        """Check if current EQ settings are effectively flat (bypass worthy)"""
+        # Temporarily disable bypass to debug stem EQ
+        return False
+        # Check current configuration for flat response
+        if 'gains' not in self._cur:
+            return True
+        gains = self._cur['gains']  # [low_db, mid_db, high_db]
+        return all(abs(gain) < 0.01 for gain in gains)  # All gains within 0.01dB of flat
 
     # ---- internals ----
     def _design(self, low_db, mid_db, high_db, f_low, f_mid, q_mid, f_high):
@@ -539,7 +553,8 @@ class ToneEQ3:
 
         return {
             "sos": [sosL, sosM, sosH],
-            "zi":  [sps.sosfilt_zi(sosL)*0.0, sps.sosfilt_zi(sosM)*0.0, sps.sosfilt_zi(sosH)*0.0]
+            "zi":  [sps.sosfilt_zi(sosL)*0.0, sps.sosfilt_zi(sosM)*0.0, sps.sosfilt_zi(sosH)*0.0],
+            "gains": [low_db, mid_db, high_db]  # Store gains for bypass check
         }
 
     def _run(self, xin: np.ndarray, cfg: dict, copy_state: bool) -> np.ndarray:
@@ -824,7 +839,8 @@ class FixedBeatViewer:
         self.master_isolator = IsolatorEQ(self.sample_rate, f_lo=200.0, f_hi=2000.0)
         
         # EQ enable flags for debugging
-        self.enable_stem_eqs = False  # Disable per-stem EQs for now (has issues)
+        self.enable_stem_eqs = True   # Test with the fix
+        self._last_stem_eq_update = None  # Debug: track last EQ update
         
         # Master EQ now has clickless ON/OFF toggle
         self.master_isolator.set_enabled(True)  # Enable with wet/dry crossfading
@@ -1961,7 +1977,7 @@ class FixedBeatViewer:
             self.stem_eq_displays[stem_name][eq_band].config(text=f"{gain_db:+.1f}dB")
         
         # Update the stem's EQ filter - but only if stem EQ is enabled
-        if stem_name in self.stem_eq_filters:
+        if stem_name in self.stem_tone_eqs:
             # Only apply EQ changes if this stem's EQ is enabled
             if self.stem_eq_enabled.get(stem_name, False):
                 # Get current values for all bands
@@ -1969,12 +1985,16 @@ class FixedBeatViewer:
                 mid_db = self.stem_eq_mid_vars[stem_name].get() if stem_name in self.stem_eq_mid_vars else 0.0
                 low_db = self.stem_eq_low_vars[stem_name].get() if stem_name in self.stem_eq_low_vars else 0.0
                 
-                # Update the filter with all three band values
-                self.stem_eq_filters[stem_name].set_gains(high_db, mid_db, low_db)
+                # Update the ToneEQ3 filter with all three band values
+                if stem_name in self.stem_tone_eqs:
+                    self.stem_tone_eqs[stem_name].set_params_db(low_db, mid_db, high_db)
+                    # DEBUG: prove updates are applied
+                    self._last_stem_eq_update = (stem_name, float(low_db), float(mid_db), float(high_db))
                 logger.debug(f"{stem_name} EQ updated: H={high_db:+.1f}dB, M={mid_db:+.1f}dB, L={low_db:+.1f}dB")
             else:
                 # Keep at passthrough if disabled (sliders can move but EQ stays at 0dB)
-                self.stem_eq_filters[stem_name].set_gains(0.0, 0.0, 0.0)
+                if stem_name in self.stem_tone_eqs:
+                    self.stem_tone_eqs[stem_name].set_params_db(0.0, 0.0, 0.0)
                 logger.debug(f"{stem_name} EQ disabled - staying at passthrough")
     
     def _reset_stem_eq(self, stem_name):
@@ -1994,8 +2014,8 @@ class FixedBeatViewer:
                     self.stem_eq_displays[stem_name][band].config(text="0.0dB")
         
         # Update filter
-        if stem_name in self.stem_eq_filters:
-            self.stem_eq_filters[stem_name].set_gains(0.0, 0.0, 0.0)
+        if stem_name in self.stem_tone_eqs:
+            self.stem_tone_eqs[stem_name].set_params_db(0.0, 0.0, 0.0)
         
         self._update_status(f"{stem_name.title()} EQ reset", "orange")
     
@@ -2134,6 +2154,13 @@ class FixedBeatViewer:
                 self._in_audio_callback = True
                 
                 try:
+                    # Debug: count audio callback calls
+                    if not hasattr(self, '_audio_callback_count'):
+                        self._audio_callback_count = 0
+                    self._audio_callback_count += 1
+                    if self._audio_callback_count % 100 == 0:  # Log every 100 calls
+                        logger.debug(f"🔊 AUDIO CALLBACK: call #{self._audio_callback_count}, requesting {frames} frames")
+                    
                     # No logging/UI here; set flags only
                     if status:
                         self._had_underflow = True
@@ -2189,7 +2216,21 @@ class FixedBeatViewer:
             for stem_name, stem_audio in self.stem_data.items():
                 vol = float(self.stem_volumes.get(stem_name, 1.0))
                 if pos1 <= len(stem_audio):
-                    src += stem_audio[pos0:pos1] * vol
+                    # Get raw stem chunk
+                    stem_chunk = stem_audio[pos0:pos1]
+                    
+                    # Apply per-stem tone EQ (same logic as pitch-preserving mode)
+                    if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                        self.stem_eq_enabled.get(stem_name, False)):
+                        try:
+                            stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                            stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                        except Exception as e:
+                            logger.warning(f"Turntable stem EQ error for {stem_name}: {e}")
+                            # Continue without stem EQ processing
+                    
+                    # Apply volume and mix
+                    src += stem_chunk * vol
         else:
             src = self.audio_data
 
@@ -2279,6 +2320,7 @@ class FixedBeatViewer:
         try:
             current_pos = self.stretch_input_pos
             chunk_size = self.process_chunk_size
+            logger.info(f"🎵 STREAMING PROCESSING: pos={current_pos}, stems_available={self.stems_available}, enable_stem_eqs={self.enable_stem_eqs}")
             
             # Check bounds
             if current_pos >= len(self.audio_data) - chunk_size:
@@ -2293,10 +2335,16 @@ class FixedBeatViewer:
                         # Get raw stem chunk
                         stem_chunk = stem_audio[current_pos:current_pos + chunk_size]
                         
-                        # Apply per-stem tone EQ (ToneEQ3) - optional for debugging
-                        if self.enable_stem_eqs and stem_name in self.stem_tone_eqs:
-                            stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
-                            stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                        # Apply per-stem tone EQ (ToneEQ3) - check both global and per-stem enable  
+                        if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                            self.stem_eq_enabled.get(stem_name, False)):
+                            try:
+                                original_rms = np.sqrt(np.mean(stem_chunk**2))
+                                stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                                stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                            except Exception as e:
+                                logger.warning(f"Stem EQ error for {stem_name}: {e}")
+                                # Continue without stem EQ processing
                         
                         # Apply stem volume
                         volume = self.stem_volumes.get(stem_name, 1.0)
@@ -2476,6 +2524,7 @@ class FixedBeatViewer:
         try:
             current_pos = self.stretch_input_pos
             chunk_size = self.process_chunk_size
+            logger.info(f"🎵 FALLBACK PROCESSING: pos={current_pos}, stems_available={self.stems_available}, enable_stem_eqs={self.enable_stem_eqs}")
             
             # Drift detection and correction
             expected_buffer_size = self.stretch_buffer_used - self.stretch_read_pos
@@ -2488,13 +2537,27 @@ class FixedBeatViewer:
             if current_pos >= len(self.audio_data) - chunk_size:
                 return
             
-            # Get audio chunk (same as streaming version)
+            # Get audio chunk with stem mixing and per-stem EQ processing
             if self.stems_available and self.stem_data:
                 input_chunk = np.zeros(chunk_size, dtype=np.float32)
                 for stem_name, stem_audio in self.stem_data.items():
                     if current_pos + chunk_size <= len(stem_audio):
-                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        # Get raw stem chunk
                         stem_chunk = stem_audio[current_pos:current_pos + chunk_size]
+                        
+                        # Apply per-stem tone EQ (ToneEQ3) - check both global and per-stem enable  
+                        if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                            self.stem_eq_enabled.get(stem_name, False)):
+                            try:
+                                original_rms = np.sqrt(np.mean(stem_chunk**2))
+                                stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                                stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                            except Exception as e:
+                                logger.warning(f"Fallback stem EQ error for {stem_name}: {e}")
+                                # Continue without stem EQ processing
+                        
+                        # Apply stem volume
+                        volume = self.stem_volumes.get(stem_name, 1.0)
                         input_chunk += stem_chunk * volume
             else:
                 input_chunk = self.audio_data[current_pos:current_pos + chunk_size]
@@ -2631,19 +2694,98 @@ class FixedBeatViewer:
         """Start the producer thread to fill ring buffer"""
         t = threading.Thread(target=self._producer_loop, daemon=True)
         t.start()
+    
+    def _produce_chunk_turntable(self, target_frames):
+        """Produce audio chunk without pitch preservation (turntable style)"""
+        logger.info(f"🎵 TURNTABLE CHUNK: target_frames={target_frames}")
+        try:
+            # Get current playback position
+            current_pos = int(self.current_frame)
+            logger.info(f"TURNTABLE DEBUG: current_pos={current_pos}, stems_available={self.stems_available}, enable_stem_eqs={self.enable_stem_eqs}")
+            
+            # Check bounds
+            if current_pos >= len(self.audio_data) - target_frames:
+                return np.zeros((target_frames, 1), dtype=np.float32)
+            
+            # Process with stem EQ
+            if self.stems_available and self.stem_data:
+                input_chunk = np.zeros(target_frames, dtype=np.float32)
+                for stem_name, stem_audio in self.stem_data.items():
+                    if current_pos + target_frames <= len(stem_audio):
+                        # Get raw stem chunk
+                        stem_chunk = stem_audio[current_pos:current_pos + target_frames]
+                        
+                        # Apply per-stem tone EQ (check both global and per-stem enable)
+                        if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                            self.stem_eq_enabled.get(stem_name, False)):
+                            try:
+                                stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                                stem_chunk = stem_chunk_eq.flatten()
+                            except Exception as e:
+                                logger.warning(f"Turntable stem EQ error for {stem_name}: {e}")
+                        
+                        # Apply stem volume and mix
+                        volume = self.stem_volumes.get(stem_name, 1.0)
+                        input_chunk += stem_chunk * volume
+                
+                # Update position
+                self.current_frame = current_pos + target_frames
+            else:
+                # No stems - use original audio
+                input_chunk = self.audio_data[current_pos:current_pos + target_frames]
+                self.current_frame = current_pos + target_frames
+            
+            # Apply master isolator EQ
+            if self.master_isolator:
+                input_chunk_eq = self.master_isolator.process_block(input_chunk)
+                input_chunk = input_chunk_eq.flatten()
+            
+            return input_chunk.reshape(-1, 1)
+            
+        except Exception as e:
+            logger.error(f"Turntable chunk error: {e}")
+            return np.zeros((target_frames, 1), dtype=np.float32)
+        
+    def _produce_chunk_rubberband(self, target_frames):
+        """Produce audio chunk with RubberBand pitch preservation"""  
+        logger.info(f"🎵 RUBBERBAND CHUNK: target_frames={target_frames}")
+        try:
+            # Process more audio with stem EQ if buffer is running low
+            samples_available = self.stretch_buffer_used - self.stretch_read_pos
+            if samples_available < target_frames:
+                self._process_more_audio_streaming()  # This processes stems with EQ
+                samples_available = self.stretch_buffer_used - self.stretch_read_pos
+            
+            # Read from the processed buffer
+            if samples_available >= target_frames:
+                chunk = self.stretch_processed_audio[self.stretch_read_pos:self.stretch_read_pos + target_frames]
+                self.stretch_read_pos += target_frames
+                return chunk.reshape(-1, 1)
+            else:
+                # Not enough audio - return zeros
+                return np.zeros((target_frames, 1), dtype=np.float32)
+                
+        except Exception as e:
+            logger.error(f"RubberBand chunk error: {e}")
+            return np.zeros((target_frames, 1), dtype=np.float32)
 
     def _producer_loop(self):
         """Continuously fill out_ring with processed audio."""
+        logger.info("🎵 PRODUCER LOOP STARTED")
         TARGET_BLOCK = 8192  # frames per chunk we produce
-        WATERMARK = self.sample_rate // 2  # keep ~0.5s ahead
+        WATERMARK = self.sample_rate // 8  # Much smaller watermark for debugging
 
         while not self._producer_stop and self.is_playing:
             try:
                 # Dynamic backoff for producer pacing (Issue #7)
-                backoff = 0.002 if self.out_ring.available_data() > WATERMARK else 0.0
+                available_data = self.out_ring.available_data()
+                backoff = 0.002 if available_data > WATERMARK else 0.0
                 if backoff:
+                    logger.debug(f"🎵 RING BUFFER FULL: available={available_data}, watermark={WATERMARK} - backing off")
                     time.sleep(backoff)
                     continue
+                
+                logger.debug(f"🎵 PROCEEDING WITH CHUNK PRODUCTION: available_data={available_data}, watermark={WATERMARK}")
 
                 # Compute a chunk (choose one path) - check variables safely
                 # Check current RubberBand state and pending operations
@@ -2660,6 +2802,8 @@ class FixedBeatViewer:
                 use_rubberband = (RUBBERBAND_STREAMING_AVAILABLE and 
                                 hasattr(self, 'preserve_pitch_var') and self.preserve_pitch_var.get() and
                                 (has_active_rb or has_pending_rb_ops))
+                
+                logger.debug(f"🎵 PRODUCER PATH: use_rubberband={use_rubberband}, pitch_enabled={getattr(self, 'preserve_pitch_var', None) and self.preserve_pitch_var.get()}")
                 
                 if use_rubberband:
                     chunk = self._produce_chunk_rubberband(TARGET_BLOCK)  # see 3C
@@ -2715,10 +2859,16 @@ class FixedBeatViewer:
                         # Get raw stem chunk
                         stem_chunk = stem_audio[self.stretch_input_pos:self.stretch_input_pos + chunk_size]
                         
-                        # Apply per-stem tone EQ (ToneEQ3) - optional for debugging
-                        if self.enable_stem_eqs and stem_name in self.stem_tone_eqs:
-                            stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
-                            stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                        # Apply per-stem tone EQ (ToneEQ3) - check both global and per-stem enable  
+                        if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                            self.stem_eq_enabled.get(stem_name, False)):
+                            try:
+                                original_rms = np.sqrt(np.mean(stem_chunk**2))
+                                stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
+                                stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
+                            except Exception as e:
+                                logger.warning(f"Stem EQ error for {stem_name}: {e}")
+                                # Continue without stem EQ processing
                         
                         # Apply stem volume
                         volume = self.stem_volumes.get(stem_name, 1.0)
@@ -2880,34 +3030,74 @@ class FixedBeatViewer:
             return self._produce_chunk_turntable(out_frames)
 
     def _produce_chunk_turntable(self, out_frames):
-        """Produce audio chunk using vectorized turntable processing (no RubberBand)"""
-        step = float(self.current_tempo_ratio)
+        """
+        Vectorized 'turntable-style' (tempo changes pitch) path that RESPECTS per-stem EQ.
+        Returns (out_frames, 1) float32 or None at end-of-track.
+        """
+        if self.audio_data is None:
+            return None
+
+        step = float(self.current_tempo_ratio)        # <1=faster, >1=slower
         base = float(self.playback_position)
+
+        # Positions for this output block (monotonic forward)
         pos = base + step * np.arange(out_frames, dtype=np.float32)
         pos_int = pos.astype(np.int32)
-        max_idx = len(self.audio_data) - 2
+
+        # Determine the integer input window we need
+        if len(self.audio_data) < 2:
+            return None
+        start = int(pos_int.min())
+        stop  = int(min(pos_int.max() + 2, len(self.audio_data)))  # +1 for interp, +1 safety
+        if start >= stop:
+            return None
+
+        # ---- Build the source mix for [start:stop] USING per-stem EQs ----
+        # Expect stems: dict[str] -> np.ndarray mono shape (total_frames,)
+        # and stem_eq: dict[str] -> ToneEQ3 instances
+        if getattr(self, "stems_available", False) and getattr(self, "stem_data", None):
+            # Preallocate
+            basebuf = np.zeros(stop - start, dtype=np.float32)
+            for stem_name, stem_arr in self.stem_data.items():
+                if stem_arr is None or len(stem_arr) == 0:
+                    continue
+                # Slice needed window for this stem
+                seg = stem_arr[start:stop].astype(np.float32, copy=False)
+
+                # Apply per-stem EQ if present (stateful across calls)
+                # Use the same logic as the other processing paths
+                if (self.enable_stem_eqs and stem_name in self.stem_tone_eqs and 
+                    self.stem_eq_enabled.get(stem_name, False)):
+                    try:
+                        seg_eq = self.stem_tone_eqs[stem_name].process_block(seg)
+                        seg_eq = seg_eq.flatten()  # Convert (N,1) back to (N,)
+                    except Exception as e:
+                        logger.warning(f"Turntable chunk stem EQ error for {stem_name}: {e}")
+                        seg_eq = seg  # Continue without stem EQ processing
+                else:
+                    seg_eq = seg
+
+                # Stem volume (if you have per-stem faders)
+                vol = float(self.stem_volumes.get(stem_name, 1.0))
+                basebuf += seg_eq * vol
+        else:
+            # Fall back to pre-mixed track window
+            basebuf = self.audio_data[start:stop].astype(np.float32, copy=False)
+
+        # ---- Vectorized linear interpolation from basebuf to output ----
+        # Clamp so pos_int+1 is valid within [start, stop)
+        max_idx = (stop - start) - 2
         if max_idx < 1:
             return None
-        np.clip(pos_int, 0, max_idx, out=pos_int)
-        pos_frac = pos - pos_int
+        idx = pos_int - start
+        np.clip(idx, 0, max_idx, out=idx)
 
-        # Stems mix once per chunk if available
-        if self.stems_available and self.stem_data:
-            # Mix stems around needed integer range
-            start = pos_int.min()
-            stop = min(pos_int.max() + 2, len(self.audio_data))
-            basebuf = np.zeros(stop - start, dtype=np.float32)
-            for name, stem in self.stem_data.items():
-                vol = float(self.stem_volumes.get(name, 1.0))
-                if stop <= len(stem):
-                    basebuf += stem[start:stop] * vol
-            a = basebuf[pos_int - start]
-            b = basebuf[pos_int - start + 1]
-        else:
-            a = self.audio_data[pos_int]
-            b = self.audio_data[pos_int + 1]
+        frac = (pos - pos_int).astype(np.float32)
+        a = basebuf[idx]
+        b = basebuf[idx + 1]
+        out = (a * (1.0 - frac) + b * frac).astype(np.float32)
 
-        out = (a * (1.0 - pos_frac) + b * pos_frac).astype(np.float32)
+        # Advance playback head
         self.playback_position = float(base + step * out_frames)
         
         # Update position for UI thread
