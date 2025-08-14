@@ -503,6 +503,13 @@ class FixedBeatViewer:
         self._producer_error = None
         self._pending_out = None  # Buffer for partial ring writes
         
+        # Thread synchronization for RubberBand access to prevent segfaults
+        self._rb_lock = threading.RLock()
+        self._pending_time_ratio = None   # handoff from UI → producer thread
+        self._pending_reinit = False      # if you ever want to rebuild the stretcher safely
+        self._pending_disable = False     # to disable RubberBand from UI thread safely
+        self._tempo_debounce_id = None    # tempo debouncing to reduce RB churn
+        
         # Pitch preservation with buffer management to eliminate periodic pops
         self.stretch_processor = None
         # Start with empty buffer - will be allocated on first use with generous size
@@ -536,6 +543,64 @@ class FixedBeatViewer:
         
         if initial_filepath:
             self.master.after(100, lambda: self._load_audio_file(initial_filepath))
+    
+    def _validate_rubberband_buffer(self, input_block):
+        """
+        Validate buffer for RubberBand to prevent segfaults.
+        Ensures proper dtype, shape, and contiguity as suggested by the other AI.
+        """
+        # Check dtype
+        if input_block.dtype != np.float32:
+            input_block = input_block.astype(np.float32)
+        
+        # Check dimensions - must be 2D (frames, channels)
+        if input_block.ndim != 2:
+            raise ValueError(f"RubberBand input must be 2D (frames, channels), got {input_block.ndim}D")
+        
+        # Check contiguity
+        if not input_block.flags['C_CONTIGUOUS']:
+            input_block = np.ascontiguousarray(input_block, dtype=np.float32)
+        
+        # Validate shape
+        frames, channels = input_block.shape
+        if frames <= 0:
+            raise ValueError(f"Invalid frame count: {frames}")
+        if channels not in [1, 2]:
+            raise ValueError(f"RubberBand supports 1 or 2 channels, got {channels}")
+        
+        return input_block
+    
+    def _assert_not_in_audio_callback(self, method_name="RubberBand method"):
+        """
+        Development guard to ensure RubberBand methods are never called from audio callback.
+        This helps catch violations of the ring buffer design pattern.
+        """
+        if hasattr(self, '_in_audio_callback'):
+            raise RuntimeError(f"VIOLATION: {method_name} called from audio callback! "
+                             f"All RubberBand processing must happen in producer thread only. "
+                             f"Audio callback should only read from ring buffer.")
+    
+    def _queue_time_ratio_update(self, tempo_ratio):
+        """
+        Queued tempo update for debouncing.
+        This is called after the debounce delay to actually apply the tempo change.
+        """
+        try:
+            if not self.preserve_pitch_var.get():
+                return  # Pitch preservation disabled, no need to update RubberBand
+            
+            new_time_ratio = 1.0 / float(tempo_ratio)
+            
+            with self._rb_lock:
+                self._pending_time_ratio = new_time_ratio
+            
+            logger.debug(f"Debounced tempo update applied: ratio={tempo_ratio:.3f}, time_ratio={new_time_ratio:.3f}")
+            
+        except Exception as e:
+            logger.error(f"Error in debounced tempo update: {e}")
+        finally:
+            # Clear the debounce ID
+            self._tempo_debounce_id = None
     
     def _create_ui(self):
         """Create simple, working UI"""
@@ -804,6 +869,11 @@ class FixedBeatViewer:
     def _load_audio_file(self, file_path):
         """Load and analyze audio file"""
         try:
+            # Cancel any pending debounced tempo updates
+            if self._tempo_debounce_id is not None:
+                self.master.after_cancel(self._tempo_debounce_id)
+                self._tempo_debounce_id = None
+            
             self._update_status("Loading audio file...", "orange")
             
             # Load audio
@@ -988,18 +1058,24 @@ class FixedBeatViewer:
                     self.stretch_processor and 
                     self.stretch_processor.get('streaming', False)):
                     
-                    # Update existing streaming processor - much more efficient!
-                    new_time_ratio = 1.0 / tempo_ratio
-                    self.rubberband_stretcher.set_time_ratio(new_time_ratio)
+                    # Use debounced update to prevent RubberBand churn during rapid tempo changes
+                    if self._tempo_debounce_id is not None:
+                        self.master.after_cancel(self._tempo_debounce_id)
+                    self._tempo_debounce_id = self.master.after(20, lambda: self._queue_time_ratio_update(tempo_ratio))
+                    
+                    # Update local state immediately for display responsiveness
                     self.stretch_processor['tempo_ratio'] = tempo_ratio
-                    self.stretch_processor['time_ratio'] = new_time_ratio
+                    self.stretch_processor['time_ratio'] = 1.0 / tempo_ratio
                     self.last_tempo_ratio = tempo_ratio
-                    logger.info(f"✓ Updated streaming tempo ratio: {tempo_ratio:.2f} (time_ratio: {new_time_ratio:.3f})")
+                    
+                    logger.debug(f"Debounced tempo update scheduled: {tempo_ratio:.2f}")
                     
                 else:
-                    # Initialize new processor
-                    self._init_stretch_processor(tempo_ratio)
-                    logger.info(f"Pitch preservation ENABLED with tempo ratio: {tempo_ratio:.2f}")
+                    # Queue processor initialization for producer thread (no debouncing needed for init)
+                    with self._rb_lock:
+                        self._pending_reinit = True
+                        self._pending_time_ratio = 1.0 / tempo_ratio
+                    logger.info(f"Pitch preservation initialization queued with tempo ratio: {tempo_ratio:.2f}")
         else:
             self.stretch_processor = None
             if self.preserve_pitch_var.get():
@@ -1008,61 +1084,11 @@ class FixedBeatViewer:
         logger.debug(f"Tempo changed: ratio={tempo_ratio:.2f}, new_bpm={new_bpm:.1f}")
     
     def _init_stretch_processor(self, tempo_ratio):
-        """Initialize streaming pitch preservation processor with proper RubberBand streaming API"""
-        if not RUBBERBAND_STREAMING_AVAILABLE or self.audio_data is None:
-            logger.warning("Falling back to old RubberBand API")
-            return self._init_stretch_processor_fallback(tempo_ratio)
-        
-        try:
-            # Clean up existing processor
-            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
-                self.rubberband_stretcher.close()
-            
-            # Calculate proper time ratio (inverse of tempo for RubberBand)
-            # For faster playback (tempo_ratio > 1.0), time_ratio < 1.0
-            time_ratio = 1.0 / tempo_ratio
-            
-            # Create streaming RubberBand processor  
-            # Check if we have stereo or mono audio
-            audio_channels = 2 if len(self.audio_data.shape) > 1 and self.audio_data.shape[1] == 2 else 1
-            if len(self.audio_data.shape) == 1:
-                audio_channels = 1  # Definitely mono
-            
-            self.rubberband_stretcher = RubberBand(
-                sample_rate=int(self.sample_rate),
-                channels=audio_channels,
-                options=REALTIME_DEFAULT,
-                time_ratio=time_ratio,
-                pitch_scale=1.0  # Keep pitch unchanged
-            )
-            
-            self.audio_channels = audio_channels  # Store for later use
-            
-            # Optimize for different audio types - default to crisp for general use
-            self.rubberband_stretcher.set_transients_option(RubberBandOptionTransientsCrisp)
-            self.rubberband_stretcher.set_phase_option(RubberBandOptionPhaseIndependent)
-            self.rubberband_stretcher.set_detector_option(RubberBandOptionDetectorPercussive)
-            
-            # Reset processing state - keep allocated buffer
-            self.stretch_buffer_used = 0
-            self.stretch_read_pos = 0
-            self.stretch_input_pos = int(self.playback_position)  # Start from current playback position
-            self.last_tempo_ratio = tempo_ratio
-            
-            # Set up processor metadata
-            self.stretch_processor = {
-                'tempo_ratio': tempo_ratio,
-                'time_ratio': time_ratio,
-                'streaming': True,
-                'initialized': True
-            }
-            
-            logger.info(f"✓ Streaming pitch processor initialized (tempo: {tempo_ratio:.2f}, time_ratio: {time_ratio:.3f})")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize streaming pitch processor: {e}")
-            logger.info("Falling back to old RubberBand API")
-            return self._init_stretch_processor_fallback(tempo_ratio)
+        """DEPRECATED: Use handoff pattern instead. This method is kept for fallback only."""
+        logger.warning("Deprecated _init_stretch_processor called - using handoff pattern instead")
+        with self._rb_lock:
+            self._pending_reinit = True
+            self._pending_time_ratio = 1.0 / tempo_ratio
     
     def _init_stretch_processor_fallback(self, tempo_ratio):
         """Fallback to old stateless RubberBand API"""
@@ -1086,6 +1112,54 @@ class FixedBeatViewer:
             
         except Exception as e:
             logger.error(f"Failed to initialize fallback pitch processor: {e}")
+            self.stretch_processor = None
+    
+    def _init_stretch_processor_producer_thread(self, tempo_ratio):
+        """Initialize RubberBand from producer thread (thread-safe)"""
+        if not RUBBERBAND_STREAMING_AVAILABLE or self.audio_data is None:
+            return
+        
+        try:
+            # Calculate proper time ratio
+            time_ratio = 1.0 / tempo_ratio
+            
+            # Check if we have stereo or mono audio
+            audio_channels = 2 if len(self.audio_data.shape) > 1 and self.audio_data.shape[1] == 2 else 1
+            if len(self.audio_data.shape) == 1:
+                audio_channels = 1  # Definitely mono
+            
+            # Create RubberBand processor (called from producer thread, no lock needed)
+            self.rubberband_stretcher = RubberBand(
+                sample_rate=int(self.sample_rate),
+                channels=audio_channels,
+                options=REALTIME_DEFAULT,
+                time_ratio=time_ratio,
+                pitch_scale=1.0  # Keep pitch unchanged
+            )
+            
+            self.audio_channels = audio_channels  # Store for later use
+            
+            # Optimize for different audio types
+            self.rubberband_stretcher.set_transients_option(RubberBandOptionTransientsCrisp)
+            self.rubberband_stretcher.set_phase_option(RubberBandOptionPhaseIndependent)
+            self.rubberband_stretcher.set_detector_option(RubberBandOptionDetectorPercussive)
+            
+            # Reset processing state
+            self.stretch_buffer_used = 0
+            self.stretch_read_pos = 0
+            self.stretch_input_pos = int(self.playback_position)
+            self.last_tempo_ratio = tempo_ratio
+            
+            # Set up processor metadata
+            self.stretch_processor = {
+                'tempo_ratio': tempo_ratio,
+                'time_ratio': time_ratio,
+                'streaming': True,
+                'initialized': True
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize RubberBand in producer thread: {e}")
             self.stretch_processor = None
     
     def _set_bpm_from_input(self):
@@ -1578,18 +1652,21 @@ class FixedBeatViewer:
         enabled = self.preserve_pitch_var.get()
         
         if enabled and self.file_loaded:
-            # Initialize the processor
-            self._init_stretch_processor(self.current_tempo_ratio)
+            # Queue processor initialization for producer thread (never call RB from UI)
+            with self._rb_lock:
+                self._pending_reinit = True
+                self._pending_time_ratio = 1.0 / self.current_tempo_ratio
             self._update_status("Pitch preservation enabled", "green")
             logger.info(f"Pitch preservation enabled (ratio: {self.current_tempo_ratio:.2f})")
         else:
-            # Clean disable - cleanup streaming processor
-            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
-                try:
-                    self.rubberband_stretcher.close()
-                except:
-                    pass
-                self.rubberband_stretcher = None
+            # Cancel any pending debounced tempo updates
+            if self._tempo_debounce_id is not None:
+                self.master.after_cancel(self._tempo_debounce_id)
+                self._tempo_debounce_id = None
+            
+            # Queue disable for producer thread (never call RB from UI)
+            with self._rb_lock:
+                self._pending_disable = True
             
             self.stretch_processor = None
             self._update_status("Pitch preservation disabled", "orange") 
@@ -1697,22 +1774,34 @@ class FixedBeatViewer:
                     self._init_stretch_processor(self.current_tempo_ratio)
             
             def audio_callback(outdata, frames, time, status):
-                # No logging/UI here; set flags only
-                if status:
-                    self._had_underflow = True
-
-                out, n = self.out_ring.read(frames)
-                if n < frames:
-                    # underrun: fill tail with zeros
-                    out[n:] = 0.0
+                # DEVELOPMENT GUARD: Never call RubberBand methods in audio callback!
+                # This callback should only read from ring buffer - all RB processing
+                # happens in the producer thread to prevent segfaults and dropouts.
+                assert not hasattr(self, '_in_audio_callback'), "Nested audio callback detected!"
+                self._in_audio_callback = True
                 
-                if self.device_output_channels == 1:
-                    # Mono output
-                    outdata[:frames, 0] = out[:, 0]
-                else:
-                    # Stereo output - duplicate mono to both channels
-                    outdata[:frames, 0] = out[:, 0]  # Left
-                    outdata[:frames, 1] = out[:, 0]  # Right (same as left)
+                try:
+                    # No logging/UI here; set flags only
+                    if status:
+                        self._had_underflow = True
+
+                    out, n = self.out_ring.read(frames)
+                    if n < frames:
+                        # underrun: fill tail with zeros
+                        out[n:] = 0.0
+                    
+                    if self.device_output_channels == 1:
+                        # Mono output
+                        outdata[:frames, 0] = out[:, 0]
+                    else:
+                        # Stereo output - duplicate mono to both channels
+                        outdata[:frames, 0] = out[:, 0]  # Left
+                        outdata[:frames, 1] = out[:, 0]  # Right (same as left)
+                
+                finally:
+                    # Clean up guard flag
+                    if hasattr(self, '_in_audio_callback'):
+                        del self._in_audio_callback
             
             # Start stream with optimized settings for low latency and reduced callback pressure
             self.stream = sd.OutputStream(
@@ -1871,14 +1960,98 @@ class FixedBeatViewer:
                 # Stereo: duplicate mono to stereo (frames,) -> (frames, 2)
                 input_block = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
             
-            # Feed to RubberBand streaming processor
-            self.rubberband_stretcher.process(input_block, final=False)
+            # Validate buffer to prevent segfaults
+            input_block = self._validate_rubberband_buffer(input_block)
             
-            # CRITICAL: Use proper drain pattern like working example
-            self._drain_rubberband_output()
+            # Check for pending operations (non-blocking)
+            pending_ratio = None
+            pending_reinit = False
+            pending_disable = False
+            if self._rb_lock.acquire(blocking=False):
+                try:
+                    if self._pending_time_ratio is not None:
+                        pending_ratio = self._pending_time_ratio
+                        self._pending_time_ratio = None
+                    if self._pending_reinit:
+                        pending_reinit = True
+                        self._pending_reinit = False
+                    if self._pending_disable:
+                        pending_disable = True
+                        self._pending_disable = False
+                finally:
+                    self._rb_lock.release()
             
-            # Advance input position by the chunk size we just consumed
-            self.stretch_input_pos += chunk_size
+            # Handle pending disable first
+            if pending_disable:
+                # Synchronize position: use RubberBand input position for turntable
+                if hasattr(self, 'stretch_input_pos'):
+                    self.playback_position = float(self.stretch_input_pos)
+                
+                if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                    try:
+                        self.rubberband_stretcher.close()
+                    except:
+                        pass
+                    self.rubberband_stretcher = None
+                logger.debug(f"RubberBand disabled by producer thread (synced position: {self.playback_position})")
+                # Don't return early - might also have pending_reinit
+            
+            # Handle pending reinit
+            if pending_reinit:
+                if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                    try:
+                        self.rubberband_stretcher.close()
+                    except:
+                        pass
+                
+                # Synchronize position: use current playback position as RubberBand input position
+                self.stretch_input_pos = int(self.playback_position)
+                # Will be recreated with pending_ratio below
+                
+            # Initialize or update RubberBand if needed
+            if pending_reinit or not hasattr(self, 'rubberband_stretcher') or not self.rubberband_stretcher:
+                time_ratio = pending_ratio if pending_ratio else (1.0 / self.current_tempo_ratio)
+                audio_channels = 2 if len(self.audio_data.shape) > 1 and self.audio_data.shape[1] == 2 else 1
+                if len(self.audio_data.shape) == 1:
+                    audio_channels = 1  # Definitely mono
+                
+                self.rubberband_stretcher = RubberBand(
+                    sample_rate=int(self.sample_rate),
+                    channels=audio_channels,
+                    options=REALTIME_DEFAULT,
+                    time_ratio=time_ratio,
+                    pitch_scale=1.0
+                )
+                
+                self.audio_channels = audio_channels
+                self.stretch_processor = {
+                    'tempo_ratio': 1.0 / time_ratio,
+                    'time_ratio': time_ratio,
+                    'streaming': True,
+                    'initialized': True
+                }
+                if pending_reinit:
+                    logger.debug(f"RubberBand reinitialized by producer thread (time_ratio: {time_ratio:.3f}, synced position: {self.stretch_input_pos})")
+                else:
+                    logger.debug(f"RubberBand initialized by producer thread (time_ratio: {time_ratio:.3f})")
+            elif pending_ratio is not None:
+                # Just update existing processor
+                self._assert_not_in_audio_callback("RubberBand.set_time_ratio")
+                self.rubberband_stretcher.set_time_ratio(pending_ratio)
+                logger.debug(f"Applied pending time ratio: {pending_ratio:.3f}")
+            
+            # Feed to RubberBand streaming processor (only if available)
+            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                self._assert_not_in_audio_callback("RubberBand.process")
+                self.rubberband_stretcher.process(input_block, final=False)
+                
+                # CRITICAL: Use proper drain pattern like working example
+                self._drain_rubberband_output()
+                
+                # Advance input position by the chunk size we just consumed
+                self.stretch_input_pos += chunk_size
+            else:
+                logger.debug("RubberBand not available in _process_more_audio_streaming")
             
             # Success - no logging in processing thread
             
@@ -1889,6 +2062,7 @@ class FixedBeatViewer:
     def _drain_rubberband_output(self):
         """Drain all available output from RubberBand processor (like working example)"""
         try:
+            self._assert_not_in_audio_callback("RubberBand.available/retrieve")
             total_samples = 0
             n = self.rubberband_stretcher.available()
             while n > 0:
@@ -2112,9 +2286,20 @@ class FixedBeatViewer:
                     continue
 
                 # Compute a chunk (choose one path) - check variables safely
+                # Check current RubberBand state and pending operations
+                has_active_rb = False
+                has_pending_rb_ops = False
+                if hasattr(self, '_rb_lock') and self._rb_lock.acquire(blocking=False):
+                    try:
+                        has_active_rb = (hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher)
+                        has_pending_rb_ops = (self._pending_reinit or self._pending_disable)
+                    finally:
+                        self._rb_lock.release()
+                
+                # Use RubberBand if: pitch preservation is enabled AND we have active RB or pending operations
                 use_rubberband = (RUBBERBAND_STREAMING_AVAILABLE and 
                                 hasattr(self, 'preserve_pitch_var') and self.preserve_pitch_var.get() and
-                                hasattr(self, 'stretch_processor') and self.stretch_processor is not None)
+                                (has_active_rb or has_pending_rb_ops))
                 
                 if use_rubberband:
                     chunk = self._produce_chunk_rubberband(TARGET_BLOCK)  # see 3C
@@ -2151,7 +2336,7 @@ class FixedBeatViewer:
                 time.sleep(0.01)  # Brief pause on error
 
     def _produce_chunk_rubberband(self, out_frames):
-        """Produce audio chunk using streaming RubberBand (direct processing)"""
+        """Produce audio chunk using streaming RubberBand with proper locking"""
         try:
             # Check bounds
             if self.stretch_input_pos >= len(self.audio_data) - 1:
@@ -2184,13 +2369,84 @@ class FixedBeatViewer:
                 input_block = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
             else:
                 input_block = input_chunk.reshape(-1, 1).astype(np.float32)
+            
+            # Validate buffer to prevent segfaults
+            input_block = self._validate_rubberband_buffer(input_block)
 
-            # Process with streaming RubberBand
-            if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
-                self.rubberband_stretcher.process(input_block, final=False)
+            output_chunks = []
+
+            # ---- All RubberBand operations guarded by the same lock ----
+            with self._rb_lock:
+                # Apply any pending RubberBand parameter changes (single-threaded)
+                if self._pending_time_ratio is not None and hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                    self._assert_not_in_audio_callback("RubberBand.set_time_ratio")
+                    self.rubberband_stretcher.set_time_ratio(self._pending_time_ratio)
+                    logger.debug(f"Applied pending time ratio: {self._pending_time_ratio:.3f}")
+                    self._pending_time_ratio = None
+
+                # Handle pending operations
+                if self._pending_disable:
+                    # Synchronize position: use RubberBand input position for turntable
+                    if hasattr(self, 'stretch_input_pos'):
+                        self.playback_position = float(self.stretch_input_pos)
+                    
+                    if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                        try:
+                            self.rubberband_stretcher.close()
+                        except:
+                            pass
+                        self.rubberband_stretcher = None
+                    self._pending_disable = False
+                    logger.debug(f"RubberBand disabled by producer thread (synced position: {self.playback_position})")
+                    # Exit lock and fallback to turntable
+                    return self._produce_chunk_turntable(out_frames)
+
+                if self._pending_reinit:
+                    # Close old stretcher
+                    if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                        self.rubberband_stretcher.close()
+                    
+                    # Synchronize position: use current playback position as RubberBand input position
+                    self.stretch_input_pos = int(self.playback_position)
+                    
+                    # Recreate with current SR/channels and pending ratio
+                    time_ratio = self._pending_time_ratio if self._pending_time_ratio is not None else 1.0
+                    audio_channels = 2 if len(self.audio_data.shape) > 1 and self.audio_data.shape[1] == 2 else 1
+                    if len(self.audio_data.shape) == 1:
+                        audio_channels = 1  # Definitely mono
+                    
+                    self.rubberband_stretcher = RubberBand(
+                        sample_rate=int(self.sample_rate),
+                        channels=audio_channels,
+                        options=REALTIME_DEFAULT,
+                        time_ratio=time_ratio,
+                        pitch_scale=1.0
+                    )
+                    
+                    # Set up metadata
+                    self.audio_channels = audio_channels
+                    self.stretch_processor = {
+                        'tempo_ratio': 1.0 / time_ratio,
+                        'time_ratio': time_ratio,
+                        'streaming': True,
+                        'initialized': True
+                    }
+                    
+                    # Clear flags
+                    self._pending_time_ratio = None
+                    self._pending_reinit = False
+                    logger.debug(f"RubberBand reinitialized by producer thread (time_ratio: {time_ratio:.3f}, synced position: {self.stretch_input_pos})")
+
+                # Ensure we have a valid RubberBand processor
+                if not hasattr(self, 'rubberband_stretcher') or not self.rubberband_stretcher:
+                    # Exit lock and fallback to turntable
+                    return self._produce_chunk_turntable(out_frames)
                 
-                # Drain all available output (like the working test file)
-                output_chunks = []
+                # Process with streaming RubberBand (all calls inside lock)
+                self._assert_not_in_audio_callback("RubberBand.process/available/retrieve")
+                self.rubberband_stretcher.process(input_block, final=False)
+
+                # Drain in a loop; never call retrieve() without the lock
                 while True:
                     available = self.rubberband_stretcher.available()
                     if available <= 0:
@@ -2204,42 +2460,48 @@ class FixedBeatViewer:
                     else:
                         mono_output = output_block[:, 0].astype(np.float32)
                     output_chunks.append(mono_output)
+            # ---- end lock ----
+
+            # Process output outside of lock (no RubberBand calls)
+            if output_chunks:
+                # Concatenate all drained output
+                full_output = np.concatenate(output_chunks)
                 
-                if output_chunks:
-                    # Concatenate all drained output
-                    full_output = np.concatenate(output_chunks)
+                # Take exactly what we need, save rest for next call
+                if len(full_output) >= out_frames:
+                    chunk_out = full_output[:out_frames]
+                    # Store remainder (would need a class buffer for this - simplified for now)
+                else:
+                    chunk_out = full_output
                     
-                    # Take exactly what we need, save rest for next call
-                    if len(full_output) >= out_frames:
-                        chunk_out = full_output[:out_frames]
-                        # Store remainder (would need a class buffer for this - simplified for now)
-                    else:
-                        chunk_out = full_output
-                        
-                    # Apply EQ (vectorized for performance)
-                    if self.eq_enabled and self.eq_filters:
-                        chunk_out = self.eq_filters.process_block_vectorized(chunk_out)
-                    
-                    # Update position
-                    self.playback_position += len(chunk_out)
-                    
-                    # Update position for UI thread - use input position for accurate beat tracking
-                    self._audio_position = float(self.stretch_input_pos)
-                    
-                    # Format for ring buffer output channels
-                    if self.device_output_channels == 1:
-                        return chunk_out.reshape(-1, 1).astype(np.float32)
-                    else:
-                        # Duplicate mono to stereo for ring buffer
-                        return np.column_stack([chunk_out, chunk_out]).astype(np.float32)
+                # Apply EQ (vectorized for performance)
+                if self.eq_enabled and self.eq_filters:
+                    chunk_out = self.eq_filters.process_block_vectorized(chunk_out)
+                
+                # Safety sanitization
+                np.nan_to_num(chunk_out, copy=False)
+                
+                # Update position
+                self.playback_position += len(chunk_out)
+                
+                # Update position for UI thread - use input position for accurate beat tracking
+                self._audio_position = float(self.stretch_input_pos)
+                
+                # Format for ring buffer output channels
+                if self.device_output_channels == 1:
+                    return chunk_out.reshape(-1, 1).astype(np.float32)
+                else:
+                    # Duplicate mono to stereo for ring buffer
+                    return np.column_stack([chunk_out, chunk_out]).astype(np.float32)
             
-            # Fallback to silence with correct channel count
-            return np.zeros((out_frames, self.device_output_channels), dtype=np.float32)
+            # Fallback to turntable processing until RubberBand is ready
+            return self._produce_chunk_turntable(out_frames)
             
         except Exception as e:
             # Set error flag instead of logging in processing thread
             self._producer_error = f"RubberBand chunk production error: {e}"
-            return np.zeros((out_frames, self.device_output_channels), dtype=np.float32)
+            # Fallback to turntable processing on error
+            return self._produce_chunk_turntable(out_frames)
 
     def _produce_chunk_turntable(self, out_frames):
         """Produce audio chunk using vectorized turntable processing (no RubberBand)"""
@@ -2292,6 +2554,28 @@ class FixedBeatViewer:
         """Update status"""
         self.status_label.config(text=message, fg=color)
         logger.info(f"Status: {message}")
+    
+    def cleanup(self):
+        """Clean up resources when app closes"""
+        # Stop playback and producer
+        if self.is_playing:
+            self._stop_playback()
+        
+        # Queue RubberBand cleanup for producer thread (never call RB from UI)
+        with self._rb_lock:
+            self._pending_disable = True
+        
+        # Give producer thread a moment to handle cleanup
+        import time
+        time.sleep(0.1)
+        
+        # Close audio stream
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing audio stream: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Fixed Beat Viewer")
@@ -2303,14 +2587,20 @@ def main():
     root = tk.Tk()
     app = FixedBeatViewer(root, args.audio_file)
     
+    # Set up proper cleanup on window close
+    def on_closing():
+        app.cleanup()
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
     try:
         root.mainloop()
     except KeyboardInterrupt:
         logger.info("Application interrupted")
+        app.cleanup()
     finally:
-        if hasattr(app, 'stream') and app.stream:
-            app.stream.stop()
-            app.stream.close()
+        app.cleanup()
 
 if __name__ == "__main__":
     main()
