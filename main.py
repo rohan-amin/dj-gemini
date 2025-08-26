@@ -116,47 +116,107 @@ def run_dj_gemini():
         return
 
     try:
+        # Get initial script status
+        if hasattr(audio_engine, '_all_actions_from_script'):
+            total_actions = len(audio_engine._all_actions_from_script)
+            logger.info(f"📜 Script loaded with {total_actions} actions")
+        
         audio_engine.start_script_processing()
 
-        logger.info("Script action processing initiated.")
+        logger.info("🚀 Script action processing initiated.")
+        logger.info("📊 Event-driven architecture active - actions will be scheduled and executed automatically")
         
         wait_start_time = time.time()
         loop_count = 0
 
         logger.info("Monitoring. Press Ctrl+C to exit early.")
+        
+        # Get initial status for comparison
+        last_status_time = time.time()
+        last_engine_status = False
+        last_deck_status = False
+        
         while True: 
             loop_count += 1
+            current_time = time.time()
+            
+            # Get current status
             engine_is_dispatching_actions = audio_engine.is_processing_script_actions 
             decks_are_active = audio_engine.any_deck_active()
             
-            # Reduce status logging frequency
-            if loop_count % 50 == 0 or not engine_is_dispatching_actions:
-                pass
+            # Get event scheduler status
+            scheduler_status = "unknown"
+            pending_events = 0
+            if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler:
+                try:
+                    scheduler_stats = audio_engine.event_scheduler.get_stats()
+                    total_scheduled = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0)
+                    total_executed = scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
+                    pending_events = total_scheduled - total_executed
+                    
+                    if pending_events > 0:
+                        scheduler_status = f"{pending_events} pending"
+                    else:
+                        scheduler_status = "idle"
+                except Exception as e:
+                    scheduler_status = f"error: {e}"
+                    pending_events = 0
+            
+            # Status change detection and logging
+            status_changed = (engine_is_dispatching_actions != last_engine_status or 
+                            decks_are_active != last_deck_status or
+                            loop_count % 20 == 0)  # Log every 20 iterations (10 seconds)
+            
+            if status_changed:
+                elapsed = current_time - wait_start_time
+                status_msg = f"Status: Engine={'🔄' if engine_is_dispatching_actions else '⏸️'} | Decks={'🎵' if decks_are_active else '🔇'} | Scheduler={scheduler_status} | Elapsed={elapsed:.1f}s"
+                logger.info(status_msg)
+                
+                # Update last status for change detection
+                last_engine_status = engine_is_dispatching_actions
+                last_deck_status = decks_are_active
+                last_status_time = current_time
 
-            # Exit condition
+            # Exit condition: Check if everything is complete
             if not engine_is_dispatching_actions and not decks_are_active:
-                if not getattr(audio_engine, '_pending_on_beat_actions', True):
-                    logger.info("Engine done, no pending actions, and no decks active.")
-                    break 
+                if pending_events == 0:
+                    logger.info("🎉 All actions completed successfully!")
+                    logger.info(f"Total execution time: {current_time - wait_start_time:.1f}s")
+                    break
+                else:
+                    # Still have pending events but engine stopped - this might indicate an issue
+                    logger.warning(f"Engine stopped but {pending_events} events still pending. This might indicate an issue.")
+                    break
             
             # Timeout check
-            if args.max_wait_after_script > 0 and (time.time() - wait_start_time) > args.max_wait_after_script:
-                logger.warning(f"Max wait time of {args.max_wait_after_script}s reached.")
+            if args.max_wait_after_script > 0 and (current_time - wait_start_time) > args.max_wait_after_script:
+                logger.warning(f"⏰ Max wait time of {args.max_wait_after_script}s reached.")
+                logger.info(f"Final status - Engine: {engine_is_dispatching_actions}, Decks: {decks_are_active}, Pending: {pending_events}")
                 break
+                
             time.sleep(0.5)
         logger.info("Monitoring loop finished.")
 
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received. Shutting down...")
+        logger.info("🛑 KeyboardInterrupt received. Shutting down gracefully...")
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
+        logger.error(f"❌ An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        logger.info("Initiating shutdown of audio engine and decks...")
+        logger.info("🔄 Initiating shutdown of audio engine and decks...")
         if audio_engine: 
-            audio_engine.stop_script_processing() 
-        logger.info("DJ Gemini finished.")
+            try:
+                # Get final status before shutdown
+                if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler:
+                    final_stats = audio_engine.event_scheduler.get_stats()
+                    logger.info(f"Final event scheduler stats: {final_stats}")
+                
+                audio_engine.stop_script_processing()
+                logger.info("✅ Audio engine shutdown completed successfully")
+            except Exception as shutdown_error:
+                logger.error(f"⚠️ Error during shutdown: {shutdown_error}")
+        logger.info("🎯 DJ Gemini finished.")
 
 if __name__ == "__main__":
     run_dj_gemini()

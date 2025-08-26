@@ -16,8 +16,10 @@ except ImportError:
 
 from .audio_analyzer import AudioAnalyzer
 from .deck import Deck
+from .audio_clock import AudioClock
+from .event_scheduler import EventScheduler
 
-ENGINE_TICK_INTERVAL = 0.01  # 10ms intervals for tighter timing 
+# Event-driven architecture replaces old polling system 
 
 class AudioEngine:
     def __init__(self, app_config_module): 
@@ -37,22 +39,96 @@ class AudioEngine:
         self.decks = {}
         self.script_name = "Untitled Mix"
         
-        self._all_actions_from_script = [] 
-        self._pending_on_beat_actions = [] 
+        # NEW: Event-driven architecture
+        self.audio_clock = AudioClock()
+        self.event_scheduler = EventScheduler(self.audio_clock)
         
-        self._engine_thread = None
-        self._engine_stop_event = threading.Event()
+        # Event-driven architecture replaces old polling system
+        self._all_actions_from_script = []
         self.is_processing_script_actions = False 
         
         self._script_start_time = 0 
         
         logger.debug("AudioEngine - Initialized.")
+        
+        # Register event handlers for different action types
+        self._register_event_handlers()
 
     def _get_or_create_deck(self, deck_id):
         """Get existing deck or create new one"""
         if deck_id not in self.decks:
             self.decks[deck_id] = Deck(deck_id, self.analyzer, engine_instance=self)
         return self.decks[deck_id]
+    
+    def _register_event_handlers(self):
+        """Register handlers for different action types with the event scheduler"""
+        logger.debug("AudioEngine - Registering event handlers")
+        
+        # Register handlers for deck-specific commands
+        deck_commands = [
+            "load_track", "play", "pause", "stop", "seek_and_play", 
+            "activate_loop", "deactivate_loop", "stop_at_beat", 
+            "set_tempo", "set_pitch", "set_volume", "fade_volume",
+            "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample",
+            "set_stem_eq", "enable_stem_eq", "set_stem_volume",
+            "set_master_eq", "set_all_stem_eq"
+        ]
+        
+        for command in deck_commands:
+            self.event_scheduler.register_handler(command, self._execute_deck_action)
+        
+        # Register handlers for engine-level commands
+        engine_commands = ["crossfade", "bpm_match"]
+        for command in engine_commands:
+            self.event_scheduler.register_handler(command, self._execute_engine_action)
+        
+        # Register default handler for unknown commands
+        self.event_scheduler.register_default_handler(self._execute_unknown_action)
+        
+        # Register error callback
+        self.event_scheduler.register_error_callback(self._handle_scheduler_error)
+        
+        logger.debug("AudioEngine - Event handlers registered")
+    
+    def _execute_deck_action(self, action: dict):
+        """Execute a deck-specific action"""
+        try:
+            deck_id = action.get("deck_id")
+            if not deck_id:
+                logger.error(f"Deck action missing deck_id: {action}")
+                return False
+            
+            deck = self._get_or_create_deck(deck_id)
+            if not deck:
+                logger.error(f"Could not get or create deck: {deck_id}")
+                return False
+            
+            # Execute the action using existing deck methods
+            return self._execute_action(action)
+            
+        except Exception as e:
+            logger.error(f"Error executing deck action: {e}")
+            return False
+    
+    def _execute_engine_action(self, action: dict):
+        """Execute an engine-level action"""
+        try:
+            # Execute the action using existing engine methods
+            return self._execute_action(action)
+            
+        except Exception as e:
+            logger.error(f"Error executing engine action: {e}")
+            return False
+    
+    def _execute_unknown_action(self, action: dict):
+        """Handle unknown action types"""
+        logger.warning(f"Unknown action type: {action.get('command', 'unknown')}")
+        return False
+    
+    def _handle_scheduler_error(self, error: Exception):
+        """Handle errors from the event scheduler"""
+        logger.error(f"Event scheduler error: {error}")
+        # Could implement error recovery logic here
 
     def _validate_action(self, action, action_index):
         command = action.get("command")
@@ -91,7 +167,7 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -202,6 +278,160 @@ class AudioEngine:
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_eq' parameters not valid numbers. Params: {params}")
                 return False
+
+        elif command == "set_stem_eq":
+            params = action.get("parameters", {})
+            
+            # Stem name is required
+            if "stem" not in params:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_stem_eq' missing required parameter 'stem'. Params: {params}")
+                return False
+                
+            stem = params["stem"]
+            valid_stems = ["vocals", "drums", "bass", "other"]
+            if stem not in valid_stems:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Invalid stem '{stem}'. Must be one of: {valid_stems}")
+                return False
+            
+            # At least one EQ band must be specified (support both legacy and professional formats)
+            legacy_bands = ["low", "mid", "high"]
+            professional_bands = ["low_db", "mid_db", "high_db"]
+            
+            found_legacy = [band for band in legacy_bands if band in params]
+            found_professional = [band for band in professional_bands if band in params]
+            
+            if not found_legacy and not found_professional:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_stem_eq' must specify at least one of: 'low', 'mid', 'high' (legacy) or 'low_db', 'mid_db', 'high_db' (professional). Params: {params}")
+                return False
+            
+            try:
+                # Validate legacy format (linear gains 0.0-3.0)
+                for band in found_legacy:
+                    value = float(params[band])
+                    if value < 0.0 or value > 3.0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{band}' must be between 0.0 and 3.0. Value: {value}")
+                        return False
+                        
+                # Validate professional format (dB gains -20.0 to +20.0)
+                for band in found_professional:
+                    value = float(params[band])
+                    if value < -20.0 or value > 20.0:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{band}' must be between -20.0 and +20.0 dB. Value: {value}")
+                        return False
+                        
+            except (ValueError, TypeError):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_stem_eq' parameters not valid numbers. Params: {params}")
+                return False
+
+        elif command == "enable_stem_eq":
+            params = action.get("parameters", {})
+            
+            # Stem name is required
+            if "stem" not in params:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'enable_stem_eq' missing required parameter 'stem'. Params: {params}")
+                return False
+                
+            stem = params["stem"]
+            valid_stems = ["vocals", "drums", "bass", "other"]
+            if stem not in valid_stems:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Invalid stem '{stem}'. Must be one of: {valid_stems}")
+                return False
+                
+            # Enabled parameter is required
+            if "enabled" not in params:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'enable_stem_eq' missing required parameter 'enabled'. Params: {params}")
+                return False
+            
+            if not isinstance(params["enabled"], bool):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'enabled' must be true or false. Value: {params['enabled']}")
+                return False
+
+        elif command == "set_stem_volume":
+            params = action.get("parameters", {})
+            
+            # Stem name is required
+            if "stem" not in params:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_stem_volume' missing required parameter 'stem'. Params: {params}")
+                return False
+                
+            stem = params["stem"]
+            valid_stems = ["vocals", "drums", "bass", "other"]
+            if stem not in valid_stems:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Invalid stem '{stem}'. Must be one of: {valid_stems}")
+                return False
+                
+            # Volume parameter is required
+            if "volume" not in params:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_stem_volume' missing required parameter 'volume'. Params: {params}")
+                return False
+            
+            try:
+                volume = float(params["volume"])
+                if volume < 0.0 or volume > 2.0:
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' must be between 0.0 and 2.0. Value: {volume}")
+                    return False
+            except (ValueError, TypeError):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'volume' parameter not a valid number. Value: {params['volume']}")
+                return False
+
+        elif command == "set_master_eq":
+            params = action.get("parameters", {})
+            
+            # Validate gain parameters if specified
+            gain_params = ["low_gain", "mid_gain", "high_gain"]
+            for gain_param in gain_params:
+                if gain_param in params:
+                    try:
+                        gain_value = float(params[gain_param])
+                        if gain_value < 0.0 or gain_value > 2.0:
+                            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{gain_param}' must be between 0.0 and 2.0. Value: {gain_value}")
+                            return False
+                    except (ValueError, TypeError):
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{gain_param}' not a valid number. Value: {params[gain_param]}")
+                        return False
+            
+            # Validate enabled parameter if specified
+            if "enabled" in params:
+                if not isinstance(params["enabled"], bool):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'enabled' must be true or false. Value: {params['enabled']}")
+                    return False
+
+        elif command == "set_all_stem_eq":
+            params = action.get("parameters", {})
+            valid_stems = ["vocals", "drums", "bass", "other"]
+            
+            # At least one stem must be specified
+            if not any(stem in params for stem in valid_stems):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'set_all_stem_eq' must specify at least one stem. Valid stems: {valid_stems}")
+                return False
+            
+            # Validate each stem's settings
+            for stem_name, stem_settings in params.items():
+                if stem_name not in valid_stems:
+                    continue  # Skip non-stem parameters
+                    
+                if not isinstance(stem_settings, dict):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Settings for '{stem_name}' must be an object. Value: {stem_settings}")
+                    return False
+                
+                # Validate EQ values if present
+                for eq_band in ["low", "mid", "high"]:
+                    if eq_band in stem_settings:
+                        try:
+                            value = float(stem_settings[eq_band])
+                            if value < 0.0 or value > 3.0:
+                                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{stem_name}.{eq_band}' must be between 0.0 and 3.0. Value: {value}")
+                                return False
+                        except (ValueError, TypeError):
+                            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{stem_name}.{eq_band}' not a valid number. Value: {stem_settings[eq_band]}")
+                            return False
+                
+                # Validate enabled if present
+                if "enabled" in stem_settings:
+                    if not isinstance(stem_settings["enabled"], bool):
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): '{stem_name}.enabled' must be true or false. Value: {stem_settings['enabled']}")
+                        return False
+
         elif command == "crossfade":
             params = action.get("parameters", {})
             if params.get("from_deck") is None or params.get("to_deck") is None or params.get("duration_seconds") is None:
@@ -434,65 +664,6 @@ class AudioEngine:
         logger.info(f"AudioEngine - Cache validation complete. Found cache for {len(required_transformations)} tracks.")
         return True
 
-    def _jit_process_tempo(self, deck, target_bpm):
-        """Just-in-time processing of tempo variant for bpm_match fallback"""
-        try:
-            if not deck.filepath or not os.path.exists(deck.filepath):
-                logger.error(f"JIT tempo processing failed: invalid deck filepath {deck.filepath}")
-                return False
-            
-            if deck.original_bpm <= 0:
-                logger.error(f"JIT tempo processing failed: invalid original BPM {deck.original_bpm}")
-                return False
-            
-            # Calculate tempo ratio
-            tempo_ratio = target_bpm / deck.original_bpm
-            logger.info(f"JIT processing tempo ratio {tempo_ratio:.3f} for {os.path.basename(deck.filepath)}")
-            
-            # Get cache filepath
-            cache_filepath = self.app_config.get_tempo_cache_filepath(deck.filepath, target_bpm)
-            if os.path.exists(cache_filepath):
-                logger.debug(f"JIT: Cache file already exists, skipping processing")
-                return True
-            
-            # Ensure cache directory exists
-            cache_dir = os.path.dirname(cache_filepath)
-            self.app_config.ensure_dir_exists(cache_dir)
-            
-            # Load original audio data
-            if not hasattr(deck, 'audio_thread_data') or deck.audio_thread_data is None:
-                logger.error(f"JIT: No audio data available for deck {deck.deck_id}")
-                return False
-            
-            # Process with PyRubberBand
-            try:
-                import pyrubberband as pyrb
-                import numpy as np
-                
-                sample_rate = deck.sample_rate
-                audio_data = deck.audio_thread_data.astype(np.float32)
-                
-                logger.info(f"JIT: Processing {len(audio_data)} samples with PyRubberBand...")
-                processed_audio = pyrb.time_stretch(audio_data, sample_rate, tempo_ratio)
-                
-                # Save to cache
-                np.save(cache_filepath, processed_audio.astype(np.float32))
-                logger.info(f"JIT: Saved processed audio to {cache_filepath}")
-                
-                return True
-                
-            except ImportError:
-                logger.error("JIT: PyRubberBand not available for tempo processing")
-                return False
-            except Exception as e:
-                logger.error(f"JIT: PyRubberBand processing failed: {e}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"JIT tempo processing failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
 
     def _preprocess_deck_transformations(self, deck_id, transformations):
         """Pre-process all transformations for a specific deck"""
@@ -626,171 +797,143 @@ class AudioEngine:
             logger.info("No actions loaded to process.")
             return
 
-        logger.info(f"Starting script processing: '{self.script_name}'")
-        self._engine_stop_event.clear()
+        logger.info(f"Starting event-driven script processing: '{self.script_name}'")
         self.is_processing_script_actions = True 
         self._script_start_time = time.time() 
         
-        self._pending_on_beat_actions = [] 
-        initial_actions_to_execute = []    
-
-        for action in self._all_actions_from_script:
-            if action.get("trigger", {}).get("type") == "script_start":
-                initial_actions_to_execute.append(action)
-            else: 
-                self._pending_on_beat_actions.append(action)
+        # Start the audio clock
+        self.audio_clock.start()
         
-        logger.debug(f"AudioEngine - Initial 'script_start' actions dispatched. Pending on_beat: {len(self._pending_on_beat_actions)}")
-        for action in initial_actions_to_execute:
-            action_command = action.get('command', 'N/A')
-            action_deck_id = action.get('deck_id', 'Engine-Level')
-            action_id_for_log = action.get('action_id', 'N/A_script_start')
-            logger.info(f"AudioEngine (Initial) - Executing: CMD='{action_command}', Deck='{action_deck_id}', ActionID='{action_id_for_log}'")
-            self._execute_action(action) 
-            if self._engine_stop_event.is_set(): 
-                logger.error("AudioEngine - Stop event set during initial action execution.")
-                self.is_processing_script_actions = False
-                return
-        logger.debug(f"AudioEngine - Initial 'script_start' actions dispatched. Pending on_beat: {len(self._pending_on_beat_actions)}")
+        # Schedule all actions using the event scheduler
+        self._schedule_all_actions()
+        
+        # Start the event scheduler
+        self.event_scheduler.start()
+        
+        logger.info("AudioEngine - Event-driven script processing started")
+    
+    def _schedule_all_actions(self):
+        """Schedule all script actions using the event scheduler"""
+        logger.debug("AudioEngine - Scheduling all script actions")
+        
+        for action in self._all_actions_from_script:
+            try:
+                self._schedule_action(action)
+            except Exception as e:
+                logger.error(f"Failed to schedule action {action.get('action_id', 'unknown')}: {e}")
+        
+        logger.debug("AudioEngine - All actions scheduled")
+    
+    def _schedule_action(self, action: dict):
+        """Schedule a single action based on its trigger type"""
+        trigger = action.get("trigger", {})
+        trigger_type = trigger.get("type")
+        
+        if trigger_type == "script_start":
+            # Execute immediately
+            event_id = self.event_scheduler.schedule_immediate_action(
+                action, priority=100  # High priority for immediate actions
+            )
+            logger.debug(f"AudioEngine - Scheduled immediate action: {event_id}")
+            
+        elif trigger_type == "on_deck_beat":
+            # Beat-triggered actions - store for later execution when deck reaches the beat
+            source_deck_id = trigger.get("source_deck_id")
+            target_beat = trigger.get("beat_number")
+            
+            if source_deck_id and target_beat is not None:
+                # Get the deck to access its beat timing
+                deck = self.decks.get(source_deck_id)
+                if deck and hasattr(deck, 'beat_timestamps') and deck.beat_timestamps:
+                    # Calculate relative time from current playback position
+                    if target_beat < len(deck.beat_timestamps):
+                        # Get the current playback position
+                        current_frame = getattr(deck, '_current_playback_frame_for_display', 0)
+                        current_time = current_frame / deck.audio_thread_sample_rate if hasattr(deck, 'audio_thread_sample_rate') and deck.audio_thread_sample_rate > 0 else 0
+                        
+                        # Calculate time to reach target beat from current position
+                        target_time = deck.beat_timestamps[target_beat]
+                        time_to_beat = target_time - current_time
+                        
+                        # Schedule relative to current time
+                        trigger_time = time.time() + time_to_beat
+                        
+                        event_id = self.event_scheduler.schedule_action(
+                            action, trigger_time, priority=50
+                        )
+                        logger.debug(f"AudioEngine - Scheduled beat action {event_id} for beat {target_beat} in {time_to_beat:.2f}s (relative timing)")
+                    else:
+                        logger.warning(f"Beat {target_beat} is beyond deck {source_deck_id} beat count")
+                else:
+                    # Fallback to BPM calculation
+                    event_id = self.event_scheduler.schedule_beat_action(
+                        action, target_beat, priority=50
+                    )
+                    logger.debug(f"AudioEngine - Scheduled beat action {event_id} for beat {target_beat} (BPM fallback)")
+            else:
+                logger.error(f"Invalid on_deck_beat trigger: {trigger}")
+                
+        elif trigger_type == "on_loop_complete":
+            # Loop completion triggers will be handled dynamically by checking LoopManager
+            # Store the action for later execution when loops complete
+            if not hasattr(self, '_loop_completion_actions'):
+                self._loop_completion_actions = []
+            self._loop_completion_actions.append(action)
+            logger.debug(f"AudioEngine - Stored loop completion action: {action.get('action_id')}")
+            
+        else:
+            logger.warning(f"Unknown trigger type: {trigger_type}")
 
-        if not self._pending_on_beat_actions and not self.any_deck_active():
-            logger.info("AudioEngine - No future-triggered actions and no decks active after initial. Script complete.")
-            self.is_processing_script_actions = False
-            self.shutdown_decks() 
-            return
 
-        self._engine_thread = threading.Thread(target=self._engine_loop, daemon=True)
-        self._engine_thread.start()
 
     def stop_script_processing(self): 
-        logger.info("Stop script processing requested externally.")
-        if not self.is_processing_script_actions and (self._engine_thread is None or not self._engine_thread.is_alive()):
-            logger.info("Engine loop was not running or already finished.")
-            self.is_processing_script_actions = False 
-            self.shutdown_decks()
+        logger.info("Stop event-driven script processing requested externally.")
+        
+        if not self.is_processing_script_actions:
+            logger.info("Script processing was not running.")
             return
 
-        self._engine_stop_event.set() 
-        if self._engine_thread and self._engine_thread.is_alive():
-            logger.info("Waiting for engine thread to complete...")
-            self._engine_thread.join(timeout=1.0) 
-            if self._engine_thread.is_alive(): 
-                logger.warning("Engine thread did not stop cleanly via event.")
+        # Stop the event scheduler
+        if self.event_scheduler:
+            self.event_scheduler.stop()
+            logger.info("Event scheduler stopped.")
+        
+        # Stop the audio clock
+        if self.audio_clock:
+            self.audio_clock.stop()
+            logger.info("Audio clock stopped.")
         
         self.is_processing_script_actions = False 
-        logger.info("Engine processing loop signaled to stop/completed.")
+        logger.info("Event-driven script processing stopped.")
         self.shutdown_decks() 
 
-
-    def _engine_loop(self):
-        logger.info(f"Engine loop started (monitoring {len(self._pending_on_beat_actions)} actions)")
+    def _process_loop_completion_immediate(self, deck_id, completed_action_id):
+        """Process loop completion triggers using the event scheduler"""
+        logger.debug(f"Processing loop completion for deck {deck_id}, action: {completed_action_id}")
         
-        while not self._engine_stop_event.is_set():
-            if not self._pending_on_beat_actions:
-                self.is_processing_script_actions = False 
-                if not self.any_deck_active():
-                    logger.info("All actions dispatched and no decks active. Engine loop self-terminating.")
-                    break 
-                time.sleep(ENGINE_TICK_INTERVAL)
-                continue
-
-            # Check for on_loop_complete triggers
-            for deck_id, deck in self.decks.items():
-                if hasattr(deck, '_loop_just_completed') and deck._loop_just_completed:
-                    completed_action_id = getattr(deck, '_completed_loop_action_id', None)
-                    # Loop just completed all repetitions
-                    for action in self._pending_on_beat_actions[:]:
-                        trigger = action.get("trigger", {})
-                        if (trigger.get("type") == "on_loop_complete" and 
-                            trigger.get("source_deck_id") == deck_id):
-                            
-                            # Check if we need a specific loop action ID
-                            required_action_id = trigger.get("loop_action_id")
-                            if required_action_id is None or required_action_id == completed_action_id:
-                                logger.info(f"Trigger MET: on_loop_complete for action '{action.get('action_id')}' (loop: {completed_action_id})")
-                                self._pending_on_beat_actions.remove(action)
-                                self._execute_action(action)
+        # Find and execute loop completion actions from stored list
+        if hasattr(self, '_loop_completion_actions'):
+            for action in self._loop_completion_actions:
+                trigger = action.get("trigger", {})
+                if (trigger.get("type") == "on_loop_complete" and 
+                    trigger.get("source_deck_id") == deck_id):
                     
-                    # Reset the flag
-                    deck._loop_just_completed = False
-                    deck._completed_loop_action_id = None
-
-            actions_executed_this_tick = []
-            next_round_pending_actions = [] 
-
-            for idx, action in enumerate(self._pending_on_beat_actions): 
-                trigger = action.get("trigger") 
-                trigger_type = trigger.get("type")
-                action_id_for_log = action.get('action_id', f'pending_action_idx_{idx}')
-                
-                triggered_this_tick = False
-
-                if trigger_type == "on_deck_beat":
-                    source_deck_id = trigger.get("source_deck_id")
-                    target_beat_str = trigger.get("beat_number") 
-                    deck = self.decks.get(source_deck_id)
-                    
-                    if deck and target_beat_str is not None:
-                        if not hasattr(deck, 'get_current_beat_count'):
-                            logger.error(f"Deck {source_deck_id} missing get_current_beat_count! Action ID: {action_id_for_log}")
-                            next_round_pending_actions.append(action) 
-                            continue
-                        try:
-                            target_beat = float(target_beat_str)
-                            current_beat = deck.get_synchronized_beat_count()
-                            
-                            # Print beat indicator in DEBUG mode
-                            if logger.isEnabledFor(logging.DEBUG):
-                                self._print_beat_indicator()
-                            
-                            if current_beat >= target_beat: 
-                                logger.info(f"Trigger MET: on_deck_beat for action '{action_id_for_log}'")
-                                triggered_this_tick = True
-                        except ValueError:
-                             logger.error(f"Invalid 'beat_number' format ('{target_beat_str}') for action '{action_id_for_log}'.")
-                        except Exception as e_beat_check:
-                             logger.error(f"Error checking beat count for deck {source_deck_id} (action '{action_id_for_log}'): {e_beat_check}")
-                    else:
-                        logger.warning(f"Invalid trigger data for on_deck_beat action '{action_id_for_log}': Deck={source_deck_id}, BeatNum={target_beat_str}")
-                elif trigger_type == "on_loop_complete":
-                    source_deck_id = trigger.get("source_deck_id")
-                    loop_action_id = trigger.get("loop_action_id")  # Optional: specific loop action ID
-                    deck = self.decks.get(source_deck_id)
-                    
-                    if deck and hasattr(deck, '_loop_just_completed') and deck._loop_just_completed:
-                        completed_action_id = getattr(deck, '_completed_loop_action_id', None)
+                    # Check if we need a specific loop action ID
+                    required_action_id = trigger.get("loop_action_id")
+                    if required_action_id is None or required_action_id == completed_action_id:
+                        logger.info(f"Trigger MET: on_loop_complete for action '{action.get('action_id')}' (loop: {completed_action_id})")
                         
-                        # Check if we need a specific loop action ID
-                        if loop_action_id is None or loop_action_id == completed_action_id:
-                            logger.info(f"Trigger MET: on_loop_complete for action '{action_id_for_log}' (loop: {completed_action_id})")
-                            triggered_this_tick = True
-                            # Reset the flag
-                            deck._loop_just_completed = False
-                            deck._completed_loop_action_id = None
-                else:
-                    logger.warning(f"Action '{action_id_for_log}' in _pending_on_beat_actions has unexpected trigger type: '{trigger_type}'. Removing.")
-                    triggered_this_tick = True 
-                
-                if triggered_this_tick:
-                    actions_executed_this_tick.append(action) 
-                else:
-                    next_round_pending_actions.append(action) 
-            
-            self._pending_on_beat_actions = next_round_pending_actions 
-            
-            if actions_executed_this_tick:
-                for exec_action in actions_executed_this_tick: 
-                    action_command = exec_action.get('command', 'N/A')
-                    action_deck_id = exec_action.get('deck_id', 'Engine-Level')
-                    logger.info(f"Executing: CMD='{action_command}', Deck='{action_deck_id}' for action '{exec_action.get('action_id', 'N/A')}'")
-                    self._execute_action(exec_action) 
-                    if self._engine_stop_event.is_set(): break 
-                if self._engine_stop_event.is_set(): break 
-            
-            time.sleep(ENGINE_TICK_INTERVAL) 
-        
-        self.is_processing_script_actions = False 
-        logger.debug(f"Engine loop finished. Pending actions: {len(self._pending_on_beat_actions)}")
+                        # Schedule the action for immediate execution
+                        self.event_scheduler.schedule_immediate_action(action, priority=75)
+                        
+                        # Note: LoopManager handles completion state internally
+                        logger.debug(f"Loop completion processed for deck {deck_id}, action: {completed_action_id}")
+
+    # OLD: Engine loop removed - replaced by event-driven scheduler
+    # def _engine_loop(self):
+    #     # This method has been replaced by the EventScheduler._execution_loop
+    #     pass 
+        logger.debug("Engine loop finished - replaced by event-driven scheduler")
 
     def _print_beat_indicator(self):
         """Print a clear beat indicator showing current status of all decks"""
@@ -819,22 +962,32 @@ class AudioEngine:
                     deck_status = f"{deck_id}: {current_beat:.0f}/{total_beats} (BPM: {bpm:.2f})"
                     
                     # Add loop status if active
-                    if hasattr(deck, '_loop_active') and deck._loop_active:
-                        loop_done = deck._loop_repetitions_done if hasattr(deck, '_loop_repetitions_done') else 0
-                        loop_total = deck._loop_repetitions_total if hasattr(deck, '_loop_repetitions_total') else 0
-                        if loop_total is not None:
-                            deck_status += f" [Loop: {loop_done}/{loop_total}]"
-                        else:
-                            deck_status += " [Loop: ∞]"
+                    if hasattr(deck, 'loop_manager') and deck.loop_manager.has_active_loop():
+                        loop_info = deck.loop_manager.get_current_loop_info()
+                        if loop_info:
+                            loop_done = loop_info['repetitions_done']
+                            loop_total = loop_info['repetitions_total']
+                            if loop_total is not None:
+                                deck_status += f" [Loop: {loop_done}/{loop_total}]"
+                            else:
+                                deck_status += " [Loop: ∞]"
                     
                     deck_statuses.append(deck_status)
                 else:
                     deck_statuses.append(f"{deck_id}: inactive")
             
+            # Always check for loop completion (not just on beat changes)
+            # This ensures loops complete and trigger actions even between beats
+            self._check_loop_completion_triggers()
+            
             # Only print if a beat changed
             if current_beat_changed:
-                # Get pending actions count
-                pending_actions = len(self._pending_on_beat_actions)
+                # Get pending actions count from event scheduler
+                if hasattr(self, 'event_scheduler') and self.event_scheduler:
+                    scheduler_stats = self.event_scheduler.get_stats()
+                    pending_actions = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
+                else:
+                    pending_actions = 0
                 
                 # Print the beat indicator
                 deck_info = " | ".join(deck_statuses)
@@ -842,6 +995,19 @@ class AudioEngine:
             
         except Exception as e:
             logger.debug(f"Error printing beat indicator: {e}")
+            
+    def _check_loop_completion_triggers(self):
+        """Check all decks for loop completion and trigger appropriate actions"""
+        try:
+            for deck_id, deck in self.decks.items():
+                if hasattr(deck, 'loop_manager'):
+                    completion_status = deck.check_loop_completion()
+                    if completion_status:
+                        # A loop has completed, trigger the completion action
+                        logger.info(f"AudioEngine - Loop completion detected for deck {deck_id}, action: {completion_status['action_id']}")
+                        self._process_loop_completion_immediate(deck_id, completion_status['action_id'])
+        except Exception as e:
+            logger.debug(f"Error checking loop completion triggers: {e}")
 
 
     def _execute_action(self, action_dict):
@@ -849,14 +1015,14 @@ class AudioEngine:
         deck_id = action_dict.get("deck_id")
         parameters = action_dict.get("parameters", {})
 
-        if not command: logger.warning("Action missing 'command'. Skipping."); return
+        if not command: logger.warning("Action missing 'command'. Skipping."); return False
         logger.debug(f"Executing action: {action_dict}")
 
         try:
             if command == "load_track":
                 filepath = parameters.get("filepath")
                 if not deck_id or not filepath:
-                    logger.warning("'load_track' missing deck_id or filepath in parameters. Skipping."); return
+                    logger.warning("'load_track' missing deck_id or filepath in parameters. Skipping."); return False
                 
                 # Validate file exists
                 if not os.path.exists(filepath):
@@ -878,9 +1044,11 @@ class AudioEngine:
                         logger.info(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_deck.bpm} + {tempo_offset_bpm} = {target_bpm} BPM")
                     else:
                         logger.warning(f"Cannot match tempo: reference deck {match_tempo_to} has invalid BPM ({reference_deck.bpm})")
+                
+                return False  # Engine convention: False = success
 
             elif command == "play":
-                if not deck_id: logger.warning("'play' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'play' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
                 
                 # Set volume if specified
@@ -892,16 +1060,20 @@ class AudioEngine:
                 
                 deck.play(start_at_beat=parameters.get("start_at_beat"), 
                           start_at_cue_name=parameters.get("start_at_cue_name"))
+                
+                return False  # Engine convention: False = success
 
             elif command == "pause":
-                if not deck_id: logger.warning("'pause' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'pause' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
                 deck.pause()
+                return False  # Engine convention: False = success
                 
             elif command == "stop":
-                if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
                 deck.stop()
+                return False  # Engine convention: False = success
             
             elif command == "seek_and_play":
                 if not deck_id: logger.warning("'seek_and_play' missing deck_id. Skipping."); return
@@ -993,13 +1165,16 @@ class AudioEngine:
                                        length_beats=length_beats_val, 
                                        repetitions=repetitions_val,
                                        action_id=action_dict.get('action_id'))
+                    return False  # Engine convention: False = success
                 except ValueError: 
                     logger.warning(f"Invalid numeric values for loop parameters: start_beat='{start_beat_from_json}', length_beats='{length_beats_from_json}'. Skipping.")
+                    return False
 
             elif command == "deactivate_loop":
-                if not deck_id: logger.warning("'deactivate_loop' missing deck_id. Skipping."); return
+                if not deck_id: logger.warning("'deactivate_loop' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
                 deck.deactivate_loop()
+                return False  # Engine convention: False = success
             
             elif command == "set_tempo":
                 deck_id = action_dict.get("deck_id")
@@ -1044,6 +1219,95 @@ class AudioEngine:
                 target_high = params.get("target_high")
                 duration_seconds = float(params.get("duration_seconds", 1.0))
                 deck.fade_eq(target_low=target_low, target_mid=target_mid, target_high=target_high, duration_seconds=duration_seconds)
+
+            elif command == "set_stem_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                stem = params.get("stem")
+                
+                # Support both formats: new professional API (low_db, mid_db, high_db) and legacy (low, mid, high)
+                if 'low_db' in params or 'mid_db' in params or 'high_db' in params:
+                    # Professional dB format
+                    low_db = params.get("low_db", 0.0)
+                    mid_db = params.get("mid_db", 0.0) 
+                    high_db = params.get("high_db", 0.0)
+                    enabled = params.get("enabled", None)
+                    result = deck.set_stem_eq(stem, low_db=low_db, mid_db=mid_db, high_db=high_db, enabled=enabled)
+                    if result:
+                        logger.info(f"Set {stem} professional EQ: L={low_db:+.1f}dB M={mid_db:+.1f}dB H={high_db:+.1f}dB")
+                    else:
+                        logger.warning(f"Failed to set {stem} professional EQ")
+                else:
+                    # Legacy linear gain format - convert to dB
+                    low = params.get("low", 1.0)
+                    mid = params.get("mid", 1.0) 
+                    high = params.get("high", 1.0)
+                    
+                    # Convert linear gains to dB (1.0 = 0dB, 2.0 = +6dB, etc.)
+                    import math
+                    low_db = 20 * math.log10(max(0.01, low)) if low > 0 else -40.0
+                    mid_db = 20 * math.log10(max(0.01, mid)) if mid > 0 else -40.0
+                    high_db = 20 * math.log10(max(0.01, high)) if high > 0 else -40.0
+                    
+                    result = deck.set_stem_eq(stem, low_db=low_db, mid_db=mid_db, high_db=high_db, enabled=True)
+                    if result:
+                        logger.info(f"Set {stem} EQ (converted): L={low}→{low_db:+.1f}dB M={mid}→{mid_db:+.1f}dB H={high}→{high_db:+.1f}dB")
+                    else:
+                        logger.warning(f"Failed to set {stem} EQ")
+
+            elif command == "enable_stem_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                stem = params.get("stem")
+                enabled = params.get("enabled")
+                result = deck.enable_stem_eq(stem, enabled)
+                if result:
+                    logger.info(f"{stem} EQ {'enabled' if enabled else 'disabled'}")
+                else:
+                    logger.warning(f"Failed to {'enable' if enabled else 'disable'} {stem} EQ")
+
+            elif command == "set_stem_volume":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                stem = params.get("stem")
+                volume = float(params.get("volume"))
+                result = deck.set_stem_volume(stem, volume)
+                if result:
+                    logger.info(f"Set {stem} volume: {volume}")
+                else:
+                    logger.warning(f"Failed to set {stem} volume")
+
+            elif command == "set_master_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                low_gain = params.get("low_gain", 1.0)
+                mid_gain = params.get("mid_gain", 1.0) 
+                high_gain = params.get("high_gain", 1.0)
+                enabled = params.get("enabled", None)
+                result = deck.set_master_eq(low_gain=low_gain, mid_gain=mid_gain, high_gain=high_gain, enabled=enabled)
+                if result:
+                    logger.info(f"Set master EQ: L={low_gain:.2f}, M={mid_gain:.2f}, H={high_gain:.2f}, enabled={enabled}")
+                else:
+                    logger.warning("Failed to set master EQ")
+
+            elif command == "set_all_stem_eq":
+                deck_id = action_dict.get("deck_id")
+                deck = self._get_or_create_deck(deck_id)
+                params = action_dict.get("parameters", {})
+                
+                # Filter out only stem settings
+                valid_stems = ["vocals", "drums", "bass", "other"]
+                stem_settings = {k: v for k, v in params.items() if k in valid_stems}
+                
+                results = deck.set_all_stem_eq(stem_settings)
+                success_count = sum(1 for success in results.values() if success)
+                total_count = len(results)
+                logger.info(f"Set all stem EQ: {success_count}/{total_count} stems configured successfully")
+                return False  # Engine convention: False = success
             
             elif command == "play_sample":
                 params = action_dict.get("parameters", {})
@@ -1054,13 +1318,15 @@ class AudioEngine:
                 
                 if not sample_id:
                     logger.warning("'play_sample' missing 'sample_id'. Skipping.")
-                    return
+                    return False
                 
                 # Global playback with optional key matching and looping
                 logger.debug(f"Playing sample globally: {sample_id} (volume: {volume}, key_match: {key_match_deck}, repetitions: {repetitions})")
                 success = self._play_global_sample(sample_id=sample_id, volume=volume, key_match_deck=key_match_deck, repetitions=repetitions)
                 if not success:
                     logger.warning(f"Failed to play global sample: {sample_id}")
+                
+                return False  # Engine convention: False = success
             
             elif command == "stop_sample":
                 # Stop any currently playing global samples
@@ -1070,6 +1336,7 @@ class AudioEngine:
                     self._global_sample_loop_repetitions = None
                     self._global_sample_loop_repetitions_done = 0
                 logger.debug("Stopped global sample playback")
+                return False  # Engine convention: False = success
             
             elif command == "load_sample":
                 sample_filepath = parameters.get("sample_filepath")
@@ -1091,6 +1358,7 @@ class AudioEngine:
                     'filepath': sample_filepath,
                     'pitch_semitones': pitch_semitones
                 }
+                return False  # Engine convention: False = success
             
             elif command == "crossfade":
                 params = action_dict.get("parameters", {})
@@ -1116,11 +1384,16 @@ class AudioEngine:
                 timer.start()
                 
                 logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s (will stop {from_deck_id} after fade)")
+                return False  # Engine convention: False = success
             
             elif command == "bpm_match":
                 params = action_dict.get("parameters", {})
                 reference_deck_id = params.get("reference_deck")
                 follow_deck_id = params.get("follow_deck")
+                
+                if not reference_deck_id or not follow_deck_id:
+                    logger.error(f"bpm_match missing reference_deck or follow_deck")
+                    return False
                 
                 reference_deck = self._get_or_create_deck(reference_deck_id)
                 follow_deck = self._get_or_create_deck(follow_deck_id)
@@ -1129,28 +1402,16 @@ class AudioEngine:
                 follow_bpm = follow_deck.bpm
                 
                 logger.info(f"BPM-matching {follow_deck_id} to reference {reference_deck_id}")
-                logger.info(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
+                logger.info(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} Bpm")
                 
                 if reference_bpm <= 0 or follow_bpm <= 0:
                     logger.error(f"Invalid BPM for bpm_match")
-                    return
+                    return False
                 
-                # Check if the required tempo change is cached
-                cache_filepath = follow_deck._get_tempo_cache_filepath(reference_bpm)
-                if not cache_filepath or not os.path.exists(cache_filepath):
-                    logger.warning(f"BPM match: tempo cache not found for {follow_deck_id} at {reference_bpm} BPM")
-                    logger.info(f"Processing tempo {reference_bpm} BPM on-demand (JIT)...")
-                    
-                    # JIT processing - process the missing tempo variant immediately
-                    if self._jit_process_tempo(follow_deck, reference_bpm):
-                        logger.info(f"Successfully processed tempo {reference_bpm} BPM on-demand")
-                    else:
-                        logger.error(f"JIT processing failed for {follow_deck_id} at {reference_bpm} BPM")
-                        return
-                
-                # Only perform tempo matching (BPM match) - this will load from cache
+                # Use real-time tempo processing (no caching needed)
                 follow_deck.set_tempo(reference_bpm)
-                logger.info(f"BPM match complete: {follow_deck_id} synchronized. New BPM: {follow_deck.bpm}")
+                logger.info(f"BPM match complete: {follow_deck_id} synchronized to {reference_bpm} BPM")
+                return False  # Engine convention: False = success
             
             elif command == "ramp_tempo":
                 deck_id = action_dict.get("deck_id")
@@ -1161,27 +1422,44 @@ class AudioEngine:
                 start_bpm = float(params.get("start_bpm"))
                 end_bpm = float(params.get("end_bpm"))
                 curve = params.get("curve", "linear")
-                deck.ramp_tempo(start_beat, end_beat, start_bpm, end_bpm, curve)
+                
+                # Calculate tempo change over the beat range
+                beat_duration = end_beat - start_beat
+                if beat_duration <= 0:
+                    logger.error("Invalid beat range for tempo ramp")
+                    return False
+                
+                # Calculate BPM change per beat
+                bpm_change_per_beat = (end_bpm - start_bpm) / beat_duration
+                
+                # Schedule tempo changes at regular intervals
+                import threading
+                def ramp_tempo():
+                    current_beat = start_beat
+                    current_bpm = start_bpm
+                    while current_beat <= end_beat:
+                        deck.set_tempo(current_bpm)
+                        current_beat += 1.0
+                        current_bpm += bpm_change_per_beat
+                        if current_beat <= end_beat:
+                            # Schedule next tempo change
+                            timer = threading.Timer(60.0 / current_bpm, ramp_tempo)
+                            timer.start()
+                            break
+                
+                # Start the ramp
+                ramp_tempo()
+                logger.info(f"Tempo ramp scheduled: {start_bpm}→{end_bpm} BPM over beats {start_beat}→{end_beat}")
+                return False  # Engine convention: False = success
             
-            elif command == "scratch":
-                if not deck_id: logger.warning("'scratch' missing deck_id. Skipping."); return
-                deck = self._get_or_create_deck(deck_id)
-                params = action_dict.get("parameters", {})
-                pattern = params.get("pattern", [1.0, -1.0])
-                duration_beats = params.get("duration_beats")
-                duration_seconds = params.get("duration_seconds")
-                # Prefer duration_seconds, else convert beats to seconds using BPM
-                if duration_seconds is None and duration_beats is not None and deck.bpm > 0:
-                    duration_seconds = float(duration_beats) * 60.0 / deck.bpm
-                if duration_seconds is None:
-                    logger.warning("'scratch' missing duration (duration_beats or duration_seconds). Skipping."); return
-                deck.trigger_scratch(pattern, duration_seconds)
-            
-            else: logger.warning(f"Unknown command '{command}'. Skipping.")
-        except Exception as e_action:
-            logger.error(f"Failed to execute action {action_dict}: {e_action}")
-            import traceback
-            traceback.print_exc()
+            # Add default return for unhandled commands
+            else:
+                logger.warning(f"Unhandled command: {command}")
+                return False  # Engine convention: False = success
+                
+        except Exception as e:
+            logger.error(f"Error executing action {command}: {e}")
+            return False  # Engine convention: False = success (even on error, we don't want to fail the script)
 
     def shutdown_decks(self):
         logger.info("AudioEngine - Shutting down all decks...")
@@ -1200,6 +1478,18 @@ class AudioEngine:
         for deck in self.decks.values():
             if deck.is_active(): return True
         return False
+    
+    def get_event_scheduler_stats(self):
+        """Get statistics from the event scheduler"""
+        if hasattr(self, 'event_scheduler'):
+            return self.event_scheduler.get_stats()
+        return {}
+    
+    def get_audio_clock_state(self):
+        """Get current audio clock state"""
+        if hasattr(self, 'audio_clock'):
+            return self.audio_clock.get_state()
+        return {}
 
     def _play_global_sample(self, sample_id, volume=1.0, key_match_deck=None, repetitions=None):
         """Play a pre-processed global sample with optional key matching and looping"""
@@ -1389,16 +1679,26 @@ if __name__ == '__main__':
                 decks_are_active = engine.any_deck_active()
 
                 if not engine_is_processing and not decks_are_active:
-                    if not engine._pending_on_beat_actions : 
-                        logger.info("Engine Test - Engine done, no pending actions, and no decks active.")
+                    # Check if event scheduler has any pending events
+                    if hasattr(engine, 'event_scheduler') and engine.event_scheduler:
+                        scheduler_stats = engine.event_scheduler.get_stats()
+                        pending_events = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
+                        if pending_events == 0:
+                            logger.info("Engine Test - Engine done, no pending events, and no decks active.")
+                            break
+                    else:
+                        logger.info("Engine Test - Engine done, no event scheduler, and no decks active.")
                         break 
                 
                 if (time.time() - start_wait_time) > max_script_duration_estimate:
                     logger.warning(f"Engine Test - Max wait time of {max_script_duration_estimate}s reached.")
-                    if engine._pending_on_beat_actions:
-                        logger.debug(f"Engine Test - Still {len(engine._pending_on_beat_actions)} pending actions on timeout:")
-                        for pa_idx, pa in enumerate(engine._pending_on_beat_actions):
-                            logger.debug(f"  Pending {pa_idx+1}: ID='{pa.get('id','N/A')}', CMD='{pa.get('command')}', Deck='{pa.get('deck_id','N/A')}', Trigger={pa.get('trigger')}")
+                    # Log event scheduler status on timeout
+                    if hasattr(engine, 'event_scheduler') and engine.event_scheduler:
+                        scheduler_stats = engine.event_scheduler.get_stats()
+                        pending_events = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
+                        if pending_events > 0:
+                            logger.debug(f"Engine Test - Still {pending_events} pending events on timeout")
+                            logger.debug(f"Event scheduler stats: {scheduler_stats}")
                     break
                 time.sleep(0.5)
             logger.info("Engine Test - Monitoring loop finished or timed out.")

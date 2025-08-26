@@ -1207,10 +1207,12 @@ class FixedBeatViewer:
             # Convert to numpy
             self.audio_data = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
             
-            # Handle stereo
+            # Handle stereo - keep as stereo format (samples, 2)
             if audio_segment.channels == 2:
                 self.audio_data = self.audio_data.reshape((-1, 2))
-                self.audio_data = np.mean(self.audio_data, axis=1)
+            else:
+                # Convert mono to stereo by duplicating
+                self.audio_data = np.stack([self.audio_data, self.audio_data], axis=1)
             
             # Normalize
             if np.max(np.abs(self.audio_data)) > 0:
@@ -1703,8 +1705,18 @@ class FixedBeatViewer:
             for stem_name in stem_names:
                 stem_file = os.path.join(stems_dir, f"{stem_name}.npy")
                 stem_audio = np.load(stem_file)
+                
+                # Ensure consistent stereo format (samples, 2) to match main audio
+                if stem_audio.ndim == 2 and stem_audio.shape[0] == 2:
+                    # Convert (2, samples) to (samples, 2)
+                    stem_audio = stem_audio.T
+                elif stem_audio.ndim == 1:
+                    # Convert mono to stereo by duplicating
+                    stem_audio = np.stack([stem_audio, stem_audio], axis=1)
+                
                 loaded_stems[stem_name] = stem_audio
-                logger.info(f"Loaded {stem_name} stem: {len(stem_audio)} samples")
+                sample_count = len(stem_audio)
+                logger.info(f"Loaded {stem_name} stem: {sample_count} samples (stereo)")
             
             return loaded_stems
         except Exception as e:
@@ -2052,9 +2064,9 @@ class FixedBeatViewer:
         if not self.stems_available or not self.stem_data:
             return self.audio_data
         
-        # Create mixed audio from current playback position
+        # Create mixed audio from current playback position  
         mixed_length = len(self.audio_data)
-        mixed_audio = np.zeros(mixed_length, dtype=np.float32)
+        mixed_audio = np.zeros((mixed_length, 2), dtype=np.float32)  # Stereo output
         
         for stem_name, stem_audio in self.stem_data.items():
             if stem_name in self.stem_volumes:

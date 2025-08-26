@@ -10,6 +10,8 @@ from typing import Optional, Any, Dict
 from enum import Enum
 import logging
 
+from .pedalboard_effects import PedalboardAudioProcessor, create_audio_processor
+
 logger = logging.getLogger(__name__)
 
 class AudioCommand(Enum):
@@ -68,18 +70,14 @@ class LockFreeAudioEngine:
         self._callback_frame_position = 0
         self._callback_audio_data: Optional[np.ndarray] = None
         self._callback_volume = 1.0
-        self._callback_eq = {'low': 1.0, 'mid': 1.0, 'high': 1.0}
         self._callback_playing = False
         
         # Beat detection data
         self._beat_timestamps: Optional[np.ndarray] = None
         self._original_bpm = 120.0
         
-        # EQ processing state
-        self._eq_filters_initialized = False
-        self._eq_low_filter = None
-        self._eq_mid_filter = None  
-        self._eq_high_filter = None
+        # Pedalboard audio processor
+        self._audio_processor = create_audio_processor(sample_rate)
         
         # Effect state
         self._fade_active = False
@@ -206,6 +204,10 @@ class LockFreeAudioEngine:
         # Update shared state (atomic write)
         self._update_shared_state()
     
+    def get_current_eq(self) -> Dict[str, float]:
+        """Get current EQ settings"""
+        return self._audio_processor.get_eq()
+    
     def _process_commands(self):
         """Process all pending commands (called from audio callback)"""
         processed = 0
@@ -239,9 +241,12 @@ class LockFreeAudioEngine:
             self._callback_volume = params.get('volume', 1.0)
             
         elif command == AudioCommand.SET_EQ:
-            if 'low' in params: self._callback_eq['low'] = params['low']
-            if 'mid' in params: self._callback_eq['mid'] = params['mid']
-            if 'high' in params: self._callback_eq['high'] = params['high']
+            # Update Pedalboard processor EQ
+            self._audio_processor.set_eq(
+                low=params.get('low'),
+                mid=params.get('mid'),
+                high=params.get('high')
+            )
             
         elif command == AudioCommand.FADE_EQ:
             self._start_eq_fade(params)
@@ -273,10 +278,12 @@ class LockFreeAudioEngine:
         return self._callback_audio_data[start_frame:end_frame].copy()
     
     def _apply_eq(self, audio_chunk: np.ndarray) -> np.ndarray:
-        """Apply EQ to audio chunk (called from audio callback)"""
-        # Simple EQ for now - can be replaced with proper filters
-        eq_factor = (self._callback_eq['low'] + self._callback_eq['mid'] + self._callback_eq['high']) / 3.0
-        return audio_chunk * eq_factor
+        """Apply EQ to audio chunk using Pedalboard (called from audio callback)"""
+        try:
+            return self._audio_processor.process_audio(audio_chunk)
+        except Exception as e:
+            logger.error(f"EQ processing failed: {e}")
+            return audio_chunk
     
     def _update_effects(self):
         """Update time-based effects like fades (called from audio callback)"""
@@ -285,17 +292,28 @@ class LockFreeAudioEngine:
             if elapsed >= self._fade_duration:
                 # Fade complete
                 self._fade_active = False
-                for param, target in self._fade_target_values.items():
-                    if param in self._callback_eq:
-                        self._callback_eq[param] = target
+                # Apply final target values to processor
+                self._audio_processor.set_eq(
+                    low=self._fade_target_values.get('low'),
+                    mid=self._fade_target_values.get('mid'),
+                    high=self._fade_target_values.get('high')
+                )
             else:
                 # Interpolate fade
                 progress = elapsed / self._fade_duration
+                current_values = {}
                 for param, target in self._fade_target_values.items():
-                    if param in self._callback_eq and param in self._fade_start_values:
+                    if param in self._fade_start_values:
                         start_val = self._fade_start_values[param]
                         current_val = start_val + (target - start_val) * progress
-                        self._callback_eq[param] = current_val
+                        current_values[param] = current_val
+                
+                # Apply interpolated values to processor
+                self._audio_processor.set_eq(
+                    low=current_values.get('low'),
+                    mid=current_values.get('mid'),
+                    high=current_values.get('high')
+                )
     
     def _start_eq_fade(self, params: Dict[str, Any]):
         """Start EQ fade (called from audio callback)"""
@@ -304,7 +322,7 @@ class LockFreeAudioEngine:
         self._fade_duration = params.get('duration', 1.0)
         
         # Store current values as start
-        self._fade_start_values = self._callback_eq.copy()
+        self._fade_start_values = self._audio_processor.get_eq().copy()
         
         # Store targets
         self._fade_target_values = {}
@@ -320,12 +338,15 @@ class LockFreeAudioEngine:
             current_time = self._callback_frame_position / self.sample_rate
             current_beat = float(np.searchsorted(self._beat_timestamps, current_time, side='left'))
         
+        # Get current EQ from processor
+        current_eq = self._audio_processor.get_eq()
+        
         # Atomic state update (no locks needed for simple assignments)
         self._shared_state.current_frame = self._callback_frame_position
         self._shared_state.current_beat = current_beat
         self._shared_state.is_playing = self._callback_playing
         self._shared_state.volume = self._callback_volume
-        self._shared_state.eq_low = self._callback_eq['low']
-        self._shared_state.eq_mid = self._callback_eq['mid']
-        self._shared_state.eq_high = self._callback_eq['high']
+        self._shared_state.eq_low = current_eq.get('low', 1.0)
+        self._shared_state.eq_mid = current_eq.get('mid', 1.0)
+        self._shared_state.eq_high = current_eq.get('high', 1.0)
         self._shared_state.current_bpm = self._original_bpm

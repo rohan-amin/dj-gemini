@@ -1,5 +1,4 @@
 # dj-gemini/audio_engine/deck.py
-# Hybrid Ring Buffer + Professional EQ + Seamless Loop Architecture
 
 import os
 import threading
@@ -20,9 +19,8 @@ import scipy.signal as sps
 from scipy.signal import lfilter_zi
 from config import EQ_SMOOTHING_MS
 from .realtime_tempo import create_realtime_tempo_processor
-from .ring_buffer import RingBuffer as ExternalRingBuffer
-from .professional_eq import ToneEQ3, IsolatorEQ
-from .loop_manager import LoopManager
+from .stem_processor import create_stem_processor
+from .stem_separation import create_stem_separator
 
 # Check for RubberBand availability
 try:
@@ -33,8 +31,11 @@ except ImportError as e:
     RUBBERBAND_STREAMING_AVAILABLE = False
     logger.warning(f"RubberBand streaming not available: {e}")
 
-# PyRubberBand removed - using native rubberband library for consistency with beat_viewer
-PYRUBBERBAND_AVAILABLE = False
+try:
+    import pyrubberband as pyrb
+    PYRUBBERBAND_AVAILABLE = True
+except ImportError:
+    PYRUBBERBAND_AVAILABLE = False
 
 try:
     import librosa
@@ -48,7 +49,7 @@ try:
 except ImportError:
     RUBBERBAND_AVAILABLE = False
 
-PITCH_PRESERVATION_AVAILABLE = RUBBERBAND_STREAMING_AVAILABLE or LIBROSA_AVAILABLE or RUBBERBAND_AVAILABLE
+PITCH_PRESERVATION_AVAILABLE = RUBBERBAND_STREAMING_AVAILABLE or PYRUBBERBAND_AVAILABLE or LIBROSA_AVAILABLE or RUBBERBAND_AVAILABLE
 
 # Command constants for the Deck's internal audio thread
 DECK_CMD_LOAD_AUDIO = "LOAD_AUDIO"
@@ -224,6 +225,173 @@ class RingBuffer:
         with self.lock:
             return self.cap - self.size
 
+class IsolatorEQ:
+    """
+    DJ-style master isolator:
+      - Parallel bands split by Linkwitz–Riley 24 dB/oct crossovers (LR4)
+      - Per-band linear gains (0.0 = kill)
+      - Persistent zi state; crossfaded coefficient updates (default 20 ms)
+    """
+    def __init__(self, sample_rate: int, f_lo: float = 200.0, f_hi: float = 2000.0, xfade_ms: float = 20.0):
+        self.sr = int(sample_rate)
+        self.f_lo = float(f_lo)
+        self.f_hi = float(f_hi)
+        self._xfade = int(max(1, xfade_ms * 1e-3 * self.sr))
+        self._xfade_remaining = 0
+        self._needs_priming = True
+        
+        # Current settings
+        self.low_gain = 1.0
+        self.mid_gain = 1.0
+        self.high_gain = 1.0
+        
+        # Vectorized path state
+        self._vectorized_filters = []
+        self._vec_zi = []
+        self._pending_filters = None
+        self._pending_zi = None
+        
+        self._compute_vectorized_coefficients()
+
+    def set_eq(self, low_gain=None, mid_gain=None, high_gain=None):
+        """Set EQ gains (0.0 = kill, 1.0 = neutral, 2.0 = boost)"""
+        changed = False
+        if low_gain is not None and low_gain != self.low_gain:
+            self.low_gain = float(low_gain)
+            changed = True
+        if mid_gain is not None and mid_gain != self.mid_gain:
+            self.mid_gain = float(mid_gain)
+            changed = True
+        if high_gain is not None and high_gain != self.high_gain:
+            self.high_gain = float(high_gain)
+            changed = True
+            
+        if changed:
+            self._compute_vectorized_coefficients()
+
+    def _compute_vectorized_coefficients(self):
+        """Compute vectorized filter coefficients"""
+        filters = []
+        
+        # Convert gains to dB for filter design
+        low_db = 20 * np.log10(max(self.low_gain, 1e-6))
+        mid_db = 20 * np.log10(max(self.mid_gain, 1e-6)) 
+        high_db = 20 * np.log10(max(self.high_gain, 1e-6))
+        
+        # Design filters (simplified for vectorized processing)
+        if abs(low_db) > 0.1:
+            b_low, a_low = signal.butter(2, self.f_lo / (self.sr / 2), 'low')
+            b_low = b_low * (10 ** (low_db / 20))
+            filters.append((b_low, a_low))
+            
+        if abs(mid_db) > 0.1:
+            b_mid, a_mid = signal.butter(2, [self.f_lo / (self.sr / 2), self.f_hi / (self.sr / 2)], 'band')
+            b_mid = b_mid * (10 ** (mid_db / 20))
+            filters.append((b_mid, a_mid))
+            
+        if abs(high_db) > 0.1:
+            b_high, a_high = signal.butter(2, self.f_hi / (self.sr / 2), 'high')
+            b_high = b_high * (10 ** (high_db / 20))
+            filters.append((b_high, a_high))
+
+        self._schedule_vectorized_update(filters)
+
+    def _schedule_vectorized_update(self, new_filters):
+        """Schedule smooth transition to new filter coefficients"""
+        new_zi = []
+        for b, a in new_filters:
+            try:
+                zi = lfilter_zi(b, a)
+                new_zi.append(zi)
+            except:
+                new_zi.append(np.zeros(len(a) - 1, dtype=np.float64))
+
+        if not self._vectorized_filters:
+            self._vectorized_filters = new_filters
+            self._vec_zi = new_zi
+            self._xfade_remaining = 0
+            return
+
+        self._pending_filters = new_filters
+        self._pending_zi = new_zi
+        self._xfade_remaining = self._xfade
+
+    def process_block(self, x: np.ndarray) -> np.ndarray:
+        """Process audio block with vectorized EQ"""
+        if x.size == 0:
+            return x.astype(np.float32).reshape(-1, 1)
+
+        xin = x.astype(np.float64, copy=False).reshape(-1)
+        
+        # Prime state on first use
+        if self._needs_priming and len(xin) > 0:
+            self._prime_state(xin[0])
+            self._needs_priming = False
+
+        if not self._vectorized_filters:
+            return x.astype(np.float32).reshape(-1, 1)
+
+        def run_chain(data, filters, zi_list):
+            y = data
+            for i, (b, a) in enumerate(filters):
+                if i < len(zi_list) and zi_list[i] is not None:
+                    y, zi_list[i] = signal.lfilter(b, a, y, zi=zi_list[i])
+                else:
+                    y = signal.lfilter(b, a, y)
+            return y
+
+        # No crossfade needed
+        if self._pending_filters is None or self._xfade_remaining <= 0:
+            y = run_chain(xin, self._vectorized_filters, self._vec_zi)
+            return y.astype(np.float32).reshape(-1, 1)
+
+        # Crossfade between old and new filters
+        n = len(xin)
+        nxf = min(self._xfade_remaining, n)
+
+        vec_zi_tmp = [zi.copy() if zi is not None else None for zi in self._vec_zi]
+        pend_zi_tmp = [zi.copy() if zi is not None else None for zi in self._pending_zi]
+
+        y_old = run_chain(xin, self._vectorized_filters, vec_zi_tmp)
+        y_new = run_chain(xin, self._pending_filters, pend_zi_tmp)
+
+        if nxf > 0:
+            w = np.linspace(0.0, 1.0, nxf, dtype=np.float64)
+            y = y_old.copy()
+            y[:nxf] = (1.0 - w) * y_old[:nxf] + w * y_new[:nxf]
+            if nxf < n:
+                y[nxf:] = y_new[nxf:]
+            self._xfade_remaining -= nxf
+        else:
+            y = y_new
+
+        # Commit new filters if crossfade is done
+        if self._xfade_remaining <= 0:
+            self._vectorized_filters = self._pending_filters
+            self._vec_zi = pend_zi_tmp
+            self._pending_filters = None
+            self._pending_zi = None
+
+        return y.astype(np.float32).reshape(-1, 1)
+
+    def _prime_state(self, first_sample_value: float = 0.0):
+        """Prime filter states to avoid startup transients"""
+        if not self._vectorized_filters:
+            return
+        zis = []
+        for b, a in self._vectorized_filters:
+            try:
+                zi = lfilter_zi(b, a) * float(first_sample_value)
+            except:
+                zi = np.zeros(len(a) - 1, dtype=np.float64)
+            zis.append(zi)
+        self._vec_zi = zis
+
+    def reset(self):
+        """Reset all filter states"""
+        self._vec_zi = []
+        self._pending_zi = []
+        self._needs_priming = True
 
 class Deck:
     def __init__(self, deck_id, analyzer_instance, engine_instance=None):
@@ -233,42 +401,11 @@ class Deck:
         logger.debug(f"Deck {self.deck_id} - Initializing...")
 
         self.filepath = None
-        self.sample_rate = 44100  # Default sample rate
+        self.sample_rate = 0
         self.beat_timestamps = np.array([])
         self.bpm = 0.0
         self.total_frames = 0 
         self.cue_points = {} 
-        
-        # === RING BUFFER ARCHITECTURE FOR STEREO AUDIO ===
-        # Ring buffer for real-time audio (5 seconds at 44.1kHz stereo)
-        self.ring_buffer = RingBuffer(capacity_frames=5 * 44100, channels=2)
-        
-        # Producer thread for heavy processing
-        self._producer_thread = None
-        self._producer_running = False
-        self._producer_stop_event = threading.Event()
-        
-        # === PROFESSIONAL STEREO EQ SYSTEM ===
-        # Per-stem tone EQs for musical shaping (stereo)
-        self.stem_tone_eqs = {
-            'vocals': ToneEQ3(self.sample_rate),
-            'drums': ToneEQ3(self.sample_rate),
-            'bass': ToneEQ3(self.sample_rate),
-            'other': ToneEQ3(self.sample_rate)
-        }
-        
-        # Master isolator EQ for kill switches (stereo)
-        self.master_isolator = IsolatorEQ(self.sample_rate, f_lo=200.0, f_hi=2000.0)
-        
-        # Stem EQ control
-        self.stem_eq_enabled = {'vocals': False, 'drums': False, 'bass': False, 'other': False}
-        self.stem_volumes = {'vocals': 1.0, 'drums': 1.0, 'bass': 1.0, 'other': 1.0}
-        self.master_eq_enabled = True
-        
-        # === STEREO AUDIO DATA ===
-        self.audio_data = None  # Will be stereo (frames, 2)
-        self.stems_available = False
-        self.stem_data = {}  # Each stem will be stereo
         
         # Data for Audio Thread's direct use by its callback
         self.audio_thread_data = None
@@ -289,16 +426,18 @@ class Deck:
         self._is_actually_playing_stream_state = False 
         self.seek_in_progress_flag = False 
 
-                # === CENTRALIZED LOOP MANAGEMENT ===
-        self.loop_manager = LoopManager(self)
-        
-        # Set callback for clearing ring buffer during position jumps
-        self.loop_manager.set_clear_ring_buffer_callback(self._clear_ring_buffer_for_position_jump)
+                # --- Loop state attributes ---
+        self._loop_active = False
+        self._loop_start_frame = 0
+        self._loop_end_frame = 0
+        self._loop_repetitions_total = None
+        self._loop_repetitions_done = 0
         
         # --- Synchronized beat state ---
         self._last_synchronized_beat = 0
 
-        # Loop queue handled by LoopManager
+        # Add loop queue for handling multiple loops
+        self._loop_queue = []
 
         # Add tempo state
         self._playback_tempo = 1.0  # 1.0 = original speed
@@ -410,11 +549,12 @@ class Deck:
         self.STEM_NAMES = ['vocals', 'drums', 'bass', 'other']
 
         # --- Ring Buffer Architecture ---
-        self.RING_BUFFER_SIZE = 8192  # 8k frames buffer for tighter control and fewer artifacts
+        self.RING_BUFFER_SIZE = 16384  # 16k frames buffer for smooth audio
         self.out_ring = None  # Will be initialized when sample rate is known
         self.master_isolator = None  # Will be initialized when sample rate is known
         
         # Producer thread for filling ring buffer
+        self._producer_stop = False
         self._producer_error = None
         self.device_output_channels = 1  # Default to mono, updated when stream starts
         
@@ -431,181 +571,11 @@ class Deck:
         # Current tempo ratio for processing
         self.current_tempo_ratio = 1.0
         
-        # Pitch preservation setting - Always enabled for consistent RubberBand processing
-        self.preserve_pitch_enabled = True  # Always use RubberBand for consistency
+        # Pitch preservation setting
+        self.preserve_pitch_enabled = False  # Default to turntable mode (faster)
 
         self.audio_thread.start()
         logger.debug(f"Deck {self.deck_id} - Initialized and audio thread started.")
-
-    def _wait_for_ring_buffer_ready(self):
-        """Wait for ring buffer to have sufficient audio data before starting stream"""
-        if not self.out_ring:
-            return
-            
-        # Wait for at least 2 chunks of audio data to prevent startup artifacts
-        target_frames = 8192  # 2 chunks of 4096 frames
-        max_wait_time = 1.0  # Maximum 1 second wait
-        
-        start_time = time.time()
-        while (self.out_ring.available_read() < target_frames and 
-               time.time() - start_time < max_wait_time):
-            time.sleep(0.001)  # 1ms sleep for tight polling
-            
-        available = self.out_ring.available_read()
-        logger.info(f"Deck {self.deck_id} - Ring buffer ready: {available} frames available")
-        
-        if available < target_frames:
-            logger.warning(f"Deck {self.deck_id} - Ring buffer not fully ready ({available} frames), but proceeding")
-
-    def _clear_ring_buffer_for_position_jump(self, reason="position jump"):
-        """
-        Clear ring buffer to prevent audio artifacts during position jumps.
-        
-        This is critical for preventing "double beat" and other artifacts when:
-        - Loop activation causes immediate position jumps
-        - Seeking to new positions
-        - Starting playback at specific beats
-        """
-        if self.out_ring:
-            frames_cleared = self.out_ring.available_read()
-            self.out_ring.clear()
-            
-            # Also clear any pending audio data to prevent artifacts
-            if hasattr(self, '_pending_out') and self._pending_out is not None:
-                self._pending_out = None
-                logger.debug(f"Deck {self.deck_id} - Pending audio data cleared for {reason}")
-            
-            logger.info(f"Deck {self.deck_id} - Ring buffer cleared for {reason} ({frames_cleared} frames)")
-        else:
-            logger.debug(f"Deck {self.deck_id} - Ring buffer clear requested for {reason} but no ring buffer active")
-
-    # === PROFESSIONAL STEREO EQ API METHODS ===
-    
-    def set_stem_eq(self, stem_name, low_db=0.0, mid_db=0.0, high_db=0.0, enabled=None):
-        """Set per-stem 3-band EQ parameters with smooth transitions"""
-        if stem_name not in self.stem_tone_eqs:
-            logger.warning(f"Deck {self.deck_id} - Unknown stem: {stem_name}")
-            return False
-            
-        # Update EQ parameters with smooth crossfade
-        self.stem_tone_eqs[stem_name].set_params_db(low_db, mid_db, high_db)
-        
-        # Update enabled state if specified
-        if enabled is not None:
-            self.stem_eq_enabled[stem_name] = bool(enabled)
-            
-        logger.info(f"Deck {self.deck_id} - Stem EQ updated: {stem_name} L:{low_db:+.1f}dB M:{mid_db:+.1f}dB H:{high_db:+.1f}dB enabled:{self.stem_eq_enabled[stem_name]}")
-        return True
-    
-    def set_stem_volume(self, stem_name, volume):
-        """Set per-stem volume (0.0 to 1.0)"""
-        if stem_name not in self.stem_volumes:
-            logger.warning(f"Deck {self.deck_id} - Unknown stem: {stem_name}")
-            return False
-            
-        self.stem_volumes[stem_name] = max(0.0, min(1.0, float(volume)))
-        logger.info(f"Deck {self.deck_id} - Stem volume updated: {stem_name} = {self.stem_volumes[stem_name]:.2f}")
-        return True
-    
-    def set_master_eq(self, low_gain=1.0, mid_gain=1.0, high_gain=1.0, enabled=None):
-        """Set master isolator EQ gains (0.0 = kill, 1.0 = full)"""
-        self.master_isolator.set_gains(low_gain, mid_gain, high_gain)
-        
-        if enabled is not None:
-            self.master_eq_enabled = bool(enabled)
-            self.master_isolator.set_enabled(self.master_eq_enabled)
-            
-        logger.info(f"Deck {self.deck_id} - Master EQ updated: L:{low_gain:.2f} M:{mid_gain:.2f} H:{high_gain:.2f} enabled:{self.master_eq_enabled}")
-        return True
-    
-    def enable_stem_eq(self, stem_name, enabled):
-        """Enable/disable per-stem EQ with smooth bypass"""
-        if stem_name not in self.stem_eq_enabled:
-            logger.warning(f"Deck {self.deck_id} - Unknown stem: {stem_name}")
-            return False
-            
-        self.stem_eq_enabled[stem_name] = bool(enabled)
-        
-        # If disabling, set EQ to flat for smooth bypass
-        if not enabled:
-            self.stem_tone_eqs[stem_name].set_params_db(0.0, 0.0, 0.0)
-            
-        logger.info(f"Deck {self.deck_id} - Stem EQ {stem_name}: {'enabled' if enabled else 'disabled'}")
-        return True
-    
-    def _process_stereo_stem_mix(self, target_frames):
-        """
-        Process stems with professional stereo EQ system
-        
-        Returns:
-            np.ndarray: Stereo audio chunk, shape (frames, 2)
-        """
-        if not self.stems_available or not self.stem_data:
-            return None
-            
-        # Get current position
-        start_frame = int(self.audio_thread_current_frame)
-        
-        # Initialize stereo mix
-        mix_chunk = np.zeros((target_frames, 2), dtype=np.float32)
-        
-        # Process each stem with individual EQ and volume
-        for stem_name, stem_audio in self.stem_data.items():
-            if stem_name not in self.stem_volumes:
-                continue
-                
-            # Extract stem chunk
-            end_frame = start_frame + target_frames
-            if start_frame >= len(stem_audio):
-                continue
-                
-            # Get stereo stem data
-            if end_frame > len(stem_audio):
-                # Handle end of track
-                available_frames = len(stem_audio) - start_frame
-                if available_frames <= 0:
-                    continue
-                stem_chunk = np.zeros((target_frames, 2), dtype=np.float32)
-                if stem_audio.ndim == 1:
-                    # Convert mono to stereo
-                    mono_data = stem_audio[start_frame:start_frame + available_frames]
-                    stem_chunk[:available_frames, 0] = mono_data
-                    stem_chunk[:available_frames, 1] = mono_data
-                else:
-                    # Already stereo
-                    stem_chunk[:available_frames] = stem_audio[start_frame:start_frame + available_frames]
-            else:
-                # Normal case
-                if stem_audio.ndim == 1:
-                    # Convert mono to stereo
-                    mono_data = stem_audio[start_frame:end_frame]
-                    stem_chunk = np.column_stack([mono_data, mono_data])
-                else:
-                    # Already stereo
-                    stem_chunk = stem_audio[start_frame:end_frame]
-            
-            # Apply per-stem ToneEQ3 (musical shaping)
-            if self.stem_eq_enabled.get(stem_name, False) and stem_name in self.stem_tone_eqs:
-                try:
-                    stem_chunk = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
-                except Exception as e:
-                    logger.warning(f"Deck {self.deck_id} - Stem EQ error for {stem_name}: {e}")
-            
-            # Apply stem volume
-            stem_volume = self.stem_volumes.get(stem_name, 1.0)
-            stem_chunk *= stem_volume
-            
-            # Add to stereo mix
-            mix_chunk += stem_chunk
-        
-        # Apply master isolator EQ (kill switches)
-        if self.master_eq_enabled:
-            try:
-                mix_chunk = self.master_isolator.process_block(mix_chunk)
-            except Exception as e:
-                logger.warning(f"Deck {self.deck_id} - Master EQ error: {e}")
-        
-        return mix_chunk
 
     def _initialize_eq_filters(self):
         """Initialize EQ filters for real-time processing"""
@@ -652,7 +622,7 @@ class Deck:
             
             # Initialize ring buffer and master isolator EQ
             if self.out_ring is None:
-                self.out_ring = ExternalRingBuffer(self.RING_BUFFER_SIZE, channels=2)
+                self.out_ring = RingBuffer(self.RING_BUFFER_SIZE, channels=2)
                 logger.debug(f"Deck {self.deck_id} - Ring buffer initialized: {self.RING_BUFFER_SIZE} frames")
             
             if self.master_isolator is None:
@@ -692,16 +662,17 @@ class Deck:
     def _load_or_generate_stems(self, audio_filepath, audio_data):
         """Load existing stems or generate new ones"""
         try:
-            # Check if stems already exist (stems must be pre-cached via preprocess_stems.py)
+            # Check if stems already exist
+            stems_cache_dir = self._get_stems_cache_dir(audio_filepath)
             if self._check_stems_exist(audio_filepath):
                 logger.info(f"Deck {self.deck_id} - Loading cached stems for {os.path.basename(audio_filepath)}")
                 self._load_cached_stems(audio_filepath)
             else:
-                logger.info(f"Deck {self.deck_id} - No cached stems found. Run preprocess_stems.py first to generate stems.")
-                self.stems_available = False
+                logger.info(f"Deck {self.deck_id} - Generating stems for {os.path.basename(audio_filepath)}")
+                self._generate_and_cache_stems(audio_filepath, audio_data)
                 
         except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Failed to load stems: {e}")
+            logger.error(f"Deck {self.deck_id} - Failed to load/generate stems: {e}")
             # Continue without stems - fallback to master EQ only
             self.stems_available = False
 
@@ -776,6 +747,43 @@ class Deck:
             logger.error(f"Deck {self.deck_id} - Failed to load cached stems: {e}")
             self.stems_available = False
 
+    def _generate_and_cache_stems(self, audio_filepath, audio_data):
+        """Generate stems using stem separation and cache them"""
+        try:
+            # Use stem separation from the existing module
+            logger.info(f"Deck {self.deck_id} - Starting stem separation (this may take a while)...")
+            
+            # Generate stems - this returns a StemSeparationResult
+            stem_separator = create_stem_separator()
+            stem_result = stem_separator.separate_file(audio_filepath)
+            
+            if stem_result and stem_result.stems:
+                # Cache the generated stems
+                stems_dir = self._get_stems_cache_dir(audio_filepath)
+                os.makedirs(stems_dir, exist_ok=True)
+                
+                self.stem_data = {}
+                for stem_name, stem_data_obj in stem_result.stems.items():
+                    if stem_name in self.STEM_NAMES:
+                        # Extract audio data from StemData object
+                        stem_audio = stem_data_obj.audio_data
+                        self.stem_data[stem_name] = stem_audio
+                        
+                        # Cache to disk
+                        stem_file = os.path.join(stems_dir, f"{stem_name}.npy")
+                        np.save(stem_file, stem_audio)
+                        
+                        logger.debug(f"Deck {self.deck_id} - Generated and cached {stem_name}: {len(stem_audio)} samples")
+                
+                self.stems_available = len(self.stem_data) > 0
+                logger.info(f"Deck {self.deck_id} - Successfully generated and cached {len(self.stem_data)} stems")
+            else:
+                logger.error(f"Deck {self.deck_id} - Stem separation failed or returned no stems")
+                self.stems_available = False
+                
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to generate stems: {e}")
+            self.stems_available = False
 
     def _build_stem_mix_chunk(self, start_frame, num_frames):
         """Build audio chunk from stems with per-stem EQ applied"""
@@ -972,10 +980,6 @@ class Deck:
         # Store original BPM and beat timestamps for tempo scaling
         self.original_bpm = self.bpm
         self.original_beat_timestamps = self.beat_timestamps.copy()  # Store original timestamps
-        
-        # NEW: Update audio clock with beat timing information
-        if hasattr(self, '_engine_instance') and hasattr(self._engine_instance, 'audio_clock'):
-            self._engine_instance.audio_clock.set_beat_timestamps(self.beat_timestamps, self.bpm)
 
         try:
             logger.debug(f"Deck {self.deck_id} - Loading audio samples with MonoLoader...")
@@ -1008,7 +1012,7 @@ class Deck:
         with self._stream_lock:
             self._current_playback_frame_for_display = 0 
             self._user_wants_to_play = False 
-            # Loop state handled by LoopManager 
+            self._loop_active = False 
         
         # Initialize real-time tempo processor
         if self._use_realtime_tempo:
@@ -1136,7 +1140,7 @@ class Deck:
         
         # Calculate frames to offset
         frames_per_beat = (60.0 / self.bpm) * self.sample_rate
-        offset_frames = round(self._pending_phase_offset_beats * frames_per_beat)
+        offset_frames = int(self._pending_phase_offset_beats * frames_per_beat)
         
         # Apply the offset
         current_frame = self._current_playback_frame_for_display
@@ -1199,7 +1203,7 @@ class Deck:
         with self._stream_lock:
             self._user_wants_to_play = False
             self._current_playback_frame_for_display = 0 
-            # Loop state handled by LoopManager 
+            self._loop_active = False 
         self.command_queue.put((DECK_CMD_STOP, None))
 
     def seek(self, target_frame): 
@@ -1211,14 +1215,11 @@ class Deck:
             self._current_playback_frame_for_display = valid_target_frame
             if was_playing_intent: 
                 self.seek_in_progress_flag = True
-            # Loop state handled by LoopManager 
+            self._loop_active = False 
         self.command_queue.put((DECK_CMD_SEEK, {'frame': valid_target_frame, 
                                                'was_playing_intent': was_playing_intent}))
 
     def activate_loop(self, start_beat, length_beats, repetitions=None, action_id=None):
-        """Activate a loop at the specified beat position using LoopManager"""
-        logger.info(f"[LOOP ACTIVATION] Deck {self.deck_id} - Activating loop: {length_beats} beats, {repetitions} reps, Action ID: {action_id}")
-        
         if self.total_frames == 0:
             logger.warning(f"Deck {self.deck_id} - Cannot activate loop: no track loaded.")
             return False
@@ -1227,20 +1228,81 @@ class Deck:
             logger.warning(f"Deck {self.deck_id} - Cannot activate loop: BPM is {self.bpm}.")
             return False
         
-        # Use LoopManager for centralized loop activation
-        success = self.loop_manager.activate_loop(start_beat, length_beats, repetitions, action_id)
+        # Calculate loop frames - USE ORIGINAL BPM FOR CONSISTENCY
+        original_bpm = self.original_bpm if hasattr(self, 'original_bpm') else self.bpm
+        frames_per_beat = (60.0 / original_bpm) * self.audio_thread_sample_rate
+        loop_length_frames = int(length_beats * frames_per_beat)
         
-        if success:
-            logger.info(f"Deck {self.deck_id} - Loop activation successful: {action_id}")
+        # Get start frame - ALWAYS USE ORIGINAL BEAT POSITIONS (don't scale during ramp)
+        if hasattr(self, 'original_beat_positions') and start_beat in self.original_beat_positions:
+            start_frame = self.original_beat_positions[start_beat]
+            # REMOVED: Don't scale frame position during ramp - let audio callback handle tempo changes
         else:
-            logger.error(f"Deck {self.deck_id} - Loop activation failed: {action_id}")
+            # Fallback to get_frame_from_beat
+            start_frame = self.get_frame_from_beat(start_beat)
+        
+        # REMOVED: Pre-roll logic that was causing the artifact
+        # The loop should start exactly at the specified beat, not before it
+        
+        with self._stream_lock:
+            current_playback_frame = self._current_playback_frame_for_display
+        
+        logger.info(f"[LOOP ACTIVATION] Start frame: {start_frame}, Current pointer: {current_playback_frame}")
+        
+        # REMOVED: Crossfade logic that was masking the real issue
+        
+        # Calculate loop end frame
+        end_frame = start_frame + loop_length_frames
+        
+        # DEBUG: Log the exact beat positions for loop start and end
+        end_beat = start_beat + length_beats
+        logger.info(f"[LOOP FRAME CALC] Start beat: {start_beat}, End beat: {end_beat}, Length beats: {length_beats}")
+        logger.info(f"[LOOP FRAME CALC] Start frame: {start_frame}, End frame: {end_frame}, Length frames: {loop_length_frames}")
+        logger.info(f"[LOOP FRAME CALC] Frames per beat: {frames_per_beat:.2f}")
+        logger.info(f"[LOOP FRAME CALC] BPM: {self.bpm}, Sample rate: {self.sample_rate}")
+        
+        # LOG: Current playback frame at loop activation
+        with self._stream_lock:
+            current_playback_frame = self._current_playback_frame_for_display
+        logger.info(f"[LOOP ACTIVATION TIMING] At loop activation: current playback frame = {current_playback_frame}, loop start frame = {start_frame}, delta = {current_playback_frame - start_frame}")
+        
+        logger.debug(f"Deck {self.deck_id} - Activating loop: {length_beats} beats ({loop_length_frames} frames), {repetitions} reps, Action ID: {action_id}")
+        logger.debug(f"Deck {self.deck_id} - Loop frames: {start_frame} to {end_frame}")
+        
+        # DISABLED: Predictive buffer to see the actual timing gap
+        # IMMEDIATE LOOP STATE UPDATE: Set loop state immediately to avoid race condition
+        with self._stream_lock:
+            self._loop_start_frame = start_frame  # Use exact start frame
+            self._loop_end_frame = end_frame
+            self._loop_repetitions_total = repetitions
+            self._loop_repetitions_done = 0
+            self._loop_active = True
+            self._current_loop_action_id = action_id
             
-        return success
+            # IMMEDIATE position correction if we're already past the loop end
+            if self.audio_thread_current_frame >= end_frame:
+                logger.info(f"Deck {self.deck_id} - IMMEDIATE jump: past loop end ({self.audio_thread_current_frame} >= {end_frame}), jumping to start {start_frame}")
+                self.audio_thread_current_frame = start_frame
+                self._current_playback_frame_for_display = start_frame
+                # Clear the loop started flag since we're at the start
+                if hasattr(self, '_loop_started'):
+                    delattr(self, '_loop_started')
+            
+            logger.debug(f"Deck {self.deck_id} - IMMEDIATE loop state set: {action_id} (start: {start_frame}, current: {self.audio_thread_current_frame})")
+        
+        # Send to audio thread for playback pointer update
+        self.command_queue.put((DECK_CMD_ACTIVATE_LOOP, {
+            'start_frame': start_frame,
+            'end_frame': end_frame,
+            'repetitions': repetitions,
+            'action_id': action_id
+        }))
+        
+        return True
 
     def deactivate_loop(self):
-        """Deactivate the current loop using LoopManager"""
         logger.debug(f"Deck {self.deck_id} - Engine requests DEACTIVATE_LOOP.")
-        self.loop_manager.deactivate_loop()
+        self.command_queue.put((DECK_CMD_DEACTIVATE_LOOP, None))
 
     def stop_at_beat(self, beat_number):
         """Stop playback when reaching a specific beat"""
@@ -1331,11 +1393,35 @@ class Deck:
                 
             except Exception as e:
                 logger.error(f"Deck {self.deck_id} - Real-time tempo setting failed: {e}")
-                return False
+                # Fall back to cached method if available
         
-        # No cached tempo fallback - real-time processing only
-        logger.error(f"Deck {self.deck_id} - Real-time tempo processor not available")
-        return False
+        # Fallback to cached tempo processing (legacy method)
+        logger.debug(f"Deck {self.deck_id} - Falling back to cached tempo processing")
+        cache_filepath = self._get_tempo_cache_filepath(target_bpm)
+        if not cache_filepath or not os.path.exists(cache_filepath):
+            logger.error(f"Deck {self.deck_id} - Tempo cache not found for {target_bpm} BPM")
+            logger.error(f"Expected cache file: {cache_filepath}")
+            logger.error(f"Real-time processing failed and no cache available")
+            return False
+        
+        try:
+            logger.debug(f"Deck {self.deck_id} - Loading tempo cache...")
+            processed_audio = np.load(cache_filepath)
+            
+            with self._stream_lock:
+                self.audio_thread_data = processed_audio
+                self.audio_thread_total_samples = len(processed_audio)
+                # Update the BPM to the target BPM
+                self.bpm = target_bpm
+                # Scale the beat timestamps to match the new tempo
+                self._scale_beat_positions(target_bpm / self.original_bpm)
+            
+            logger.info(f"Deck {self.deck_id} - Successfully loaded tempo {target_bpm} BPM from cache")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to load tempo cache: {e}")
+            return False
 
     def set_pitch(self, semitones):
         """Set playback pitch using pre-processed cached audio (cache-only)"""
@@ -1526,6 +1612,32 @@ class Deck:
 
     # --- Per-Stem EQ Control Methods ---
     
+    def set_stem_eq(self, stem_name, low=None, mid=None, high=None):
+        """Set EQ levels for specific stem (0.0 to 3.0 for each band)"""
+        if stem_name not in self.STEM_NAMES:
+            logger.error(f"Deck {self.deck_id} - Invalid stem name: {stem_name}")
+            return False
+            
+        with self._stream_lock:
+            # Ensure stem EQ processor exists
+            if stem_name not in self.stem_tone_eqs:
+                if self.sample_rate > 0:
+                    self.stem_tone_eqs[stem_name] = ToneEQ3(self.sample_rate)
+                else:
+                    logger.warning(f"Deck {self.deck_id} - Cannot create stem EQ: sample rate is 0")
+                    return False
+            
+            # Convert linear gains to dB for ToneEQ3
+            current_gains = self.get_stem_eq(stem_name)
+            low_db = self._linear_to_db(low if low is not None else current_gains['low'])
+            mid_db = self._linear_to_db(mid if mid is not None else current_gains['mid']) 
+            high_db = self._linear_to_db(high if high is not None else current_gains['high'])
+            
+            # Apply to EQ processor
+            self.stem_tone_eqs[stem_name].set_params_db(low_db, mid_db, high_db)
+            
+            logger.debug(f"Deck {self.deck_id} - {stem_name} EQ set: L={low_db:+.1f}dB, M={mid_db:+.1f}dB, H={high_db:+.1f}dB")
+            return True
 
     def get_stem_eq(self, stem_name):
         """Get current EQ levels for specific stem"""
@@ -1889,13 +2001,9 @@ class Deck:
                         self.audio_thread_total_samples = data['total_frames'] 
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0
-                        # Loop state handled by LoopManager
-                    
-                    # Initialize RubberBand stretcher for consistent audio processing
-                    if RUBBERBAND_STREAMING_AVAILABLE:
-                        self._init_rubberband_stretcher()
-                        logger.debug(f"Deck {self.deck_id} - RubberBand initialized for consistent processing")
-                    
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
                     logger.debug(f"Deck {self.deck_id} AudioThread - Audio data set internally for playback.")
 
                 elif command == DECK_CMD_PLAY:
@@ -1914,23 +2022,22 @@ class Deck:
                         
                         self._current_playback_frame_for_display = self.audio_thread_current_frame
 
-                        # CRITICAL: Clear ring buffer for new stream to prevent artifacts
-                        self._clear_ring_buffer_for_position_jump("new stream creation")
-                        
-                        # Reset loop state for new streams (handled by LoopManager)
-                        self.loop_manager.deactivate_loop()
-                        
-                        # Reset startup fade for new stream
-                        if hasattr(self, '_startup_fade_active'):
-                            self._startup_fade_active = False
-                            logger.debug(f"Deck {self.deck_id} AudioThread - Loop state reset for new stream.")
+                        # Reset loop parameters whenever a new PLAY command (not just resume) is initiated
+                        # This ensures a seek-via-play or play-from-cue clears old loop state.
+                        self._loop_active = False
+                        self._loop_start_frame = 0
+                        self._loop_end_frame = 0
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
+                        self._loop_queue.clear()  # Clear any pending loops
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Loop state reset for PLAY.")
 
                         logger.debug(f"Deck {self.deck_id} AudioThread - Creating new stream. SR: {self.audio_thread_sample_rate}, Frame: {self.audio_thread_current_frame}")
                         _current_stream_in_thread = sd.OutputStream(
                             samplerate=self.audio_thread_sample_rate, channels=2,
                             callback=self._sd_callback, 
                             finished_callback=self._on_stream_finished_from_audio_thread, 
-                            blocksize=2048,  # Same as beat_viewer_fixed - prevents startup artifacts
+                            blocksize=256,  # PATCH: Lower buffer size for tighter loop cueing
                             device=None  # Use default device
                         )
                         self.playback_stream_obj = _current_stream_in_thread 
@@ -1938,31 +2045,17 @@ class Deck:
                         # Set device output channels for ring buffer processing
                         self.device_output_channels = 2  # Stereo output
                         
-                        # CRITICAL FIX: Start producer thread FIRST to pre-fill ring buffer
+                        # Start producer thread for ring buffer-based playback
                         self._start_producer_thread()
                         
-                        # Give producer thread a moment to start producing audio
-                        time.sleep(0.01)  # 10ms startup delay
-                        
-                        # Wait for ring buffer to have some data before starting audio stream
-                        self._wait_for_ring_buffer_ready()
-                        
-                        # CRITICAL FIX: Enable startup fade-in to prevent pop/click
-                        self._startup_fade_active = True
-                        self._startup_fade_frames = 0
-                        self._startup_fade_total_frames = int(0.01 * self.audio_thread_sample_rate)  # 10ms fade-in
-                        
-                        # Now start audio stream with pre-filled buffer
                         _current_stream_in_thread.start()
                         self._is_actually_playing_stream_state = True
-                        
-                        logger.debug(f"Deck {self.deck_id} AudioThread - New stream and producer thread started for PLAY.")
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Stream and producer thread started for PLAY.")
                     
                 elif command == DECK_CMD_PAUSE:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing PAUSE")
                     # Stop producer thread
-                    self._producer_stop_event.set()
-                    self._producer_running = False
+                    self._producer_stop = True
                     if _current_stream_in_thread and _current_stream_in_thread.active:
                         logger.debug(f"Deck {self.deck_id} AudioThread - Calling stream.stop() for PAUSE.")
                         _current_stream_in_thread.stop(ignore_errors=True) 
@@ -1973,21 +2066,17 @@ class Deck:
                 elif command == DECK_CMD_STOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing STOP")
                     # Stop producer thread
-                    self._producer_stop_event.set()
-                    self._producer_running = False
+                    self._producer_stop = True
                     # Clean up RubberBand resources
                     self._cleanup_rubberband_on_stop()
                     with self._stream_lock: 
-                        # CRITICAL: Clear ring buffer to prevent artifacts
-                        self._clear_ring_buffer_for_position_jump("stop command")
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0 
                         self._is_actually_playing_stream_state = False
-                        # Loop state handled by LoopManager
-                        
-                        # Reset startup fade
-                        if hasattr(self, '_startup_fade_active'):
-                            self._startup_fade_active = False
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
+                        self._loop_queue.clear()  # Clear any pending loops
                     logger.debug(f"Deck {self.deck_id} AudioThread - State reset for STOP.")
 
                 elif command == DECK_CMD_SEEK:
@@ -1995,16 +2084,13 @@ class Deck:
                     was_playing_intent = data['was_playing_intent']
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
                     with self._stream_lock:
-                        # CRITICAL: Clear ring buffer on seek to prevent old audio artifacts
-                        self._clear_ring_buffer_for_position_jump("seek operation")
                         self.audio_thread_current_frame = new_frame
                         self._current_playback_frame_for_display = new_frame 
                         self._user_wants_to_play = was_playing_intent 
-                        # Loop state handled by LoopManager
-                        
-                        # Reset startup fade
-                        if hasattr(self, '_startup_fade_active'):
-                            self._startup_fade_active = False
+                        self._loop_active = False 
+                        self._loop_repetitions_total = None
+                        self._loop_repetitions_done = 0
+                        self._loop_queue.clear()  # Clear any pending loops
                     if was_playing_intent: 
                         logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
                         self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
@@ -2015,15 +2101,53 @@ class Deck:
                 elif command == DECK_CMD_ACTIVATE_LOOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing ACTIVATE_LOOP")
                     
-                    # Loop activation is now handled by LoopManager in the main activate_loop method
-                    # This command is no longer needed since LoopManager handles everything centrally
-                    logger.debug(f"Deck {self.deck_id} AudioThread - Loop activation handled by LoopManager")
+                    # Add to queue or replace current loop
+                    loop_data = {
+                        'start_frame': data['start_frame'],
+                        'end_frame': data['end_frame'],
+                        'repetitions': data.get('repetitions'),
+                        'action_id': data.get('action_id')
+                    }
+                    
+                    # Log loop activation info without dumping arrays
+                    start_frame = data['start_frame']
+                    if self.audio_thread_data is not None:
+                        logger.debug(f"[LOOP ACTIVATION] Frame {start_frame}: Loop activated")
+
+                    with self._stream_lock:
+                        # Always update loop parameters, even if another loop is active
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Setting new loop parameters: start={data['start_frame']}, end={data['end_frame']}, reps={data.get('repetitions')}")
+                        self._loop_start_frame = data['start_frame']
+                        self._loop_end_frame = data['end_frame']
+                        self._loop_repetitions_total = data.get('repetitions')
+                        self._loop_repetitions_done = 0
+                        self._loop_active = True
+                        self._current_loop_action_id = data.get('action_id')
+                        
+                        # Clear the loop started flag for the new loop
+                        if hasattr(self, '_loop_started'):
+                            delattr(self, '_loop_started')
+                        
+                        # Clear debug flags for new loop
+                        if hasattr(self, '_loop_debug_logged_activation'):
+                            delattr(self, '_loop_debug_logged_activation')
+                        
+                        logger.info(f"Deck {self.deck_id} AudioThread - New loop activated: {data.get('action_id')} (start={data['start_frame']}, end={data['end_frame']})")
+                        
+                        # If we're already past the loop end, jump back to start immediately
+                        if self.audio_thread_current_frame >= self._loop_end_frame:
+                            logger.info(f"Deck {self.deck_id} AudioThread - Already past loop end ({self.audio_thread_current_frame} >= {self._loop_end_frame}), jumping to start")
+                            self.audio_thread_current_frame = self._loop_start_frame
+                            self._current_playback_frame_for_display = self._loop_start_frame
+                        elif self.audio_thread_current_frame >= self._loop_start_frame:
+                            logger.info(f"Deck {self.deck_id} AudioThread - Already at loop start position, loop will be active immediately")
 
                 elif command == DECK_CMD_DEACTIVATE_LOOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing DEACTIVATE_LOOP")
-                    # Use LoopManager for centralized loop deactivation
-                    self.loop_manager.deactivate_loop()
-                    logger.debug(f"Deck {self.deck_id} AudioThread - Loop deactivated by LoopManager.")
+                    with self._stream_lock:
+                        self._loop_active = False
+                        self._loop_queue.clear()  # Clear any pending loops
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Loop deactivated and queue cleared.")
 
                 elif command == DECK_CMD_STOP_AT_BEAT:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing STOP_AT_BEAT")
@@ -2099,69 +2223,32 @@ class Deck:
 
     def _start_producer_thread(self):
         """Start the producer thread to fill ring buffer"""
-        logger.info(f"🎵 Deck {self.deck_id} - _start_producer_thread called")
-        
-        # Clean up any existing producer thread
-        if hasattr(self, '_producer_thread') and self._producer_thread and self._producer_thread.is_alive():
-            logger.debug(f"🎵 Deck {self.deck_id} - Cleaning up existing producer thread")
-            self._producer_stop_event.set()
-            self._producer_thread.join(timeout=1.0)
-        
-        # Reset state and start new producer thread
-        self._producer_stop_event.clear()
-        self._producer_running = True
-        self._producer_startup_mode = True  # Flag for startup mode
-        
-        logger.debug(f"🎵 Deck {self.deck_id} - Creating new producer thread")
-        self._producer_thread = threading.Thread(target=self._producer_loop, daemon=True)
-        
-        logger.debug(f"🎵 Deck {self.deck_id} - Starting producer thread")
-        self._producer_thread.start()
-        
-        logger.info(f"🎵 Deck {self.deck_id} - Producer thread started in startup mode")
-        logger.debug(f"🎵 Deck {self.deck_id} - Producer thread alive: {self._producer_thread.is_alive()}")
+        self._producer_stop = False
+        self._producer_error = None
+        t = threading.Thread(target=self._producer_loop, daemon=True)
+        t.start()
+        logger.info(f"Deck {self.deck_id} - Producer thread started")
     
     def _producer_loop(self):
         """Continuously fill out_ring with processed audio."""
         logger.info(f"🎵 Deck {self.deck_id} - PRODUCER LOOP STARTED")
-        TARGET_BLOCK = 4096  # frames per chunk we produce - smaller chunks for tighter control
-        WATERMARK = self.sample_rate // 16 if self.sample_rate > 0 else 2756  # Lower watermark for smaller buffer
+        TARGET_BLOCK = 8192  # frames per chunk we produce
+        WATERMARK = self.sample_rate // 8 if self.sample_rate > 0 else 5512  # Fallback watermark
         
         # Ring buffer variables for partial writes
         self._pending_out = None
 
-        logger.info(f"🎵 Deck {self.deck_id} - Producer loop condition check: stop_event={self._producer_stop_event.is_set()}, wants_to_play={self._user_wants_to_play}")
-        
-        while not self._producer_stop_event.is_set() and self._user_wants_to_play:
+        while not self._producer_stop and self._user_wants_to_play:
             try:
-                # CRITICAL FIX: Don't back off on startup - we need to fill the buffer quickly
-                available_data = self.out_ring.available_read() if self.out_ring else 0
-                
-                # Only back off if we have sufficient data and buffer is getting full
-                if available_data > WATERMARK and available_data > 4096:  # Must have at least 1 chunk
-                    # Exit startup mode once we have sufficient data
-                    if hasattr(self, '_producer_startup_mode') and self._producer_startup_mode:
-                        self._producer_startup_mode = False
-                        logger.info(f"🎵 Deck {self.deck_id} - Producer startup mode complete, switching to normal pacing")
-                    
-                    backoff = 0.002
+                # Dynamic backoff for producer pacing
+                available_data = self.out_ring.available_data() if self.out_ring else 0
+                backoff = 0.002 if available_data > WATERMARK else 0.0
+                if backoff:
                     logger.debug(f"🎵 Deck {self.deck_id} - RING BUFFER FULL: available={available_data}, watermark={WATERMARK} - backing off")
                     time.sleep(backoff)
                     continue
                 
-                # In startup mode, log every chunk to track progress
-                if hasattr(self, '_producer_startup_mode') and self._producer_startup_mode:
-                    logger.info(f"🎵 Deck {self.deck_id} - STARTUP MODE: Producing chunk, available_data={available_data}")
-                else:
-                    logger.debug(f"🎵 Deck {self.deck_id} - PROCEEDING WITH CHUNK PRODUCTION: available_data={available_data}, watermark={WATERMARK}")
-                
-                # DEBUG: Log audio data status
-                if hasattr(self, 'audio_thread_data') and self.audio_thread_data is not None:
-                    logger.debug(f"🎵 Deck {self.deck_id} - Audio data: {len(self.audio_thread_data)} samples, current frame: {self.audio_thread_current_frame}")
-                else:
-                    logger.error(f"🎵 Deck {self.deck_id} - NO AUDIO DATA AVAILABLE!")
-                    time.sleep(0.01)
-                    continue
+                logger.debug(f"🎵 Deck {self.deck_id} - PROCEEDING WITH CHUNK PRODUCTION: available_data={available_data}, watermark={WATERMARK}")
 
                 # Compute a chunk - choose processing path
                 # Check current RubberBand state and pending operations
@@ -2174,19 +2261,17 @@ class Deck:
                     finally:
                         self._rb_lock.release()
                 
-                # Always use RubberBand for consistent audio processing architecture
-                logger.debug(f"🎵 Deck {self.deck_id} - PRODUCER PATH: using RubberBand (consistent architecture)")
+                # Use RubberBand if: pitch preservation is enabled AND we have active RB or pending operations
+                use_rubberband = (RUBBERBAND_STREAMING_AVAILABLE and 
+                                hasattr(self, 'preserve_pitch_enabled') and self.preserve_pitch_enabled and
+                                (has_active_rb or has_pending_rb_ops))
                 
-                if RUBBERBAND_STREAMING_AVAILABLE:
+                logger.info(f"🎵 Deck {self.deck_id} - PRODUCER PATH: use_rubberband={use_rubberband}")
+                
+                if use_rubberband:
                     chunk = self._produce_chunk_rubberband(TARGET_BLOCK)
-                    if chunk is not None:
-                        logger.debug(f"🎵 Deck {self.deck_id} - Produced chunk: {chunk.shape}, sum: {np.sum(chunk):.3f}")
-                    else:
-                        logger.warning(f"🎵 Deck {self.deck_id} - RubberBand produced no chunk")
                 else:
-                    # If RubberBand is not available, we should fail gracefully rather than use inconsistent processing
-                    logger.error(f"🎵 Deck {self.deck_id} - RubberBand not available! Cannot process audio with consistent architecture.")
-                    chunk = np.zeros((TARGET_BLOCK, 2), dtype=np.float32)  # Return silence
+                    chunk = self._produce_chunk_turntable(TARGET_BLOCK)
 
                 if chunk is None or (isinstance(chunk, np.ndarray) and chunk.size == 0):
                     # End: pad zeros to drain
@@ -2211,13 +2296,6 @@ class Deck:
                         current_time_seconds = self.audio_thread_current_frame / self.audio_thread_sample_rate
                         beat_count = np.searchsorted(self.beat_timestamps, current_time_seconds, side='left')
                         self._last_synchronized_beat = beat_count
-                        
-
-                        
-                        # NEW: Update audio clock if we have access to it
-                        if hasattr(self, '_engine_instance') and hasattr(self._engine_instance, 'audio_clock'):
-                            self._engine_instance.audio_clock.update_frame_count(TARGET_BLOCK)
-                            
                     except Exception as e:
                         logger.debug(f"Deck {self.deck_id} - Error updating synchronized beat: {e}")
                 
@@ -2232,17 +2310,12 @@ class Deck:
                 self._pending_out = None  # Clear pending on error
                 time.sleep(0.01)  # Brief pause on error
 
-        # Clean up producer state on exit
-        self._producer_running = False
-        if hasattr(self, '_producer_startup_mode'):
-            self._producer_startup_mode = False
         logger.info(f"🎵 Deck {self.deck_id} - PRODUCER LOOP ENDED")
     def _produce_chunk_rubberband(self, out_frames):
-        """Produce audio chunk using streaming RubberBand - ONLY processing method for consistency"""
+        """Produce audio chunk using streaming RubberBand with proper locking"""
         if not RUBBERBAND_STREAMING_AVAILABLE:
-            # RubberBand is required for consistent architecture
-            logger.error(f"Deck {self.deck_id} - RubberBand streaming not available! Cannot process audio.")
-            return np.zeros((out_frames, 2), dtype=np.float32)
+            # Fall back to turntable method if RubberBand not available
+            return self._produce_chunk_turntable(out_frames)
             
         try:
             # Initialize RubberBand stretcher if needed
@@ -2251,40 +2324,6 @@ class Deck:
             
             # Get current playback position
             start_frame = int(self.audio_thread_current_frame)
-            
-            # === CENTRALIZED LOOP MANAGEMENT ===
-            # Single point of loop boundary detection using LoopManager
-            if self.loop_manager.has_active_loop() or self.loop_manager.has_pending_loop():
-                loop_result = self.loop_manager.check_boundaries(start_frame)
-                
-                # Handle loop actions returned by LoopManager
-                if loop_result["action"] == "jump_to_start":
-                    # Jump back to loop start
-                    jump_frame = loop_result["jump_frame"]
-                    logger.debug(f"Deck {self.deck_id} - Loop jump to start: frame {jump_frame}")
-                    
-                    # Only clear ring buffer if we have significant data in it to prevent artifacts
-                    # Small amounts of data won't cause noticeable artifacts
-                    if hasattr(self, '_ring_buffer') and hasattr(self._ring_buffer, 'get_available_frames'):
-                        available_frames = self._ring_buffer.get_available_frames()
-                        if available_frames > 1024:  # Only clear if more than 1KB of data
-                            self._clear_ring_buffer_for_position_jump("loop repetition jump")
-                    
-                    self.audio_thread_current_frame = jump_frame
-                    self._current_playback_frame_for_display = jump_frame
-                    start_frame = int(jump_frame)
-                    
-                elif loop_result["action"] == "activated":
-                    logger.debug(f"Deck {self.deck_id} - Loop activated: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "completed":
-                    logger.debug(f"Deck {self.deck_id} - Loop completed: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "restarted":
-                    logger.debug(f"Deck {self.deck_id} - Loop restarted: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "finished":
-                    logger.debug(f"Deck {self.deck_id} - Loop finished: {loop_result['loop_id']}")
             
             # Check bounds
             if start_frame >= len(self.audio_thread_data):
@@ -2298,27 +2337,20 @@ class Deck:
             if input_chunk_size <= 0:
                 return None
             
-            # Build stem mix with per-stem EQ processing (mono for RubberBand compatibility)
+            # Build stem mix with per-stem EQ processing
             if self.stems_available and self.stem_data:
-                input_chunk = np.zeros(input_chunk_size, dtype=np.float32)  # Mono
+                input_chunk = np.zeros(input_chunk_size, dtype=np.float32)
                 for stem_name, stem_audio in self.stem_data.items():
                     if start_frame + input_chunk_size <= len(stem_audio):
                         # Get raw stem chunk
                         stem_chunk = stem_audio[start_frame:start_frame + input_chunk_size]
                         
-                        # Convert to mono if stereo (average both channels like beat_viewer)
-                        if stem_chunk.ndim == 2:
-                            if stem_chunk.shape[1] == 2:
-                                stem_chunk = np.mean(stem_chunk, axis=1)  # Average left + right
-                            elif stem_chunk.shape[0] == 2:
-                                stem_chunk = np.mean(stem_chunk, axis=0)  # Average channels
-                        
-                        # Apply per-stem tone EQ if enabled (EQ expects mono)
+                        # Apply per-stem tone EQ if enabled
                         if (stem_name in self.stem_tone_eqs and 
                             self.stem_eq_enabled.get(stem_name, False)):
                             try:
                                 stem_chunk_eq = self.stem_tone_eqs[stem_name].process_block(stem_chunk)
-                                stem_chunk = stem_chunk_eq.flatten() if stem_chunk_eq.ndim > 1 else stem_chunk_eq
+                                stem_chunk = stem_chunk_eq.flatten()  # Convert (N,1) back to (N,)
                             except Exception as e:
                                 logger.warning(f"Deck {self.deck_id} - Stem EQ error for {stem_name}: {e}")
                         
@@ -2326,95 +2358,77 @@ class Deck:
                         stem_volume = self.stem_volumes.get(stem_name, 1.0)
                         input_chunk += stem_chunk * stem_volume
             else:
-                # Use main audio data (convert to mono by averaging like beat_viewer)
-                main_audio = self.audio_thread_data[start_frame:start_frame + input_chunk_size]
-                if main_audio.ndim == 2:
-                    if main_audio.shape[1] == 2:
-                        input_chunk = np.mean(main_audio, axis=1)  # Average left + right
-                    elif main_audio.shape[0] == 2:
-                        input_chunk = np.mean(main_audio, axis=0)  # Average channels
-                else:
-                    input_chunk = main_audio
+                # Use main audio data
+                input_chunk = self.audio_thread_data[start_frame:start_frame + input_chunk_size]
             
-            # Process with streaming RubberBand (same as beat_viewer primary method)
+            # Process with RubberBand
             with self._rb_lock:
                 if self.rubberband_stretcher:
-                    # Convert mono to 2D format for streaming RubberBand (like beat_viewer)
-                    # Beat_viewer uses: input_block = np.column_stack([input_chunk, input_chunk])
-                    input_block = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
+                    # Convert to stereo for RubberBand (expects 2D array)
+                    input_stereo = np.column_stack([input_chunk, input_chunk]).astype(np.float32)
                     
-                    # Validate buffer (same as beat_viewer)
-                    input_block = self._validate_rubberband_buffer(input_block)
+                    # Validate buffer before processing
+                    input_stereo = self._validate_rubberband_buffer(input_stereo)
                     
-                    # Process with streaming RubberBand (same as beat_viewer)
-                    self.rubberband_stretcher.process(input_block, final=False)
+                    # Process through RubberBand
+                    processed_audio = self.rubberband_stretcher.process(input_stereo)
                     
-                    # Retrieve available output
-                    available = self.rubberband_stretcher.available()
-                    if available > 0:
-                        output_block = self.rubberband_stretcher.retrieve(min(available, out_frames))
-                        if output_block is not None and len(output_block) > 0:
-                            # Convert back to mono like beat_viewer: average stereo channels
-                            if output_block.shape[1] == 2:
-                                processed_mono = np.mean(output_block, axis=1)  # Average left + right
-                            else:
-                                processed_mono = output_block[:, 0]
-                            
-                            # Convert back to stereo for output
-                            processed_chunk = np.column_stack([processed_mono, processed_mono])
-                        else:
-                            logger.warning(f"Deck {self.deck_id} - RubberBand retrieve returned None/empty - returning silence")
-                            processed_chunk = np.zeros((out_frames, 2), dtype=np.float32)
+                    # Convert back to mono (take left channel)
+                    if processed_audio.ndim > 1:
+                        processed_chunk = processed_audio[:, 0]
                     else:
-                        # No output available yet, return silence or fall back
-                        processed_chunk = np.zeros((out_frames, 2), dtype=np.float32)
-                else:
-                    logger.error(f"Deck {self.deck_id} - RubberBand stretcher not available - returning silence")
-                    return np.zeros((out_frames, 2), dtype=np.float32)
-                
-                # Update playback position based on actual input consumed
-                self.audio_thread_current_frame += input_chunk_size
-                
-                # Keep display frame synchronized with actual frame in ring buffer architecture
-                with self._stream_lock:
-                    self._current_playback_frame_for_display = self.audio_thread_current_frame
+                        processed_chunk = processed_audio
                     
-                    # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
+                    # Update playback position based on actual input consumed
+                    self.audio_thread_current_frame += input_chunk_size
                     
-                    # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
-                    
-                    # Apply master isolator EQ
-                    if self.master_isolator and processed_chunk is not None:
-                        processed_chunk = self.master_isolator.process_block(processed_chunk)
-                    
-                    # Check if processed_chunk is still valid before volume
-                    if processed_chunk is None:
-                        logger.warning(f"Deck {self.deck_id} - processed_chunk is None after EQ - returning silence")
-                        return np.zeros((out_frames, 2), dtype=np.float32)
-                    
-                    # Apply volume
-                    processed_chunk = processed_chunk * self._volume
+                    # Check for loop boundaries in RubberBand path too
+                    if self._loop_active and self.audio_thread_current_frame >= self._loop_end_frame:
+                        logger.debug(f"Deck {self.deck_id} - Loop end reached (RubberBand): frame {self.audio_thread_current_frame} >= {self._loop_end_frame}")
+                        self._loop_repetitions_done += 1
+                        logger.info(f"Deck {self.deck_id} - Loop repetition {self._loop_repetitions_done}/{self._loop_repetitions_total} completed")
+                        
+                        if self._loop_repetitions_total is None or self._loop_repetitions_done < self._loop_repetitions_total:
+                            # Continue looping - jump back to start
+                            self.audio_thread_current_frame = self._loop_start_frame
+                            # Also update display frame
+                            with self._stream_lock:
+                                self._current_playback_frame_for_display = self._loop_start_frame
+                            logger.info(f"Deck {self.deck_id} - Jumping back to loop start: frame {self._loop_start_frame}")
+                        else:
+                            # Loop complete - disable and continue
+                            logger.info(f"Deck {self.deck_id} - Loop completed after {self._loop_repetitions_done} repetitions")
+                            self._loop_active = False
+                            # Clear loop started flag for next loop
+                            if hasattr(self, '_loop_started'):
+                                delattr(self, '_loop_started')
+                            # Signal loop completion to engine
+                            if hasattr(self, '_current_loop_action_id') and self._current_loop_action_id:
+                                # Set flags that the engine will check (for legacy polling)
+                                self._loop_just_completed = True
+                                self._completed_loop_action_id = self._current_loop_action_id
+                                logger.info(f"Deck {self.deck_id} - Loop completion signaled (RubberBand): action_id={self._current_loop_action_id}")
+                                
+                                # IMMEDIATE processing - call engine directly to eliminate gap
+                                if self.engine and hasattr(self.engine, '_process_loop_completion_immediate'):
+                                    self.engine._process_loop_completion_immediate(self.deck_id, self._current_loop_action_id)
                     
                     # Return requested number of frames (truncate or pad as needed)
                     if len(processed_chunk) >= out_frames:
-                        result_chunk = processed_chunk[:out_frames]
+                        return processed_chunk[:out_frames].reshape(-1, 1)
                     else:
                         # Pad with zeros if not enough output
-                        result_chunk = np.zeros((out_frames, 2), dtype=np.float32)
-                        result_chunk[:len(processed_chunk)] = processed_chunk
-                    
-                    # Ensure correct stereo shape for ring buffer
-                    if result_chunk.ndim == 1:
-                        result_chunk = np.column_stack([result_chunk, result_chunk])
-                    
-                    return result_chunk.reshape(-1, 2)
+                        padded = np.zeros(out_frames, dtype=np.float32)
+                        padded[:len(processed_chunk)] = processed_chunk
+                        return padded.reshape(-1, 1)
+                else:
+                    # RubberBand not available, fall back to turntable method
+                    return self._produce_chunk_turntable(out_frames)
                     
         except Exception as e:
             logger.error(f"Deck {self.deck_id} - RubberBand processing error: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return silence on error to maintain consistent architecture
-            return np.zeros((out_frames, 2), dtype=np.float32)
+            # Fall back to turntable method on error
+            return self._produce_chunk_turntable(out_frames)
 
     def _init_rubberband_stretcher(self):
         """Initialize RubberBand streaming processor"""
@@ -2428,16 +2442,15 @@ class Deck:
                 
                 # RubberBand options for real-time processing
                 options = rubberband_ctypes.RubberBandOptionProcessRealTime | \
-                         rubberband_ctypes.RubberBandOptionTransientsMixed | \
-                         rubberband_ctypes.RubberBandOptionPhaseLaminar | \
-                         rubberband_ctypes.RubberBandOptionChannelsTogether
+                         rubberband_ctypes.RubberBandOptionStretchElastic | \
+                         rubberband_ctypes.RubberBandOptionPhaseLaminar
                 
-                self.rubberband_stretcher = rubberband_ctypes.RubberBand(
+                self.rubberband_stretcher = rubberband_ctypes.RubberBandStretcher(
                     sample_rate=self.sample_rate,
                     channels=2,  # Stereo processing for better quality
                     options=options,
-                    time_ratio=self.current_tempo_ratio,
-                    pitch_scale=1.0  # No pitch shifting for now
+                    initial_time_ratio=self.current_tempo_ratio,
+                    initial_pitch_ratio=1.0  # No pitch shifting for now
                 )
                 
                 logger.info(f"Deck {self.deck_id} - RubberBand stretcher initialized (SR: {self.sample_rate}, ratio: {self.current_tempo_ratio})")
@@ -2567,30 +2580,94 @@ class Deck:
             if available_frames > 0:
                 chunk[:available_frames] = self.audio_thread_data[start_frame:start_frame + available_frames]
             self.audio_thread_current_frame = len(self.audio_thread_data)  # End of track
-            
-            # Keep display frame synchronized with actual frame in ring buffer architecture  
-            with self._stream_lock:
-                self._current_playback_frame_for_display = len(self.audio_thread_data)
         else:
             chunk = self.audio_thread_data[start_frame:end_frame]
             self.audio_thread_current_frame = end_frame
             
-            # Keep display frame synchronized with actual frame in ring buffer architecture
-            with self._stream_lock:
-                self._current_playback_frame_for_display = end_frame
-            
-            # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
-                # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
+            # Check for loop boundaries - only when we would actually cross them
+            if self._loop_active:
+                # Immediate debug for newly activated loops
+                if not hasattr(self, '_loop_debug_logged_activation'):
+                    logger.info(f"🔄 Deck {self.deck_id} - LOOP DETECTION ACTIVE: start={self._loop_start_frame}, end={self._loop_end_frame}, current={self.audio_thread_current_frame}")
+                    logger.info(f"🔄 Deck {self.deck_id} - LOOP DETECTION: start_frame={start_frame}, end_frame={end_frame}, original_end_frame={original_end_frame}")
+                    self._loop_debug_logged_activation = True
+                # Debug: Log current frame vs loop boundaries every few chunks
+                if hasattr(self, '_loop_debug_counter'):
+                    self._loop_debug_counter += 1
+                else:
+                    self._loop_debug_counter = 0
                 
-                # Loop start detection handled by centralized LoopManager
+                if self._loop_debug_counter % 50 == 0:  # Every 50 chunks for more frequent debugging
+                    logger.info(f"Deck {self.deck_id} - LOOP DEBUG: current={self.audio_thread_current_frame}, start={self._loop_start_frame}, end={self._loop_end_frame}, reps={self._loop_repetitions_done}/{self._loop_repetitions_total}")
+                    logger.info(f"Deck {self.deck_id} - LOOP DEBUG: Processing path: _build_stem_mix_chunk, target_frames={target_frames}")
+                    logger.info(f"Deck {self.deck_id} - LOOP DEBUG: start_frame={start_frame}, end_frame={end_frame}, original_end_frame={original_end_frame}")
+                    logger.info(f"Deck {self.deck_id} - LOOP DEBUG: loop_active={self._loop_active}, current_loop_action_id={getattr(self, '_current_loop_action_id', 'None')}")
                 
-                # Check if we would cross the loop end frame with this chunk (only for active loops)
-                # Loop end detection handled by centralized LoopManager
-                    # Loop end detection handled by centralized LoopManager
-                    # Loop repetition handling moved to centralized LoopManager
+                # Check if we've reached the loop start frame (for loops activated in the future or at current position)
+                if (start_frame <= self._loop_start_frame and original_end_frame >= self._loop_start_frame and 
+                    self._loop_repetitions_done == 0 and 
+                    not hasattr(self, '_loop_started')):
+                    logger.info(f"Deck {self.deck_id} - Loop start reached: crossing from {start_frame} to {original_end_frame}, loop start {self._loop_start_frame}")
+                    self._loop_started = True  # Mark that we've entered the loop
+                
+                # Check if we would cross the loop end frame with this chunk
+                if start_frame < self._loop_end_frame and original_end_frame >= self._loop_end_frame:
+                    logger.info(f"Deck {self.deck_id} - Loop end reached: crossing from {start_frame} to {original_end_frame}, loop end {self._loop_end_frame}")
+                    self._loop_repetitions_done += 1
+                    logger.info(f"Deck {self.deck_id} - Loop repetition {self._loop_repetitions_done}/{self._loop_repetitions_total} completed")
                     
-                    # Loop continuation logic moved to centralized LoopManager
-                    # Loop completion logic moved to centralized LoopManager
+                    if self._loop_repetitions_total is None or self._loop_repetitions_done < self._loop_repetitions_total:
+                        # Continue looping - jump back to start
+                        self.audio_thread_current_frame = self._loop_start_frame
+                        # Also update display frame
+                        with self._stream_lock:
+                            self._current_playback_frame_for_display = self._loop_start_frame
+                        logger.info(f"Deck {self.deck_id} - Jumping back to loop start: frame {self._loop_start_frame}")
+                        
+                        # Fetch fresh audio data from the loop start position
+                        loop_start_frame = int(self._loop_start_frame)
+                        loop_end_frame = loop_start_frame + target_frames
+                        
+                        # Ensure we don't read beyond bounds
+                        if loop_end_frame > len(self.audio_thread_data):
+                            loop_end_frame = len(self.audio_thread_data)
+                        
+                        if loop_start_frame < len(self.audio_thread_data):
+                            # Get fresh chunk from loop start position
+                            fresh_chunk = self.audio_thread_data[loop_start_frame:loop_end_frame]
+                            # Pad with zeros if needed
+                            if len(fresh_chunk) < target_frames:
+                                padded_chunk = np.zeros(target_frames, dtype=np.float32)
+                                padded_chunk[:len(fresh_chunk)] = fresh_chunk
+                                chunk = padded_chunk
+                            else:
+                                chunk = fresh_chunk
+                            # Update current frame position
+                            self.audio_thread_current_frame = loop_start_frame + len(fresh_chunk)
+                        else:
+                            # Fallback: silence if position is invalid
+                            chunk = np.zeros(target_frames, dtype=np.float32)
+                        
+                        logger.debug(f"Deck {self.deck_id} - Fetched fresh audio from loop start (frames {loop_start_frame}-{loop_end_frame})")
+                        
+                        # Continue processing with the fresh chunk (don't return early)
+                    else:
+                        # Loop complete - disable and continue
+                        logger.info(f"Deck {self.deck_id} - Loop completed after {self._loop_repetitions_done} repetitions")
+                        self._loop_active = False
+                        # Clear loop started flag for next loop
+                        if hasattr(self, '_loop_started'):
+                            delattr(self, '_loop_started')
+                        # Signal loop completion to engine
+                        if hasattr(self, '_current_loop_action_id') and self._current_loop_action_id:
+                            # Set flags that the engine will check (for legacy polling)
+                            self._loop_just_completed = True
+                            self._completed_loop_action_id = self._current_loop_action_id
+                            logger.info(f"Deck {self.deck_id} - Loop completion signaled: action_id={self._current_loop_action_id}")
+                            
+                            # IMMEDIATE processing - call engine directly to eliminate gap
+                            if self.engine and hasattr(self.engine, '_process_loop_completion_immediate'):
+                                self.engine._process_loop_completion_immediate(self.deck_id, self._current_loop_action_id)
 
         # If stems are available, build mix from stems with per-stem EQ
         if self.stems_available and self.stem_data:
@@ -2643,17 +2720,22 @@ class Deck:
         return chunk.reshape(-1, 2)  # Ensure correct stereo shape for ring buffer
 
     def _sd_callback(self, outdata, frames, time_info, status_obj):
-        """Hybrid ring buffer + seamless loop audio callback for zero-latency transitions"""
+        """Ring buffer-based audio callback - optimized for click-free playback"""
         # DEVELOPMENT GUARD: Never call RubberBand methods in audio callback!
-        # This callback reads from ring buffer AND handles loop transitions instantly
+        # This callback should only read from ring buffer - all processing
+        # happens in the producer thread to prevent segfaults and dropouts.
         assert not hasattr(self, '_in_audio_callback'), "Nested audio callback detected!"
         self._in_audio_callback = True
         
         try:
-            # === SIMPLE RING BUFFER PROCESSING (like beat_viewer_fixed) ===
-            # NO complex logic in audio callback - this prevents hiccups!
+            # Debug: count audio callback calls
+            if not hasattr(self, '_audio_callback_count'):
+                self._audio_callback_count = 0
+            self._audio_callback_count += 1
+            if self._audio_callback_count % 100 == 0:  # Log every 100 calls
+                logger.debug(f"🔊 Deck {self.deck_id} - AUDIO CALLBACK: call #{self._audio_callback_count}, requesting {frames} frames")
             
-            # Status monitoring only
+            # No logging/UI here; set flags only
             if status_obj:
                 if status_obj.output_underflow:
                     if not hasattr(self, '_had_underflow'):
@@ -2662,50 +2744,26 @@ class Deck:
                     if not hasattr(self, '_had_overflow'):
                         self._had_overflow = True
             
-            # Read stereo audio from ring buffer (SIMPLE)
+            # Read from ring buffer - this is the only operation in the callback
             if self.out_ring:
                 out, n = self.out_ring.read(frames)
                 if n < frames:
-                    # Underrun: fill tail with zeros
+                    # underrun: fill tail with zeros
                     out[n:] = 0.0
                     if not hasattr(self, '_had_underrun_logged'):
                         self._had_underrun_logged = True
-                        logger.warning(f"🔊 Deck {self.deck_id} - Audio underrun: requested {frames} frames, got {n}")
+                        logger.debug(f"🔊 Deck {self.deck_id} - Ring buffer underrun: got {n}, needed {frames}")
             else:
                 # No ring buffer - output silence
                 out = np.zeros((frames, 2), dtype=np.float32)
             
-            # CRITICAL FIX: Apply startup fade-in to prevent pop/click
-            if hasattr(self, '_startup_fade_active') and self._startup_fade_active:
-                fade_progress = self._startup_fade_frames / self._startup_fade_total_frames
-                fade_progress = min(fade_progress, 1.0)
-                
-                # Use smooth fade-in curve (sine curve for natural sound)
-                import math
-                fade_gain = math.sin(fade_progress * math.pi / 2)  # Smooth 0.0 to 1.0 transition
-                
-                # Safety check: ensure fade gain is valid
-                if not (0.0 <= fade_gain <= 1.0) or math.isnan(fade_gain):
-                    fade_gain = 0.0
-                    logger.warning(f"🔊 Deck {self.deck_id} - Invalid fade gain detected: {fade_gain}, using 0.0")
-                
-                out *= fade_gain
-                
-                # Update fade progress
-                self._startup_fade_frames += frames
-                
-                # Disable fade when complete
-                if self._startup_fade_frames >= self._startup_fade_total_frames:
-                    self._startup_fade_active = False
-                    logger.info(f"🔊 Deck {self.deck_id} - Startup fade-in complete")
-            
-            # === STEREO OUTPUT ROUTING ===
+            # Handle output channel configuration
             if self.device_output_channels == 2 and out.shape[1] == 2:
-                # Perfect stereo output
-                outdata[:frames, 0] = out[:, 0]  # Left channel
-                outdata[:frames, 1] = out[:, 1]  # Right channel
+                # Stereo output
+                outdata[:frames, 0] = out[:, 0]  # Left
+                outdata[:frames, 1] = out[:, 1]  # Right
             else:
-                # Fallback handling
+                # Fallback - mono or single channel
                 outdata[:frames, 0] = out[:, 0]  # Left
                 if self.device_output_channels == 2:
                     outdata[:frames, 1] = out[:, 0]  # Right (duplicate left)
@@ -2738,7 +2796,7 @@ class Deck:
             natural_end_condition = (
                 self.audio_thread_data is not None and
                 self.audio_thread_current_frame >= self.audio_thread_total_samples and
-                not self.loop_manager.has_active_loop()
+                not self._loop_active 
             )
             if not was_seek and natural_end_condition :
                 logger.debug(f"DEBUG: Deck {self.deck_id} finished_callback - Track ended naturally. Resetting frames.")
@@ -2751,21 +2809,6 @@ class Deck:
                    
     def get_current_display_frame(self):
         with self._stream_lock: return self._current_playback_frame_for_display
-        
-    def check_loop_completion(self):
-        """Check if a loop has completed and return completion info for engine triggers"""
-        if not hasattr(self, 'loop_manager'):
-            return None
-            
-        completion_status = self.loop_manager.get_loop_completion_status()
-        if completion_status:
-            logger.debug(f"Deck {self.deck_id} - Loop completion detected: {completion_status['action_id']}")
-            # Return the completion info in the format the engine expects
-            return {
-                'action_id': completion_status['action_id'],
-                'completed_at': completion_status['completed_at']
-            }
-        return None
 
     def shutdown(self): 
         logger.debug(f"DEBUG: Deck {self.deck_id} - Shutdown requested from external.")
