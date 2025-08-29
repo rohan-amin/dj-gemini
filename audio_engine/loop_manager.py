@@ -91,6 +91,11 @@ class LoopManager:
         Returns:
             True if loop was successfully activated, False otherwise
         """
+        # CRITICAL FIX: Skip old loop activation if frame-accurate looping is active
+        if hasattr(self.deck, '_frame_accurate_loop') and self.deck._frame_accurate_loop.get('active'):
+            logger.info(f"Deck {self.deck.deck_id} - Old loop activation skipped - frame-accurate looping is active")
+            return False
+            
         if not self.deck.total_frames or self.deck.beat_manager.get_bpm() <= 0:
             logger.error(f"Deck {self.deck.deck_id} - Cannot activate loop: invalid track or BPM")
             return False
@@ -167,6 +172,11 @@ class LoopManager:
         Returns:
             True if loop was successfully activated, False otherwise
         """
+        # CRITICAL FIX: Skip old loop activation if frame-accurate looping is active
+        if hasattr(self.deck, '_frame_accurate_loop') and self.deck._frame_accurate_loop.get('active'):
+            logger.info(f"Deck {self.deck.deck_id} - Old direct loop activation skipped - frame-accurate looping is active")
+            return False
+            
         # Validate frame positions
         if not self.deck.total_frames:
             logger.error(f"Deck {self.deck.deck_id} - Cannot activate loop: no track loaded")
@@ -236,6 +246,11 @@ class LoopManager:
         Returns:
             Dict with loop state information and any actions needed
         """
+        # CRITICAL FIX: Skip old loop manager processing if frame-accurate looping is active
+        # This prevents conflicts between the old and new loop systems
+        if hasattr(self.deck, '_frame_accurate_loop') and self.deck._frame_accurate_loop.get('active'):
+            return {"action": "none", "state": "frame_accurate_looping", "message": "Frame-accurate looping active - old loop manager disabled"}
+        
         if not self.current_loop:
             return {"action": "none", "state": self.state.value}
             
@@ -256,19 +271,11 @@ class LoopManager:
                 logger.info(f"Deck {self.deck.deck_id} - Loop now ACTIVE: {self.current_loop.action_id}")
                 
         elif self.state == LoopState.ACTIVE:
-            # Check if we need to jump back to loop start (when we reach the END)
-            if current_frame >= self.current_loop.end_frame:
-                # We've reached the loop end, jump back to loop start frame at next beat boundary
-                # This prevents audio skipping by jumping at a natural break point
-                if hasattr(self, '_loop_position_jump_pending') and self._loop_position_jump_pending:
-                    # Position jump already handled
-                    pass
-                else:
-                    # Mark position jump as pending for next beat boundary
-                    self._loop_position_jump_pending = True
-                    logger.info(f"Deck {self.deck.deck_id} - Loop end reached, position jump pending: will jump to {self.current_loop.start_frame} at next beat")
+            # CRITICAL FIX: Remove conflicting loop boundary detection
+            # Loop boundaries are now handled exclusively by the event scheduler
+            # This prevents race conditions between manual detection and scheduled events
             
-            # Execute any pending position jump at beat boundaries
+            # Execute any pending position jump (set by event-driven completion)
             self.execute_pending_position_jump()
             
             # Only log current position for debugging
@@ -346,6 +353,15 @@ class LoopManager:
         # Clear position jump tracking
         if hasattr(self, '_loop_position_jump_pending'):
             self._loop_position_jump_pending = False
+            self._pending_jump_frame = None
+        
+        # Clear any pending loop completion events from the scheduler
+        if self._engine and hasattr(self._engine, 'event_scheduler') and self.current_loop:
+            try:
+                # Cancel any pending loop completion events for this loop
+                self._engine.event_scheduler.cancel_action(f"loop_completion_{self.current_loop.action_id}")
+            except Exception as e:
+                logger.debug(f"Deck {self.deck.deck_id} - Could not cancel loop events (normal during cleanup): {e}")
         
     def _schedule_frame_accurate_loop_events(self, start_frame: int, end_frame: int, repetitions: int):
         """
@@ -406,27 +422,27 @@ class LoopManager:
             
             logger.debug(f"Deck {self.deck.deck_id} - Loop timing: start_beat={start_beat:.2f}, end_beat={end_beat:.2f}, length={loop_length_beats:.2f} beats")
             
-            # Schedule events for each repetition based on BEAT position
-            for rep in range(repetitions):
-                # Calculate the exact beat where this repetition should end
-                rep_end_beat = start_beat + (loop_length_beats * (rep + 1))
-                
-                # Schedule loop completion event using TRUE beat-aligned scheduling
-                # Phase 3: Pass deck_id for deck-specific beat alignment
-                self._engine.event_scheduler.schedule_beat_action({
-                    "command": "loop_repetition_complete",
-                    "deck_id": self.deck.deck_id,
-                    "parameters": {
-                        "action_id": self.current_loop.action_id,
-                        "repetition": rep + 1,
-                        "total_repetitions": repetitions,
-                        "start_frame": start_frame,
-                        "end_frame": end_frame,
-                        "target_beat": rep_end_beat  # Key: exact beat to trigger on
-                    }
-                }, rep_end_beat, deck_id=self.deck.deck_id, priority=80)
-                
-                logger.debug(f"Deck {self.deck.deck_id} - Scheduled loop repetition {rep + 1}/{repetitions} completion at beat {rep_end_beat:.2f}")
+            # CRITICAL FIX: Only schedule ONE completion event at the loop end beat
+            # The loop should stay within the same beat range (start_beat to end_beat)
+            # NOT advance to new beat positions for each repetition
+            
+            # Schedule single completion event at the loop end beat
+            self._engine.event_scheduler.schedule_beat_action({
+                "command": "loop_repetition_complete",
+                "deck_id": self.deck.deck_id,
+                "parameters": {
+                    "action_id": self.current_loop.action_id,
+                    "repetition": 1,  # Will be incremented by LoopManager
+                    "total_repetitions": repetitions,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "target_beat": end_beat,  # Always the same end beat
+                    "loop_start_beat": start_beat,  # Store for position jumping
+                    "loop_end_beat": end_beat
+                }
+            }, end_beat, deck_id=self.deck.deck_id, priority=80)
+            
+            logger.debug(f"Deck {self.deck.deck_id} - Scheduled loop completion event at beat {end_beat:.2f} for {repetitions} repetitions")
                 
         except Exception as e:
             logger.error(f"Deck {self.deck.deck_id} - Failed to schedule loop events: {e}")
@@ -465,21 +481,54 @@ class LoopManager:
             logger.warning(f"Deck {self.deck.deck_id} - Received repetition completion event but no active loop")
             return
             
-        logger.info(f"Deck {self.deck.deck_id} - Loop repetition {repetition}/{total_repetitions} completed: {self.current_loop.action_id}")
+        # CRITICAL FIX: Increment repetition counter (not use the passed value)
+        # The event scheduler only fires once per loop cycle, so we need to count ourselves
+        self.current_loop.repetitions_done += 1
+        current_repetition = self.current_loop.repetitions_done
         
-        # Update the repetition count
-        self.current_loop.repetitions_done = repetition
+        logger.info(f"Deck {self.deck.deck_id} - Loop repetition {current_repetition}/{total_repetitions} completed: {self.current_loop.action_id}")
         
-        if repetition >= total_repetitions:
+        if current_repetition >= total_repetitions:
             # Final repetition completed - finish the loop
             logger.info(f"Deck {self.deck.deck_id} - Final loop repetition completed: {self.current_loop.action_id}")
             self.state = LoopState.COMPLETING
             self._notify_engine_loop_completed()
             self._clear_current_loop()
         else:
-            # More repetitions to go - jump back to start
-            logger.debug(f"Deck {self.deck.deck_id} - Continuing loop: repetition {repetition}/{total_repetitions}")
-            # The deck will handle the jump_to_start action when processing the result
+            # More repetitions to go - jump back to start and reschedule the completion event
+            logger.info(f"Deck {self.deck.deck_id} - Continuing loop: repetition {current_repetition}/{total_repetitions}, jumping to start")
+            
+            # Mark position jump as pending to return to loop start
+            self._loop_position_jump_pending = True
+            self._pending_jump_frame = self.current_loop.start_frame
+            
+            # Reschedule the completion event for the next loop cycle
+            # This ensures the event fires again when we reach the end of the next repetition
+            if self._engine and hasattr(self._engine, 'event_scheduler'):
+                try:
+                    # Get the loop end beat for rescheduling
+                    end_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.end_frame)
+                    
+                    # Reschedule the completion event at the same end beat
+                    self._engine.event_scheduler.schedule_beat_action({
+                        "command": "loop_repetition_complete",
+                        "deck_id": self.deck.deck_id,
+                        "parameters": {
+                            "action_id": self.current_loop.action_id,
+                            "repetition": current_repetition + 1,  # Next repetition
+                            "total_repetitions": total_repetitions,
+                            "start_frame": self.current_loop.start_frame,
+                            "end_frame": self.current_loop.end_frame,
+                            "target_beat": end_beat,
+                            "loop_start_beat": self.current_loop.start_beat,
+                            "loop_end_beat": end_beat
+                        }
+                    }, end_beat, deck_id=self.deck.deck_id, priority=80)
+                    
+                    logger.debug(f"Deck {self.deck.deck_id} - Rescheduled loop completion event for repetition {current_repetition + 1}")
+                    
+                except Exception as e:
+                    logger.error(f"Deck {self.deck.deck_id} - Failed to reschedule loop completion event: {e}")
             
     def _notify_engine_loop_completed(self):
         """Notify engine that a loop has completed via event queue"""

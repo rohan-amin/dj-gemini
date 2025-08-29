@@ -24,6 +24,7 @@ from .ring_buffer import RingBuffer as ExternalRingBuffer
 from .professional_eq import ToneEQ3, IsolatorEQ
 from .loop_manager import LoopManager
 from .beat_manager import BeatManager
+from .scheduling.musical_timing_system import MusicalTimingSystem
 
 # Check for RubberBand availability
 try:
@@ -298,6 +299,14 @@ class Deck:
         
         # === CENTRALIZED BEAT MANAGEMENT ===
         self.beat_manager = BeatManager(self)
+        
+        # === MUSICAL TIMING SYSTEM (New Frame-Accurate Scheduling) ===
+        try:
+            self.musical_timing_system = MusicalTimingSystem(self)
+            logger.info(f"Deck {self.deck_id} - Musical timing system initialized")
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to initialize musical timing system: {e}")
+            self.musical_timing_system = None
         
         # Note: Engine reference will be set when deck is added to engine
         
@@ -1282,13 +1291,62 @@ class Deck:
             logger.warning(f"Deck {self.deck_id} - Cannot activate loop: BPM is {self.bpm}.")
             return False
         
-        # Use LoopManager for centralized loop activation
+        # === NEW: Use Musical Timing System for Frame-Accurate Loop Activation ===
+        # Check if we're already using frame-accurate looping to avoid conflicts
+        if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
+            logger.info(f"Deck {self.deck_id} - Frame-accurate loop already active, ignoring old loop manager call")
+            return True
+        
+        if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
+            try:
+                # Get current beat position to determine if we need immediate vs scheduled activation
+                current_beat = 0.0
+                if hasattr(self, 'beat_manager') and self.beat_manager:
+                    try:
+                        current_beat = self.beat_manager.get_current_beat()
+                    except:
+                        current_beat = 0.0
+                
+                # If the target beat has already passed or is very close, activate immediately
+                beat_threshold = 0.1  # If within 0.1 beats, activate immediately
+                
+                if current_beat >= (start_beat - beat_threshold):
+                    # Target beat has passed or is imminent - activate immediately via old system
+                    logger.warning(f"Deck {self.deck_id} - Beat {start_beat} has passed (current: {current_beat:.3f}) - using immediate activation")
+                    # Fall through to legacy system for immediate activation
+                else:
+                    # Schedule loop activation using the new frame-accurate system
+                    scheduled_action_id = self.musical_timing_system.schedule_beat_action(
+                        beat_number=start_beat,
+                        action_type='activate_loop',
+                        parameters={
+                            'start_at_beat': start_beat,
+                            'length_beats': length_beats,
+                            'repetitions': repetitions
+                        },
+                        action_id=action_id,
+                        priority=0  # High priority for loop activation
+                    )
+                    
+                    if scheduled_action_id:
+                        logger.info(f"Deck {self.deck_id} - Loop scheduled with frame-accurate timing: {scheduled_action_id} at beat {start_beat} (current: {current_beat:.3f})")
+                        return True
+                    else:
+                        logger.error(f"Deck {self.deck_id} - Failed to schedule frame-accurate loop activation")
+                        # Fall back to old system
+                    
+            except Exception as e:
+                logger.error(f"Deck {self.deck_id} - Error in frame-accurate loop scheduling: {e}")
+                # Fall back to old system
+        
+        # Fallback: Use old LoopManager system if new timing system unavailable
+        logger.warning(f"Deck {self.deck_id} - Using legacy LoopManager (timing system unavailable)")
         success = self.loop_manager.activate_loop(start_beat, length_beats, repetitions, action_id)
         
         if success:
-            logger.info(f"Deck {self.deck_id} - Loop activation successful: {action_id}")
+            logger.info(f"Deck {self.deck_id} - Legacy loop activation successful: {action_id}")
         else:
-            logger.error(f"Deck {self.deck_id} - Loop activation failed: {action_id}")
+            logger.error(f"Deck {self.deck_id} - Legacy loop activation failed: {action_id}")
             
         return success
 
@@ -1323,6 +1381,93 @@ class Deck:
             'target_frame': target_frame,
             'beat_number': beat_number
         }))
+
+    # === MUSICAL TIMING SYSTEM API ===
+    # Public methods for scheduling sample-accurate musical actions
+    
+    def schedule_musical_action(self, beat_number: float, action_type: str, 
+                               parameters: dict = None, action_id: str = None, priority: int = 0) -> str:
+        """
+        Schedule a sample-accurate musical action at a specific beat.
+        
+        This is the main public API for the new musical timing system that provides
+        frame-accurate scheduling that maintains musical reference across tempo changes.
+        
+        Args:
+            beat_number: Musical beat number where action should execute (1-based)
+            action_type: Type of action ('play', 'pause', 'stop', 'activate_loop', etc.)
+            parameters: Action-specific parameters (optional)
+            action_id: Optional unique identifier (auto-generated if None)
+            priority: Action priority (lower number = higher priority)
+            
+        Returns:
+            Action ID for cancellation/tracking, or empty string if failed
+            
+        Example:
+            # Schedule loop activation at beat 32
+            action_id = deck.schedule_musical_action(32.0, 'activate_loop', {
+                'start_at_beat': 32.0,
+                'length_beats': 8.0,
+                'repetitions': 4
+            })
+        """
+        if not hasattr(self, 'musical_timing_system') or not self.musical_timing_system:
+            logger.error(f"Deck {self.deck_id} - Musical timing system not available")
+            return ""
+        
+        if parameters is None:
+            parameters = {}
+        
+        try:
+            return self.musical_timing_system.schedule_beat_action(
+                beat_number=beat_number,
+                action_type=action_type,
+                parameters=parameters,
+                action_id=action_id,
+                priority=priority
+            )
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Failed to schedule musical action: {e}")
+            return ""
+    
+    def cancel_musical_action(self, action_id: str) -> bool:
+        """
+        Cancel a scheduled musical action.
+        
+        Args:
+            action_id: ID of action to cancel (returned from schedule_musical_action)
+            
+        Returns:
+            True if action was found and cancelled
+        """
+        if not hasattr(self, 'musical_timing_system') or not self.musical_timing_system:
+            return False
+        
+        return self.musical_timing_system.cancel_action(action_id)
+    
+    def get_scheduled_musical_actions(self) -> dict:
+        """
+        Get all currently scheduled musical actions.
+        
+        Returns:
+            Dictionary mapping action_id to ScheduledAction objects
+        """
+        if not hasattr(self, 'musical_timing_system') or not self.musical_timing_system:
+            return {}
+        
+        return self.musical_timing_system.get_scheduled_actions()
+    
+    def get_musical_timing_stats(self) -> dict:
+        """
+        Get comprehensive musical timing system statistics.
+        
+        Returns:
+            Dictionary with timing system statistics and performance metrics
+        """
+        if not hasattr(self, 'musical_timing_system') or not self.musical_timing_system:
+            return {'error': 'Musical timing system not available'}
+        
+        return self.musical_timing_system.get_system_stats()
 
     def _get_tempo_cache_filepath(self, target_bpm):
         """Generate cache filepath for tempo-processed audio using new structure"""
@@ -2145,6 +2290,29 @@ class Deck:
                     # NEW: Update audio clock if we have access to it
                     if hasattr(self, 'engine') and hasattr(self.engine, 'audio_clock'):
                         self.engine.audio_clock.update_frame_count(TARGET_BLOCK)
+                    
+                    # === MUSICAL TIMING SYSTEM PROCESSING ===
+                    # Process scheduled musical actions for this audio buffer
+                    if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
+                        try:
+                            # Calculate the frame range for this audio chunk
+                            start_frame = int(self.audio_thread_current_frame)
+                            end_frame = start_frame + TARGET_BLOCK
+                            
+                            # Process musical actions for this buffer
+                            timing_result = self.musical_timing_system.process_audio_buffer(start_frame, end_frame)
+                            
+                            # Log execution statistics periodically (every 1000 chunks)
+                            if not hasattr(self, '_timing_stats_counter'):
+                                self._timing_stats_counter = 0
+                            self._timing_stats_counter += 1
+                            
+                            if self._timing_stats_counter % 1000 == 0:
+                                if timing_result.get('actions_executed', 0) > 0:
+                                    logger.info(f"Deck {self.deck_id} - Musical timing stats: {timing_result}")
+                        
+                        except Exception as e:
+                            logger.error(f"Deck {self.deck_id} - Error in musical timing system: {e}")
                         
                 except Exception as e:
                     logger.debug(f"Deck {self.deck_id} - Error updating BeatManager: {e}")
@@ -2302,6 +2470,22 @@ class Deck:
                 
                 # Update playback position based on actual input consumed
                 self.audio_thread_current_frame += input_chunk_size
+                
+                # === NEW: Frame-accurate seamless looping ===
+                if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
+                    loop_info = self._frame_accurate_loop
+                    if self.audio_thread_current_frame >= loop_info['end_frame']:
+                        logger.info(f"🔄 Deck {self.deck_id}: Seamless loop jump - {loop_info['action_id']} "
+                                   f"(frame {self.audio_thread_current_frame} → {loop_info['start_frame']})")
+                        
+                        # Seamlessly jump back to loop start
+                        self.audio_thread_current_frame = loop_info['start_frame']
+                        
+                        # Track repetitions
+                        loop_info['current_repetition'] += 1
+                        if loop_info['repetitions'] > 0 and loop_info['current_repetition'] >= loop_info['repetitions']:
+                            logger.info(f"🔄 Deck {self.deck_id}: Loop completed after {loop_info['repetitions']} repetitions")
+                            self._frame_accurate_loop['active'] = False
                 
                 # Keep display frame synchronized with actual frame in ring buffer architecture
                 with self._stream_lock:
@@ -2712,6 +2896,14 @@ class Deck:
         # Shutdown thread pool executor
         if hasattr(self, '_processing_executor'):
             self._processing_executor.shutdown(wait=True)
+        
+        # Cleanup musical timing system
+        if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
+            try:
+                self.musical_timing_system.cleanup()
+                logger.debug(f"Deck {self.deck_id} - Musical timing system cleaned up")
+            except Exception as e:
+                logger.warning(f"Deck {self.deck_id} - Error cleaning up musical timing system: {e}")
         
         logger.debug(f"DEBUG: Deck {self.deck_id} - Shutdown complete.")
 

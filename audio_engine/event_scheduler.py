@@ -328,6 +328,7 @@ class EventScheduler:
         Args:
             deck_id: The deck with updated beat position
             current_beat: The current beat position
+            previous_beat: The previous beat position (None on first call)
         """
         try:
             with self._lock:
@@ -350,9 +351,10 @@ class EventScheduler:
                         should_execute = previous_beat < scheduled_beat <= current_beat
                         logger.info(f"EventScheduler: Beat {scheduled_beat} in range {previous_beat:.3f} → {current_beat:.3f}: {should_execute}")
                     else:
-                        # Fallback to simple comparison
-                        should_execute = current_beat >= scheduled_beat
-                        logger.info(f"EventScheduler: Beat {current_beat:.3f} >= {scheduled_beat}: {should_execute}")
+                        # CRITICAL FIX: Don't execute events when previous_beat is None
+                        # This prevents duplicate execution during initialization or after tempo changes
+                        should_execute = False
+                        logger.warning(f"EventScheduler: Skipping beat {scheduled_beat} - no previous_beat available (current: {current_beat:.3f})")
                     
                     if should_execute:
                         events_to_execute = self._beat_events[deck_id][scheduled_beat].copy()

@@ -637,6 +637,25 @@ class AudioEngine:
                 logger.error("AudioEngine - Pre-processing of audio transformations failed. Aborting script load.")
                 return False
 
+            # === NEW: Load mix configuration with frame-accurate timing ===
+            try:
+                from .mix_loader import MixConfigLoader
+                self.mix_loader = MixConfigLoader(self)
+                
+                # Load and pre-schedule all actions with frame-accurate timing
+                if self.mix_loader.load_mix_config(path_to_load):
+                    logger.info("🎯 Mix configuration loaded with frame-accurate timing - bypassing old event scheduler")
+                    # Set flag to indicate we're using the new timing system
+                    self._using_frame_accurate_timing = True
+                else:
+                    logger.warning("Frame-accurate mix loader failed - falling back to old event scheduler")
+                    self._using_frame_accurate_timing = False
+                    
+            except Exception as e:
+                logger.error(f"Error initializing frame-accurate mix loader: {e}")
+                logger.warning("Falling back to old event scheduler")
+                self._using_frame_accurate_timing = False
+
             return True
             
         except Exception as e:
@@ -847,24 +866,40 @@ class AudioEngine:
             return
 
         print(f"DEBUG: Starting script processing with {len(self._all_actions_from_script)} actions")
-        logger.info(f"Starting event-driven script processing: '{self.script_name}'")
-        self.is_processing_script_actions = True 
-        self._script_start_time = time.time() 
         
-        # Start the audio clock
-        self.audio_clock.start()
-        
-        # Start the event scheduler FIRST so it's running when decks are created
-        self.event_scheduler.start()
-        
-        # Schedule all actions using the event scheduler (this creates decks)
-        self._schedule_all_actions()
-        
-        # FORCE register beat callbacks with all existing decks
-        for deck_id, deck in self.decks.items():
-            if hasattr(deck, 'beat_manager'):
-                deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
-                print(f"FORCE REGISTERED: Beat callback for deck {deck_id}")
+        # Check if we're using the new frame-accurate timing system
+        if getattr(self, '_using_frame_accurate_timing', False):
+            logger.info(f"🎯 Starting frame-accurate script processing: '{self.script_name}' - OLD EVENT SCHEDULER BYPASSED")
+            self.is_processing_script_actions = True 
+            self._script_start_time = time.time() 
+            
+            # Start the audio clock
+            self.audio_clock.start()
+            
+            # The mix loader has already pre-scheduled all actions with frame-accurate timing
+            # No need to start the old event scheduler or register beat callbacks
+            logger.info("🚀 All actions pre-scheduled with sample-accurate timing")
+            
+        else:
+            # Fallback to old event scheduler system
+            logger.info(f"Starting event-driven script processing: '{self.script_name}'")
+            self.is_processing_script_actions = True 
+            self._script_start_time = time.time() 
+            
+            # Start the audio clock
+            self.audio_clock.start()
+            
+            # Start the event scheduler FIRST so it's running when decks are created
+            self.event_scheduler.start()
+            
+            # Schedule all actions using the event scheduler (this creates decks)
+            self._schedule_all_actions()
+            
+            # FORCE register beat callbacks with all existing decks
+            for deck_id, deck in self.decks.items():
+                if hasattr(deck, 'beat_manager'):
+                    deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
+                    print(f"FORCE REGISTERED: Beat callback for deck {deck_id}")
         
         # Also ensure EventScheduler has registered callbacks
         if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():

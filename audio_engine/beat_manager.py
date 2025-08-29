@@ -204,23 +204,26 @@ class BeatManager:
                     beat_int = int(beat_number)
                     beat_frac = beat_number - beat_int
                     
+                    # Convert 1-based beat number to 0-based array index
+                    beat_index = beat_int - 1
+                    
                     # If we have the exact beat timestamp, use it
-                    if 0 <= beat_int < len(self._beat_timestamps):
+                    if 0 <= beat_index < len(self._beat_timestamps):
                         if beat_frac == 0:
                             # Integer beat - use exact timestamp
-                            time_seconds = self._beat_timestamps[beat_int]
+                            time_seconds = self._beat_timestamps[beat_index]
                             frame = int(time_seconds * self._sample_rate)
                         else:
                             # Fractional beat - interpolate between timestamps
-                            if beat_int + 1 < len(self._beat_timestamps):
-                                prev_time = self._beat_timestamps[beat_int]
-                                next_time = self._beat_timestamps[beat_int + 1]
+                            if beat_index + 1 < len(self._beat_timestamps):
+                                prev_time = self._beat_timestamps[beat_index]
+                                next_time = self._beat_timestamps[beat_index + 1]
                                 # Linear interpolation
                                 interpolated_time = prev_time + (next_time - prev_time) * beat_frac
                                 frame = int(interpolated_time * self._sample_rate)
                             else:
                                 # Beyond last beat - extrapolate using BPM
-                                last_beat_time = self._beat_timestamps[beat_int]
+                                last_beat_time = self._beat_timestamps[beat_index]
                                 extra_beats = beat_frac
                                 extra_time = (extra_beats * 60.0) / self._bpm
                                 frame = int((last_beat_time + extra_time) * self._sample_rate)
@@ -314,8 +317,8 @@ class BeatManager:
                         # If we're between beats, interpolate for fractional beats
                         if beat_count < len(beat_timestamps_to_use):
                             if beat_count > 0 and abs(current_time_seconds - beat_timestamps_to_use[beat_count - 1]) < 0.001:
-                                # We're exactly at beat boundary
-                                return float(beat_count - 1)
+                                # We're exactly at beat boundary - convert to 1-based beat number
+                                return float(beat_count)
                             else:
                                 # We're between beats, interpolate
                                 if beat_count > 0:
@@ -326,15 +329,15 @@ class BeatManager:
                                         time_diff = next_beat_time - prev_beat_time
                                         if time_diff > 0:
                                             progress = (current_time_seconds - prev_beat_time) / time_diff
-                                            return float(beat_count - 1 + progress)
+                                            return float(beat_count + progress)
                                         else:
-                                            return float(beat_count - 1)
+                                            return float(beat_count)
                                     else:
-                                        return float(beat_count - 1)
+                                        return float(beat_count)
                                 else:
-                                    return 0.0
+                                    return 1.0  # First beat is beat 1, not beat 0
                         else:
-                            return float(len(beat_timestamps_to_use) - 1)
+                            return float(len(beat_timestamps_to_use))  # Last beat number
                         
                     except Exception as e:
                         logger.debug(f"BeatManager {self.deck.deck_id} - Error calculating beat from frame: {e}")
