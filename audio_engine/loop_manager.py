@@ -128,11 +128,15 @@ class LoopManager:
         current_frame = self.deck.audio_thread_current_frame
         
         if current_frame >= start_frame:
-            # We're already at or past the start frame, but DON'T jump immediately
-            # Instead, mark as active and let the next beat boundary handle the position jump
-            logger.info(f"Deck {self.deck.deck_id} - Loop activation: current_frame={current_frame}, start_frame={start_frame}, end_frame={end_frame}")
+            # CRITICAL FIX: Always jump to loop start when activating, even if we're past it
+            # This prevents the "fast-forward" effect and ensures loops start cleanly
+            logger.info(f"Deck {self.deck.deck_id} - Loop activation: current_frame={current_frame}, start_frame={start_frame}, jumping to start")
             self.state = LoopState.ACTIVE
-            logger.info(f"Deck {self.deck.deck_id} - Loop marked as active: {action_id} (frames {start_frame}-{end_frame}) - position jump deferred to next beat")
+            
+            # Force immediate jump to loop start to prevent mid-cycle activation
+            self._loop_position_jump_pending = True
+            self._pending_jump_frame = start_frame
+            logger.info(f"Deck {self.deck.deck_id} - Loop marked as active: {action_id} (frames {start_frame}-{end_frame}) - jumping to start immediately")
         else:
             # We're before the start frame, wait for activation
             self.state = LoopState.PENDING
@@ -185,7 +189,7 @@ class LoopManager:
         # Set as current loop
         self.current_loop = new_loop
         
-        # Schedule loop completion events using frame positions
+        # Schedule loop completion events using beat-aligned timing
         self._schedule_loop_events(start_frame, end_frame, repetitions)
         
         # Determine initial state - since this is called frame-accurately, always activate immediately
@@ -194,16 +198,17 @@ class LoopManager:
         # Set as active immediately since we're executing at the exact frame
         self.state = LoopState.ACTIVE
         
-        # If we need to jump to loop start, do it immediately
-        if current_frame < start_frame or current_frame >= end_frame:
-            # We need to jump to the loop start position
-            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: jumping from {current_frame} to {start_frame}")
-            self._loop_position_jump_pending = True
-            self._pending_jump_frame = start_frame
+        # CRITICAL FIX: Always jump to loop start for clean loop activation
+        # This ensures loops start at the correct musical position, not partway through
+        frame_difference = current_frame - start_frame
+        if abs(frame_difference) > 100:  # Allow small timing tolerance (2.3ms at 44.1kHz)
+            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: jumping from {current_frame} to {start_frame} (diff: {frame_difference} frames)")
         else:
-            # We're already in the loop region
-            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: already in loop region at {current_frame}")
-            self._loop_position_jump_pending = False
+            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: jumping to exact start {start_frame} (current: {current_frame})")
+        
+        # Always jump to loop start to ensure clean musical positioning
+        self._loop_position_jump_pending = True
+        self._pending_jump_frame = start_frame
         
         # Clear ring buffer to prevent artifacts
         if self._clear_ring_buffer_callback:
@@ -342,6 +347,43 @@ class LoopManager:
         if hasattr(self, '_loop_position_jump_pending'):
             self._loop_position_jump_pending = False
         
+    def _schedule_frame_accurate_loop_events(self, start_frame: int, end_frame: int, repetitions: int):
+        """
+        Schedule frame-accurate loop completion events directly on the deck.
+        This bypasses the event scheduler for sample-accurate timing.
+        
+        Args:
+            start_frame: Start frame of the loop
+            end_frame: End frame of the loop
+            repetitions: Number of repetitions for this loop
+        """
+        if not self.current_loop:
+            logger.warning(f"Deck {self.deck.deck_id} - Cannot schedule loop events: no current loop")
+            return
+            
+        loop_length_frames = end_frame - start_frame
+        
+        logger.debug(f"Deck {self.deck.deck_id} - Scheduling frame-accurate loop events: {repetitions} reps, {loop_length_frames} frames each")
+        
+        # Schedule frame-accurate completion events for each repetition
+        for rep in range(repetitions):
+            # Calculate exact frame where this repetition should end
+            rep_end_frame = start_frame + (loop_length_frames * (rep + 1))
+            
+            # Schedule frame-accurate loop completion
+            completion_data = {
+                'action_id': self.current_loop.action_id,
+                'repetition': rep + 1,
+                'total_repetitions': repetitions,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'rep_end_frame': rep_end_frame
+            }
+            
+            self.deck.schedule_frame_action(rep_end_frame, 'loop_repetition_complete', completion_data)
+            
+            logger.debug(f"Deck {self.deck.deck_id} - Scheduled loop completion {rep + 1}/{repetitions} at frame {rep_end_frame}")
+    
     def _schedule_loop_events(self, start_frame: int, end_frame: int, repetitions: int):
         """
         Schedule loop completion events using the event scheduler.

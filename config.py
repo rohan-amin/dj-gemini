@@ -84,6 +84,11 @@ def get_pitch_cache_filepath(audio_filepath, semitones):
     song_dir = get_song_cache_dir(audio_filepath)
     return os.path.join(song_dir, f"pitch_{semitones:+.1f}.npy")
 
+def get_stems_cache_dir(audio_filepath):
+    """Get directory for stem separation cache"""
+    song_dir = get_song_cache_dir(audio_filepath)
+    return os.path.join(song_dir, "stems")
+
 # --- Optional: Automatically ensure critical directories exist upon import ---
 # print("DEBUG: CONFIG - Ensuring critical directories exist...")
 # ensure_dir_exists(AUDIO_TRACKS_DIR)
