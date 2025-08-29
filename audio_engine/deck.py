@@ -313,6 +313,11 @@ class Deck:
         # Tempo ramp state now handled by BeatManager
         # Old fields removed to eliminate confusion
 
+        # === FRAME-ACCURATE LOOP ACTIVATION ===
+        # Queue for frame-precise actions (thread-safe)
+        self._pending_frame_actions = queue.PriorityQueue()
+        self._frame_actions_lock = threading.Lock()
+
         # Add volume control
         self._volume = 1.0  # 0.0 to 1.0
         self._fade_target_volume = None
@@ -1068,6 +1073,71 @@ class Deck:
         logger.warning(f"Deck {self.deck_id} - get_frame_from_beat() is deprecated. Use beat_manager.get_frame_for_beat() instead.")
         return self.beat_manager.get_frame_for_beat(beat_number)
 
+    def schedule_frame_action(self, target_frame, action_type, action_data):
+        """Schedule an action to be executed at an exact frame position"""
+        with self._frame_actions_lock:
+            action = {
+                'type': action_type,
+                'data': action_data,
+                'frame': target_frame
+            }
+            # Use negative frame as priority so earlier frames execute first
+            self._pending_frame_actions.put((-target_frame, target_frame, action))
+            logger.debug(f"Deck {self.deck_id} - Scheduled {action_type} action at frame {target_frame}")
+
+    def schedule_beat_action_frame_accurate(self, target_beat, action_type, action_data):
+        """Schedule an action at a specific beat with frame accuracy"""
+        target_frame = self.beat_manager.get_frame_for_beat(target_beat)
+        self.schedule_frame_action(target_frame, action_type, action_data)
+        logger.debug(f"Deck {self.deck_id} - Scheduled {action_type} action at beat {target_beat} (frame {target_frame})")
+
+    def _execute_pending_frame_actions(self, current_frame):
+        """Execute any pending frame actions that should occur at or before current_frame"""
+        with self._frame_actions_lock:
+            executed_actions = []
+            
+            while not self._pending_frame_actions.empty():
+                try:
+                    # Peek at next action without removing it
+                    neg_frame, target_frame, action = self._pending_frame_actions.queue[0]
+                    
+                    # Check if it's time to execute this action
+                    if target_frame <= current_frame:
+                        # Remove and execute the action
+                        self._pending_frame_actions.get_nowait()
+                        
+                        try:
+                            if action['type'] == 'activate_loop':
+                                # Execute loop activation directly in audio thread context
+                                loop_data = action['data']
+                                success = self.loop_manager.activate_loop_direct(
+                                    start_frame=loop_data['start_frame'],
+                                    end_frame=loop_data['end_frame'],
+                                    repetitions=loop_data['repetitions'],
+                                    action_id=loop_data.get('action_id', 'frame_action')
+                                )
+                                if success:
+                                    logger.info(f"Deck {self.deck_id} - Frame-accurate loop activated at frame {current_frame} (target: {target_frame})")
+                                else:
+                                    logger.warning(f"Deck {self.deck_id} - Frame-accurate loop activation failed at frame {current_frame}")
+                            
+                            executed_actions.append((target_frame, action['type']))
+                            
+                        except Exception as e:
+                            logger.error(f"Deck {self.deck_id} - Error executing frame action {action['type']}: {e}")
+                    else:
+                        # No more actions to execute at this frame
+                        break
+                        
+                except (IndexError, queue.Empty):
+                    # Queue is empty
+                    break
+            
+            if executed_actions:
+                logger.debug(f"Deck {self.deck_id} - Executed {len(executed_actions)} frame actions at frame {current_frame}")
+        
+        return len(executed_actions)
+
     def get_frame_from_cue(self, cue_name):
         if not self.cue_points or cue_name not in self.cue_points:
             logger.warning(f"Deck {self.deck_id} - Cue point '{cue_name}' not found.")
@@ -1191,7 +1261,7 @@ class Deck:
                                                'was_playing_intent': was_playing_intent}))
 
     def activate_loop(self, start_beat, length_beats, repetitions=None, action_id=None):
-        """Activate a loop at the specified beat position using LoopManager"""
+        """Activate a loop at the specified beat position using frame-accurate scheduling"""
         logger.info(f"[LOOP ACTIVATION] Deck {self.deck_id} - Activating loop: {length_beats} beats, {repetitions} reps, Action ID: {action_id}")
         
         if self.total_frames == 0:
@@ -1207,15 +1277,39 @@ class Deck:
             logger.warning(f"Deck {self.deck_id} - Cannot activate loop: BPM is {self.bpm}.")
             return False
         
-        # Use LoopManager for centralized loop activation
-        success = self.loop_manager.activate_loop(start_beat, length_beats, repetitions, action_id)
-        
-        if success:
-            logger.info(f"Deck {self.deck_id} - Loop activation successful: {action_id}")
-        else:
-            logger.error(f"Deck {self.deck_id} - Loop activation failed: {action_id}")
+        # === FRAME-ACCURATE LOOP SCHEDULING ===
+        # Pre-calculate exact frame positions for sample-accurate timing
+        try:
+            start_frame = self.beat_manager.get_frame_for_beat(start_beat)
+            end_beat = start_beat + length_beats
+            end_frame = self.beat_manager.get_frame_for_beat(end_beat)
             
-        return success
+            # Validate frame positions
+            if start_frame >= self.total_frames:
+                logger.error(f"Deck {self.deck_id} - Loop start frame {start_frame} beyond track length {self.total_frames}")
+                return False
+                
+            if end_frame > self.total_frames:
+                logger.warning(f"Deck {self.deck_id} - Loop end frame {end_frame} beyond track length, adjusting to {self.total_frames}")
+                end_frame = self.total_frames
+            
+            # Schedule frame-accurate loop activation
+            loop_data = {
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'repetitions': repetitions,
+                'action_id': action_id or f"loop_{start_beat}_{length_beats}"
+            }
+            
+            # Use frame-accurate scheduling instead of event-based scheduling
+            self.schedule_beat_action_frame_accurate(start_beat, 'activate_loop', loop_data)
+            
+            logger.info(f"Deck {self.deck_id} - Frame-accurate loop scheduled: {action_id} at beat {start_beat} (frame {start_frame})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Loop activation failed: {e}")
+            return False
 
     def deactivate_loop(self):
         """Deactivate the current loop using LoopManager"""
@@ -2227,6 +2321,10 @@ class Deck:
                 
                 # Update playback position based on actual input consumed
                 self.audio_thread_current_frame += input_chunk_size
+                
+                # === FRAME-ACCURATE ACTION EXECUTION ===
+                # Execute any pending frame actions at the exact frame position
+                self._execute_pending_frame_actions(self.audio_thread_current_frame)
                 
                 # Keep display frame synchronized with actual frame in ring buffer architecture
                 with self._stream_lock:

@@ -146,6 +146,71 @@ class LoopManager:
         self._loop_position_jump_pending = False
             
         return True
+
+    def activate_loop_direct(self, start_frame: int, end_frame: int, repetitions: int, action_id: str) -> bool:
+        """
+        Directly activate a loop using exact frame positions - for frame-accurate execution.
+        
+        This method bypasses beat calculations and uses pre-calculated frame positions
+        for sample-accurate loop timing. Called from the audio thread context.
+        
+        Args:
+            start_frame: Exact frame where loop should start
+            end_frame: Exact frame where loop should end
+            repetitions: Number of times to repeat the loop
+            action_id: Unique identifier for this loop action
+            
+        Returns:
+            True if loop was successfully activated, False otherwise
+        """
+        # Validate frame positions
+        if not self.deck.total_frames:
+            logger.error(f"Deck {self.deck.deck_id} - Cannot activate loop: no track loaded")
+            return False
+            
+        if start_frame >= self.deck.total_frames or end_frame > self.deck.total_frames:
+            logger.error(f"Deck {self.deck.deck_id} - Loop frames {start_frame}-{end_frame} beyond track length {self.deck.total_frames}")
+            return False
+            
+        if start_frame >= end_frame:
+            logger.error(f"Deck {self.deck.deck_id} - Invalid loop: start_frame {start_frame} >= end_frame {end_frame}")
+            return False
+        
+        # Create new loop without beat calculations (frames are already exact)
+        new_loop = Loop(start_frame, end_frame, repetitions, action_id)
+        
+        # Clear any existing loops
+        self._clear_current_loop()
+        
+        # Set as current loop
+        self.current_loop = new_loop
+        
+        # Schedule loop completion events using frame positions
+        self._schedule_loop_events(start_frame, end_frame, repetitions)
+        
+        # Determine initial state - since this is called frame-accurately, always activate immediately
+        current_frame = self.deck.audio_thread_current_frame
+        
+        # Set as active immediately since we're executing at the exact frame
+        self.state = LoopState.ACTIVE
+        
+        # If we need to jump to loop start, do it immediately
+        if current_frame < start_frame or current_frame >= end_frame:
+            # We need to jump to the loop start position
+            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: jumping from {current_frame} to {start_frame}")
+            self._loop_position_jump_pending = True
+            self._pending_jump_frame = start_frame
+        else:
+            # We're already in the loop region
+            logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activation: already in loop region at {current_frame}")
+            self._loop_position_jump_pending = False
+        
+        # Clear ring buffer to prevent artifacts
+        if self._clear_ring_buffer_callback:
+            self._clear_ring_buffer_callback("frame-accurate loop activation")
+        
+        logger.info(f"Deck {self.deck.deck_id} - Frame-accurate loop activated: {action_id} (frames {start_frame}-{end_frame})")
+        return True
         
     def deactivate_loop(self):
         """Deactivate the current loop"""
