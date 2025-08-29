@@ -17,9 +17,11 @@ class LoopState(Enum):
 
 class Loop:
     """Represents a single loop with all its parameters"""
-    def __init__(self, start_frame: int, end_frame: int, repetitions: int, action_id: str):
+    def __init__(self, start_frame: int, end_frame: int, repetitions: int, action_id: str, start_beat: float = None, end_beat: float = None):
         self.start_frame = start_frame
         self.end_frame = end_frame
+        self.start_beat = start_beat  # Store original beat numbers for tempo changes
+        self.end_beat = end_beat
         self.repetitions_total = repetitions
         self.repetitions_done = 0
         self.action_id = action_id
@@ -48,11 +50,10 @@ class LoopManager:
     """
     Centralized loop management state machine.
     
-    This class replaces all the scattered loop detection logic in the deck
-    with a clean, maintainable state machine that handles:
+    This class provides a clean, maintainable state machine that handles:
     - Loop activation and deactivation
     - State transitions
-    - Boundary detection
+    - Event-driven loop completion
     - Repetition counting
     - Completion signaling
     """
@@ -66,12 +67,16 @@ class LoopManager:
         # Callback for deck to clear ring buffer during position jumps
         self._clear_ring_buffer_callback = None
         
-        # Flag to track when a loop has completed for engine notification
-        self._loop_completed_for_engine = False
+        # Reference to engine for event-driven loop completion notification
+        self._engine = None
         
     def set_clear_ring_buffer_callback(self, callback):
         """Set callback for clearing ring buffer during position jumps"""
         self._clear_ring_buffer_callback = callback
+        
+    def set_engine_reference(self, engine):
+        """Set reference to engine for event-driven loop completion notification"""
+        self._engine = engine
         
     def activate_loop(self, start_beat: int, length_beats: int, repetitions: int, action_id: str) -> bool:
         """
@@ -86,15 +91,17 @@ class LoopManager:
         Returns:
             True if loop was successfully activated, False otherwise
         """
-        if not self.deck.total_frames or self.deck.bpm <= 0:
+        if not self.deck.total_frames or self.deck.beat_manager.get_bpm() <= 0:
             logger.error(f"Deck {self.deck.deck_id} - Cannot activate loop: invalid track or BPM")
             return False
             
-        # Calculate frame positions
-        start_frame = self.deck.get_frame_from_beat(start_beat)
-        frames_per_beat = (self.deck.sample_rate * 60) / self.deck.bpm
-        loop_length_frames = int(length_beats * frames_per_beat)
-        end_frame = start_frame + loop_length_frames
+        # Calculate frame positions using BeatManager for consistent timing
+        start_frame = self.deck.beat_manager.get_frame_for_beat(start_beat)
+        
+        # CRITICAL FIX: Use BeatManager to calculate end frame for accurate timing
+        # Instead of theoretical frames_per_beat calculation, use the actual beat position
+        end_beat = start_beat + length_beats
+        end_frame = self.deck.beat_manager.get_frame_for_beat(end_beat)
         
         # Validate frame positions
         if start_frame >= self.deck.total_frames:
@@ -105,8 +112,8 @@ class LoopManager:
             logger.warning(f"Deck {self.deck.deck_id} - Loop end frame {end_frame} beyond track length, adjusting to {self.deck.total_frames}")
             end_frame = self.deck.total_frames
             
-        # Create new loop
-        new_loop = Loop(start_frame, end_frame, repetitions, action_id)
+        # Create new loop with beat information for tempo change support
+        new_loop = Loop(start_frame, end_frame, repetitions, action_id, start_beat, start_beat + length_beats)
         
         # Clear any existing loops
         self._clear_current_loop()
@@ -114,13 +121,18 @@ class LoopManager:
         # Set as current loop
         self.current_loop = new_loop
         
+        # Schedule loop completion events using beat-aligned timing
+        self._schedule_loop_events(start_frame, end_frame, repetitions)
+        
         # Determine initial state based on current playback position
         current_frame = self.deck.audio_thread_current_frame
         
         if current_frame >= start_frame:
-            # We're already at or past the start frame, activate immediately
+            # We're already at or past the start frame, but DON'T jump immediately
+            # Instead, mark as active and let the next beat boundary handle the position jump
+            logger.info(f"Deck {self.deck.deck_id} - Loop activation: current_frame={current_frame}, start_frame={start_frame}, end_frame={end_frame}")
             self.state = LoopState.ACTIVE
-            logger.info(f"Deck {self.deck.deck_id} - Loop activated immediately: {action_id} (frames {start_frame}-{end_frame})")
+            logger.info(f"Deck {self.deck.deck_id} - Loop marked as active: {action_id} (frames {start_frame}-{end_frame}) - position jump deferred to next beat")
         else:
             # We're before the start frame, wait for activation
             self.state = LoopState.PENDING
@@ -129,6 +141,9 @@ class LoopManager:
         # Clear ring buffer to prevent artifacts
         if self._clear_ring_buffer_callback:
             self._clear_ring_buffer_callback("loop activation")
+        
+        # Initialize position jump tracking
+        self._loop_position_jump_pending = False
             
         return True
         
@@ -171,31 +186,27 @@ class LoopManager:
                 logger.info(f"Deck {self.deck.deck_id} - Loop now ACTIVE: {self.current_loop.action_id}")
                 
         elif self.state == LoopState.ACTIVE:
-            # Check if we've reached the loop end frame
+            # Check if we need to jump back to loop start (when we reach the END)
             if current_frame >= self.current_loop.end_frame:
-                # Always increment repetition count first
-                self.current_loop.increment_repetition()
-                
-                if not self.current_loop.is_complete:
-                    # Continue looping - jump back to start
-                    result["action"] = "jump_to_start"
-                    result["jump_frame"] = self.current_loop.start_frame
-                    result["repetitions"] = f"{self.current_loop.repetitions_done}/{self.current_loop.repetitions_total}"
-                    
-                    logger.debug(f"Deck {self.deck.deck_id} - Loop repetition {self.current_loop.repetitions_done}/{self.current_loop.repetitions_total}")
-                    
-                    # Don't clear ring buffer here - let the deck handle it only when needed
-                    # The deck will clear it when processing the jump_to_start action
-                        
+                # We've reached the loop end, jump back to loop start frame at next beat boundary
+                # This prevents audio skipping by jumping at a natural break point
+                if hasattr(self, '_loop_position_jump_pending') and self._loop_position_jump_pending:
+                    # Position jump already handled
+                    pass
                 else:
-                    # Loop complete - transition to completing state
-                    self.state = LoopState.COMPLETING
-                    result["action"] = "completed"
-                    result["state"] = self.state.value
-                    logger.info(f"Deck {self.deck.deck_id} - Loop completed: {self.current_loop.action_id}")
-                    
-                    # Mark this loop as completed for engine notification
-                    self._loop_completed_for_engine = True
+                    # Mark position jump as pending for next beat boundary
+                    self._loop_position_jump_pending = True
+                    logger.info(f"Deck {self.deck.deck_id} - Loop end reached, position jump pending: will jump to {self.current_loop.start_frame} at next beat")
+            
+            # Execute any pending position jump at beat boundaries
+            self.execute_pending_position_jump()
+            
+            # Only log current position for debugging
+            frames_played = current_frame - self.current_loop.start_frame
+            logger.debug(f"Deck {self.deck.deck_id} - Loop active: current_frame={current_frame}, frames_played={frames_played}")
+            
+            # All loop boundaries are handled by beat-aligned events
+            # No manual boundary detection - events fire at exact beat positions
                     
         elif self.state == LoopState.COMPLETING:
             # In completing state, we can either restart or finish
@@ -207,7 +218,9 @@ class LoopManager:
                 result["state"] = self.state.value
                 logger.debug(f"Deck {self.deck.deck_id} - Loop restarted: {self.current_loop.action_id}")
             else:
-                # Loop is truly complete, clean up
+                # Loop is truly complete, clean up and notify engine
+                logger.info(f"Deck {self.deck.deck_id} - Loop truly finished: {self.current_loop.action_id}")
+                self._notify_engine_loop_completed()
                 self._clear_current_loop()
                 result["action"] = "finished"
                 result["state"] = self.state.value
@@ -227,10 +240,24 @@ class LoopManager:
         if not self.current_loop:
             return None
             
+        # Use stored beat numbers if available (these don't change with tempo)
+        if self.current_loop.start_beat is not None and self.current_loop.end_beat is not None:
+            start_beat = self.current_loop.start_beat
+            end_beat = self.current_loop.end_beat
+        else:
+            # Get beat information using BeatManager for consistency
+            start_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.start_frame)
+            end_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.end_frame)
+            
+        length_beats = end_beat - start_beat
+            
         return {
             "action_id": self.current_loop.action_id,
             "start_frame": self.current_loop.start_frame,
             "end_frame": self.current_loop.end_frame,
+            "start_beat": start_beat,
+            "end_beat": end_beat,
+            "length_beats": length_beats,
             "repetitions_total": self.current_loop.repetitions_total,
             "repetitions_done": self.current_loop.repetitions_done,
             "state": self.state.value,
@@ -246,17 +273,198 @@ class LoopManager:
         self.state = LoopState.INACTIVE
         self.pending_loops.clear()
         
-    def get_loop_completion_status(self) -> Optional[Dict[str, Any]]:
+        # Clear position jump tracking
+        if hasattr(self, '_loop_position_jump_pending'):
+            self._loop_position_jump_pending = False
+        
+    def _schedule_loop_events(self, start_frame: int, end_frame: int, repetitions: int):
         """
-        Get loop completion status for engine notification.
-        This replaces the scattered _loop_just_completed flags.
+        Schedule loop completion events using the event scheduler.
+        Uses beat-aligned timing for precise loop management.
+        
+        Args:
+            start_frame: Start frame of the loop
+            end_frame: End frame of the loop
+            repetitions: Number of repetitions for this loop
         """
-        if self._loop_completed_for_engine and self.current_loop:
-            # Reset the flag and return completion info
-            self._loop_completed_for_engine = False
-            return {
-                "action_id": self.current_loop.action_id,
-                "completed_at": time.time(),
-                "total_repetitions": self.current_loop.repetitions_total
-            }
-        return None
+        if not self._engine or not hasattr(self._engine, 'event_scheduler'):
+            logger.warning(f"Deck {self.deck.deck_id} - Cannot schedule loop events: no engine reference")
+            return
+            
+        try:
+            # Get beat information for accurate timing
+            start_beat = self.deck.beat_manager.get_beat_from_frame(start_frame)
+            end_beat = self.deck.beat_manager.get_beat_from_frame(end_frame)
+            loop_length_beats = end_beat - start_beat
+            
+            logger.debug(f"Deck {self.deck.deck_id} - Loop timing: start_beat={start_beat:.2f}, end_beat={end_beat:.2f}, length={loop_length_beats:.2f} beats")
+            
+            # Schedule events for each repetition based on BEAT position
+            for rep in range(repetitions):
+                # Calculate the exact beat where this repetition should end
+                rep_end_beat = start_beat + (loop_length_beats * (rep + 1))
+                
+                # Schedule loop completion event using TRUE beat-aligned scheduling
+                # Phase 3: Pass deck_id for deck-specific beat alignment
+                self._engine.event_scheduler.schedule_beat_action({
+                    "command": "loop_repetition_complete",
+                    "deck_id": self.deck.deck_id,
+                    "parameters": {
+                        "action_id": self.current_loop.action_id,
+                        "repetition": rep + 1,
+                        "total_repetitions": repetitions,
+                        "start_frame": start_frame,
+                        "end_frame": end_frame,
+                        "target_beat": rep_end_beat  # Key: exact beat to trigger on
+                    }
+                }, rep_end_beat, deck_id=self.deck.deck_id, priority=80)
+                
+                logger.debug(f"Deck {self.deck.deck_id} - Scheduled loop repetition {rep + 1}/{repetitions} completion at beat {rep_end_beat:.2f}")
+                
+        except Exception as e:
+            logger.error(f"Deck {self.deck.deck_id} - Failed to schedule loop events: {e}")
+            
+    def execute_pending_position_jump(self):
+        """Execute any pending position jump at beat boundaries"""
+        if (hasattr(self, '_loop_position_jump_pending') and 
+            self._loop_position_jump_pending and 
+            self.current_loop and 
+            self.state == LoopState.ACTIVE):
+            
+            # Execute the position jump
+            logger.info(f"Deck {self.deck.deck_id} - Executing pending position jump to loop start: {self.current_loop.start_frame}")
+            self.deck.audio_thread_current_frame = self.current_loop.start_frame
+            self.deck._current_playback_frame_for_display = self.current_loop.start_frame
+            
+            # Clear the pending flag
+            self._loop_position_jump_pending = False
+            
+            # Clear ring buffer to prevent artifacts
+            if self._clear_ring_buffer_callback:
+                self._clear_ring_buffer_callback("loop position jump")
+            
+            logger.info(f"Deck {self.deck.deck_id} - Position jump completed: now at frame {self.current_loop.start_frame}")
+            
+    def handle_loop_repetition_complete(self, repetition: int, total_repetitions: int):
+        """
+        Handle loop repetition completion events from the event scheduler.
+        This is called when a loop_repetition_complete event fires.
+        
+        Args:
+            repetition: The repetition number that just completed
+            total_repetitions: Total number of repetitions for this loop
+        """
+        if not self.current_loop or self.state != LoopState.ACTIVE:
+            logger.warning(f"Deck {self.deck.deck_id} - Received repetition completion event but no active loop")
+            return
+            
+        logger.info(f"Deck {self.deck.deck_id} - Loop repetition {repetition}/{total_repetitions} completed: {self.current_loop.action_id}")
+        
+        # Update the repetition count
+        self.current_loop.repetitions_done = repetition
+        
+        if repetition >= total_repetitions:
+            # Final repetition completed - finish the loop
+            logger.info(f"Deck {self.deck.deck_id} - Final loop repetition completed: {self.current_loop.action_id}")
+            self.state = LoopState.COMPLETING
+            self._notify_engine_loop_completed()
+            self._clear_current_loop()
+        else:
+            # More repetitions to go - jump back to start
+            logger.debug(f"Deck {self.deck.deck_id} - Continuing loop: repetition {repetition}/{total_repetitions}")
+            # The deck will handle the jump_to_start action when processing the result
+            
+    def _notify_engine_loop_completed(self):
+        """Notify engine that a loop has completed via event queue"""
+        if self._engine and hasattr(self._engine, 'event_scheduler'):
+            try:
+                # Post loop completion event to engine's event queue
+                self._engine.event_scheduler.schedule_immediate_action({
+                    "command": "loop_completed",
+                    "deck_id": self.deck.deck_id,
+                    "parameters": {
+                        "action_id": self.current_loop.action_id,
+                        "completed_at": time.time(),
+                        "total_repetitions": self.current_loop.repetitions_total
+                    }
+                }, priority=75)
+                logger.debug(f"Deck {self.deck.deck_id} - Loop completion event posted to engine queue")
+            except Exception as e:
+                logger.warning(f"Deck {self.deck.deck_id} - Failed to post loop completion event: {e}")
+        else:
+            logger.warning(f"Deck {self.deck.deck_id} - Cannot notify engine: no engine reference")
+            
+    def get_current_loop_position_beats(self) -> Optional[float]:
+        """
+        Get the current position within the active loop in beats.
+        Useful for synchronization and display purposes.
+        
+        Returns:
+            Current position in beats within the loop, or None if no active loop
+        """
+        if not self.current_loop or self.state != LoopState.ACTIVE:
+            return None
+            
+        current_frame = self.deck.audio_thread_current_frame
+        start_frame = self.current_loop.start_frame
+        
+        if current_frame < start_frame:
+            return 0.0
+            
+        # Calculate how many beats we've played in the loop
+        frames_played_in_loop = current_frame - start_frame
+        current_beat = self.deck.beat_manager.get_beat_from_frame(current_frame)
+        start_beat = self.deck.beat_manager.get_beat_from_frame(start_frame)
+        
+        return current_beat - start_beat
+        
+    def is_loop_synchronized_with_beat_grid(self) -> bool:
+        """
+        Check if the current loop is properly synchronized with the beat grid.
+        This ensures loops start and end on proper beat boundaries.
+        
+        Returns:
+            True if loop is synchronized, False otherwise
+        """
+        if not self.current_loop:
+            return False
+            
+        # Get beat positions using BeatManager
+        start_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.start_frame)
+        end_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.end_frame)
+        
+        # Check if both start and end are close to integer beat boundaries
+        start_beat_rounded = round(start_beat)
+        end_beat_rounded = round(end_beat)
+        
+        start_sync = abs(start_beat - start_beat_rounded) < 0.1  # Allow 0.1 beat tolerance
+        end_sync = abs(end_beat - end_beat_rounded) < 0.1
+        
+        return start_sync and end_sync
+        
+    def refresh_loop_frame_positions(self):
+        """
+        Refresh loop frame positions after tempo changes.
+        This ensures the loop boundaries are updated when the tempo changes.
+        """
+        if not self.current_loop:
+            return
+            
+        # Use the stored beat numbers (these don't change with tempo)
+        if self.current_loop.start_beat is not None and self.current_loop.end_beat is not None:
+            start_beat = self.current_loop.start_beat
+            end_beat = self.current_loop.end_beat
+        else:
+            # Derive from current frame positions
+            start_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.start_frame)
+            end_beat = self.deck.beat_manager.get_beat_from_frame(self.current_loop.end_frame)
+        
+        # Recalculate frame positions using current BeatManager state
+        new_start_frame = self.deck.beat_manager.get_frame_for_beat(start_beat)
+        new_end_frame = self.deck.beat_manager.get_frame_for_beat(end_beat)
+        
+        # Update the loop with new frame positions
+        self.current_loop.start_frame = new_start_frame
+        self.current_loop.end_frame = new_end_frame
+        
+        logger.debug(f"Deck {self.deck.deck_id} - Loop frame positions refreshed: {start_beat}→{end_beat} beats = {new_start_frame}→{new_end_frame} frames")

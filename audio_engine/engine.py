@@ -41,7 +41,19 @@ class AudioEngine:
         
         # NEW: Event-driven architecture
         self.audio_clock = AudioClock()
+        logger.debug(f"AudioEngine - Created audio clock instance {id(self.audio_clock)}")
         self.event_scheduler = EventScheduler(self.audio_clock)
+        
+        # Phase 2: BeatManager references for deck-specific beat operations
+        self._deck_beat_managers = {}  # deck_id -> BeatManager
+        logger.debug("AudioEngine - Initialized deck BeatManager storage for Phase 2")
+        
+        # Phase 3: Set EventScheduler engine reference for deck-specific beat timing
+        self.event_scheduler.set_engine_reference(self)
+        logger.debug("AudioEngine - Set EventScheduler engine reference for Phase 3")
+        
+        # Debug: log engine instance ID
+        logger.debug(f"AudioEngine - Engine instance {id(self)} created with audio clock {id(self.audio_clock)}")
         
         # Event-driven architecture replaces old polling system
         self._all_actions_from_script = []
@@ -57,8 +69,36 @@ class AudioEngine:
     def _get_or_create_deck(self, deck_id):
         """Get existing deck or create new one"""
         if deck_id not in self.decks:
-            self.decks[deck_id] = Deck(deck_id, self.analyzer, engine_instance=self)
+            print(f"DEBUG: Creating deck {deck_id}")
+            deck = Deck(deck_id, self.analyzer, engine_instance=self)
+            
+            # Set engine reference in LoopManager for event-driven notifications
+            if hasattr(deck, 'loop_manager'):
+                deck.loop_manager.set_engine_reference(self)
+            
+            # Phase 2: Store BeatManager reference for deck-specific beat operations
+            if hasattr(deck, 'beat_manager'):
+                self._deck_beat_managers[deck_id] = deck.beat_manager
+                logger.debug(f"AudioEngine - Stored BeatManager reference for deck {deck_id}")
+            else:
+                logger.warning(f"AudioEngine - Deck {deck_id} has no beat_manager attribute")
+                
+            # Add deck to dictionary FIRST
+            self.decks[deck_id] = deck
+            
+            # THEN register beat callback with EventScheduler if it's running
+            if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
+                print(f"DEBUG: Registering callback for deck {deck_id} during creation")
+                self.event_scheduler.register_deck_callback(deck_id)
+            print(f"DEBUG: Deck {deck_id} created. Total decks: {len(self.decks)}")
         return self.decks[deck_id]
+    
+    def get_beat_manager_for_deck(self, deck_id: str):
+        """
+        Get BeatManager for a specific deck.
+        Phase 2: Helper method for EventScheduler to access deck-specific beat timing.
+        """
+        return self._deck_beat_managers.get(deck_id)
     
     def _register_event_handlers(self):
         """Register handlers for different action types with the event scheduler"""
@@ -71,7 +111,7 @@ class AudioEngine:
             "set_tempo", "set_pitch", "set_volume", "fade_volume",
             "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample",
             "set_stem_eq", "enable_stem_eq", "set_stem_volume",
-            "set_master_eq", "set_all_stem_eq"
+            "set_master_eq", "set_all_stem_eq", "loop_completed", "loop_repetition_complete"
         ]
         
         for command in deck_commands:
@@ -167,7 +207,7 @@ class AudioEngine:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq", "loop_completed"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -187,6 +227,14 @@ class AudioEngine:
                         int(params["repetitions"])
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' parameters not valid numbers/type. Params: {params}")
+                return False
+        elif command == "loop_completed":
+            params = action.get("parameters", {})
+            if not action.get("deck_id"):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'loop_completed' missing 'deck_id'.")
+                return False
+            if not params.get("action_id"):
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'loop_completed' missing 'action_id' in parameters.")
                 return False
         elif command == "set_tempo":
             params = action.get("parameters", {})
@@ -790,6 +838,7 @@ class AudioEngine:
 
 
     def start_script_processing(self): 
+        print("DEBUG: start_script_processing() called")  # Basic print to bypass logging
         if self.is_processing_script_actions:
             logger.warning("Script processing already running.")
             return
@@ -797,6 +846,7 @@ class AudioEngine:
             logger.info("No actions loaded to process.")
             return
 
+        print(f"DEBUG: Starting script processing with {len(self._all_actions_from_script)} actions")
         logger.info(f"Starting event-driven script processing: '{self.script_name}'")
         self.is_processing_script_actions = True 
         self._script_start_time = time.time() 
@@ -804,20 +854,65 @@ class AudioEngine:
         # Start the audio clock
         self.audio_clock.start()
         
-        # Schedule all actions using the event scheduler
-        self._schedule_all_actions()
-        
-        # Start the event scheduler
+        # Start the event scheduler FIRST so it's running when decks are created
         self.event_scheduler.start()
         
+        # Schedule all actions using the event scheduler (this creates decks)
+        self._schedule_all_actions()
+        
+        # FORCE register beat callbacks with all existing decks
+        for deck_id, deck in self.decks.items():
+            if hasattr(deck, 'beat_manager'):
+                deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
+                print(f"FORCE REGISTERED: Beat callback for deck {deck_id}")
+        
+        # Also ensure EventScheduler has registered callbacks
+        if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
+            self.event_scheduler._register_beat_callbacks()
+            print("DEBUG: Re-registered all beat callbacks with EventScheduler")
+        
+        print(f"TOTAL CALLBACKS REGISTERED: {sum(len(deck.beat_manager._beat_callbacks) for deck in self.decks.values() if hasattr(deck, 'beat_manager'))}")
+        
         logger.info("AudioEngine - Event-driven script processing started")
+        
+        # Debug: Check if callbacks were actually registered
+        total_callbacks = 0
+        for deck_id, deck in self.decks.items():
+            if hasattr(deck, 'beat_manager'):
+                callback_count = len(deck.beat_manager._beat_callbacks)
+                total_callbacks += callback_count
+                logger.info(f"AudioEngine: Deck {deck_id} has {callback_count} beat callbacks")
+        logger.info(f"AudioEngine: Total beat callbacks registered: {total_callbacks}")
+    
+    def _register_all_beat_callbacks(self):
+        """Register beat callbacks with all existing decks after EventScheduler starts"""
+        logger.info(f"AudioEngine: _register_all_beat_callbacks called")
+        logger.info(f"AudioEngine: Has event_scheduler: {hasattr(self, 'event_scheduler')}")
+        logger.info(f"AudioEngine: EventScheduler running: {hasattr(self, 'event_scheduler') and self.event_scheduler.is_running()}")
+        logger.info(f"AudioEngine: Number of decks: {len(self.decks)}")
+        
+        if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
+            registered_count = 0
+            for deck_id, deck in self.decks.items():
+                logger.info(f"AudioEngine: Processing deck {deck_id}")
+                if hasattr(deck, 'beat_manager'):
+                    deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
+                    registered_count += 1
+                    logger.info(f"AudioEngine: Registered beat callback with deck {deck_id}")
+                else:
+                    logger.warning(f"AudioEngine: Deck {deck_id} has no beat_manager")
+            logger.info(f"AudioEngine: Registered beat callbacks with {registered_count} decks")
+        else:
+            logger.warning("AudioEngine: EventScheduler not running, cannot register beat callbacks")
     
     def _schedule_all_actions(self):
         """Schedule all script actions using the event scheduler"""
+        print(f"DEBUG: _schedule_all_actions called with {len(self._all_actions_from_script)} actions")
         logger.debug("AudioEngine - Scheduling all script actions")
         
-        for action in self._all_actions_from_script:
+        for i, action in enumerate(self._all_actions_from_script):
             try:
+                print(f"DEBUG: Scheduling action {i}: {action.get('command', 'NO_COMMAND')} for deck {action.get('deck_id', 'NO_DECK')}")
                 self._schedule_action(action)
             except Exception as e:
                 logger.error(f"Failed to schedule action {action.get('action_id', 'unknown')}: {e}")
@@ -830,11 +925,23 @@ class AudioEngine:
         trigger_type = trigger.get("type")
         
         if trigger_type == "script_start":
-            # Execute immediately
+            # Phase 5B: Execute on next beat boundary for musical timing
+            # Ensure deck_id is set for beat-based scheduling
+            if 'deck_id' not in action:
+                # For script_start actions without deck_id, use the primary deck
+                primary_deck = list(self.decks.keys())[0] if self.decks else None
+                if primary_deck:
+                    action = action.copy()  # Don't modify original
+                    action['deck_id'] = primary_deck
+                    logger.debug(f"AudioEngine - Added deck_id {primary_deck} to script_start action")
+                else:
+                    logger.error(f"AudioEngine - No decks available for script_start action: {action}")
+                    return
+            
             event_id = self.event_scheduler.schedule_immediate_action(
                 action, priority=100  # High priority for immediate actions
             )
-            logger.debug(f"AudioEngine - Scheduled immediate action: {event_id}")
+            logger.debug(f"AudioEngine - Scheduled immediate beat action: {event_id}")
             
         elif trigger_type == "on_deck_beat":
             # Beat-triggered actions - store for later execution when deck reaches the beat
@@ -842,34 +949,11 @@ class AudioEngine:
             target_beat = trigger.get("beat_number")
             
             if source_deck_id and target_beat is not None:
-                # Get the deck to access its beat timing
-                deck = self.decks.get(source_deck_id)
-                if deck and hasattr(deck, 'beat_timestamps') and deck.beat_timestamps:
-                    # Calculate relative time from current playback position
-                    if target_beat < len(deck.beat_timestamps):
-                        # Get the current playback position
-                        current_frame = getattr(deck, '_current_playback_frame_for_display', 0)
-                        current_time = current_frame / deck.audio_thread_sample_rate if hasattr(deck, 'audio_thread_sample_rate') and deck.audio_thread_sample_rate > 0 else 0
-                        
-                        # Calculate time to reach target beat from current position
-                        target_time = deck.beat_timestamps[target_beat]
-                        time_to_beat = target_time - current_time
-                        
-                        # Schedule relative to current time
-                        trigger_time = time.time() + time_to_beat
-                        
-                        event_id = self.event_scheduler.schedule_action(
-                            action, trigger_time, priority=50
-                        )
-                        logger.debug(f"AudioEngine - Scheduled beat action {event_id} for beat {target_beat} in {time_to_beat:.2f}s (relative timing)")
-                    else:
-                        logger.warning(f"Beat {target_beat} is beyond deck {source_deck_id} beat count")
-                else:
-                    # Fallback to BPM calculation
-                    event_id = self.event_scheduler.schedule_beat_action(
-                        action, target_beat, priority=50
-                    )
-                    logger.debug(f"AudioEngine - Scheduled beat action {event_id} for beat {target_beat} (BPM fallback)")
+                # Phase 4: Always use BeatManager system for deck-specific timing
+                event_id = self.event_scheduler.schedule_beat_action(
+                    action, target_beat, deck_id=source_deck_id, priority=50
+                )
+                logger.debug(f"AudioEngine - Scheduled beat action {event_id} for deck {source_deck_id} beat {target_beat} (BeatManager)")
             else:
                 logger.error(f"Invalid on_deck_beat trigger: {trigger}")
                 
@@ -976,14 +1060,10 @@ class AudioEngine:
                 else:
                     deck_statuses.append(f"{deck_id}: inactive")
             
-            # Always check for loop completion (not just on beat changes)
-            # This ensures loops complete and trigger actions even between beats
-            self._check_loop_completion_triggers()
-            
             # Only print if a beat changed
             if current_beat_changed:
                 # Get pending actions count from event scheduler
-                if hasattr(self, 'event_scheduler') and self.event_scheduler:
+                if hasattr(self, 'event_scheduler') and self.event_scheduler is not None:
                     scheduler_stats = self.event_scheduler.get_stats()
                     pending_actions = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
                 else:
@@ -996,20 +1076,6 @@ class AudioEngine:
         except Exception as e:
             logger.debug(f"Error printing beat indicator: {e}")
             
-    def _check_loop_completion_triggers(self):
-        """Check all decks for loop completion and trigger appropriate actions"""
-        try:
-            for deck_id, deck in self.decks.items():
-                if hasattr(deck, 'loop_manager'):
-                    completion_status = deck.check_loop_completion()
-                    if completion_status:
-                        # A loop has completed, trigger the completion action
-                        logger.info(f"AudioEngine - Loop completion detected for deck {deck_id}, action: {completion_status['action_id']}")
-                        self._process_loop_completion_immediate(deck_id, completion_status['action_id'])
-        except Exception as e:
-            logger.debug(f"Error checking loop completion triggers: {e}")
-
-
     def _execute_action(self, action_dict):
         command = action_dict.get("command")
         deck_id = action_dict.get("deck_id")
@@ -1038,12 +1104,13 @@ class AudioEngine:
                 
                 if match_tempo_to:
                     reference_deck = self._get_or_create_deck(match_tempo_to)
-                    if reference_deck.bpm > 0:
-                        target_bpm = reference_deck.bpm + tempo_offset_bpm
-                        deck.set_tempo(target_bpm)
-                        logger.info(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_deck.bpm} + {tempo_offset_bpm} = {target_bpm} BPM")
+                    reference_bpm = reference_deck.beat_manager.get_bpm()
+                    if reference_bpm > 0:
+                        target_bpm = reference_bpm + tempo_offset_bpm
+                        deck.beat_manager.handle_tempo_change(target_bpm)
+                        logger.info(f"Tempo matched {deck_id} to {match_tempo_to}: {reference_bpm} + {tempo_offset_bpm} = {target_bpm} BPM via BeatManager")
                     else:
-                        logger.warning(f"Cannot match tempo: reference deck {match_tempo_to} has invalid BPM ({reference_deck.bpm})")
+                        logger.warning(f"Cannot match tempo: reference deck {match_tempo_to} has invalid BPM ({reference_bpm})")
                 
                 return False  # Engine convention: False = success
 
@@ -1175,12 +1242,44 @@ class AudioEngine:
                 deck = self._get_or_create_deck(deck_id)
                 deck.deactivate_loop()
                 return False  # Engine convention: False = success
+                
+            elif command == "loop_completed":
+                # Handle loop completion events from LoopManager
+                if not deck_id: logger.warning("'loop_completed' missing deck_id. Skipping."); return False
+                action_id = parameters.get("action_id")
+                if not action_id: logger.warning("'loop_completed' missing action_id. Skipping."); return False
+                
+                logger.info(f"AudioEngine - Processing loop completion event: deck {deck_id}, action {action_id}")
+                self._process_loop_completion_immediate(deck_id, action_id)
+                return False  # Engine convention: False = success
+                
+            elif command == "loop_repetition_complete":
+                # Handle loop repetition completion events from LoopManager
+                if not deck_id: logger.warning("'loop_repetition_complete' missing deck_id. Skipping."); return False
+                action_id = parameters.get("action_id")
+                repetition = parameters.get("repetition")
+                total_repetitions = parameters.get("total_repetitions")
+                
+                if not action_id: logger.warning("'loop_repetition_complete' missing action_id. Skipping."); return False
+                
+                logger.info(f"AudioEngine - Processing loop repetition completion: deck {deck_id}, action {action_id}, repetition {repetition}/{total_repetitions}")
+                
+                # Get the deck and let its LoopManager handle the repetition completion
+                deck = self._get_or_create_deck(deck_id)
+                if hasattr(deck, 'loop_manager'):
+                    # Let the LoopManager handle the repetition completion logic
+                    deck.loop_manager.handle_loop_repetition_complete(repetition, total_repetitions)
+                else:
+                    logger.warning(f"Deck {deck_id} has no loop manager")
+                        
+                return False  # Engine convention: False = success
             
             elif command == "set_tempo":
                 deck_id = action_dict.get("deck_id")
                 deck = self._get_or_create_deck(deck_id)
                 target_bpm = float(action_dict.get("parameters", {}).get("target_bpm"))
-                deck.set_tempo(target_bpm)
+                deck.beat_manager.handle_tempo_change(target_bpm)
+                logger.info(f"Set tempo for deck {deck_id} to {target_bpm} BPM via BeatManager")
             elif command == "set_pitch":
                 deck_id = action_dict.get("deck_id")
                 deck = self._get_or_create_deck(deck_id)
@@ -1398,19 +1497,20 @@ class AudioEngine:
                 reference_deck = self._get_or_create_deck(reference_deck_id)
                 follow_deck = self._get_or_create_deck(follow_deck_id)
                 
-                reference_bpm = reference_deck.bpm
-                follow_bpm = follow_deck.bpm
+                # Use BeatManager for consistent BPM access
+                reference_bpm = reference_deck.beat_manager.get_bpm()
+                follow_bpm = follow_deck.beat_manager.get_bpm()
                 
                 logger.info(f"BPM-matching {follow_deck_id} to reference {reference_deck_id}")
-                logger.info(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} Bpm")
+                logger.info(f"Reference: {reference_bpm} BPM, Follow: {follow_bpm} BPM")
                 
                 if reference_bpm <= 0 or follow_bpm <= 0:
                     logger.error(f"Invalid BPM for bpm_match")
                     return False
                 
-                # Use real-time tempo processing (no caching needed)
-                follow_deck.set_tempo(reference_bpm)
-                logger.info(f"BPM match complete: {follow_deck_id} synchronized to {reference_bpm} BPM")
+                # Use BeatManager for tempo changes (replaces deprecated set_tempo)
+                follow_deck.beat_manager.handle_tempo_change(reference_bpm)
+                logger.info(f"BPM match complete: {follow_deck_id} synchronized to {reference_bpm} BPM via BeatManager")
                 return False  # Engine convention: False = success
             
             elif command == "ramp_tempo":
@@ -1429,27 +1529,14 @@ class AudioEngine:
                     logger.error("Invalid beat range for tempo ramp")
                     return False
                 
-                # Calculate BPM change per beat
-                bpm_change_per_beat = (end_bpm - start_bpm) / beat_duration
+                # Use BeatManager for tempo ramp (replaces deprecated set_tempo)
+                # Calculate ramp duration in beats
+                ramp_duration_beats = end_beat - start_beat
                 
-                # Schedule tempo changes at regular intervals
-                import threading
-                def ramp_tempo():
-                    current_beat = start_beat
-                    current_bpm = start_bpm
-                    while current_beat <= end_beat:
-                        deck.set_tempo(current_bpm)
-                        current_beat += 1.0
-                        current_bpm += bpm_change_per_beat
-                        if current_beat <= end_beat:
-                            # Schedule next tempo change
-                            timer = threading.Timer(60.0 / current_bpm, ramp_tempo)
-                            timer.start()
-                            break
+                # Use BeatManager's built-in tempo ramp functionality
+                deck.beat_manager.handle_tempo_change(end_bpm, ramp_duration_beats)
                 
-                # Start the ramp
-                ramp_tempo()
-                logger.info(f"Tempo ramp scheduled: {start_bpm}→{end_bpm} BPM over beats {start_beat}→{end_beat}")
+                logger.info(f"Tempo ramp scheduled via BeatManager: {start_bpm}→{end_bpm} BPM over {ramp_duration_beats} beats")
                 return False  # Engine convention: False = success
             
             # Add default return for unhandled commands
@@ -1490,6 +1577,143 @@ class AudioEngine:
         if hasattr(self, 'audio_clock'):
             return self.audio_clock.get_state()
         return {}
+        
+    def get_global_timing_info(self):
+        """
+        Get global timing information from all decks using BeatManager.
+        This provides a centralized view of timing across the entire system.
+        
+        Returns:
+            Dict with global timing information
+        """
+        timing_info = {
+            "total_decks": len(self.decks),
+            "active_decks": 0,
+            "global_bpm": None,
+            "deck_timing": {},
+            "synchronization_status": "unknown"
+        }
+        
+        if not self.decks:
+            timing_info["synchronization_status"] = "no_decks"
+            return timing_info
+            
+        # Collect timing information from all decks
+        active_decks = 0
+        bpms = []
+        
+        for deck_id, deck in self.decks.items():
+            if hasattr(deck, 'beat_manager'):
+                bpm = deck.beat_manager.get_bpm()
+                current_beat = deck.beat_manager.get_current_beat()
+                current_frame = deck.beat_manager.get_current_frame()
+                
+                deck_info = {
+                    "bpm": bpm,
+                    "current_beat": current_beat,
+                    "current_frame": current_frame,
+                    "has_tempo_ramp": deck.beat_manager.is_tempo_ramp_active(),
+                    "is_active": deck.is_active() if hasattr(deck, 'is_active') else False
+                }
+                
+                timing_info["deck_timing"][deck_id] = deck_info
+                
+                if deck_info["is_active"]:
+                    active_decks += 1
+                    if bpm > 0:
+                        bpms.append(bpm)
+            else:
+                # Fallback for decks without BeatManager
+                timing_info["deck_timing"][deck_id] = {
+                    "bpm": getattr(deck, 'bpm', 0),
+                    "current_beat": 0,
+                    "current_frame": 0,
+                    "has_tempo_ramp": False,
+                    "is_active": deck.is_active() if hasattr(deck, 'is_active') else False
+                }
+        
+        timing_info["active_decks"] = active_decks
+        
+        # Calculate global BPM if we have active decks with valid BPMs
+        if bpms:
+            # Use the most common BPM or average if they're close
+            bpms.sort()
+            if len(bpms) == 1 or (bpms[-1] - bpms[0]) < 5.0:  # Within 5 BPM
+                timing_info["global_bpm"] = sum(bpms) / len(bpms)
+                timing_info["synchronization_status"] = "synchronized"
+            else:
+                timing_info["global_bpm"] = bpms[0]  # Use first BPM as reference
+                timing_info["synchronization_status"] = "desynchronized"
+        else:
+            timing_info["synchronization_status"] = "no_active_decks"
+            
+        return timing_info
+        
+    def synchronize_all_decks_to_bpm(self, target_bpm: float, ramp_duration_beats: float = 0.0):
+        """
+        Synchronize all active decks to a common BPM using BeatManager.
+        This ensures consistent timing across the entire system.
+        
+        Args:
+            target_bpm: Target BPM for all decks
+            ramp_duration_beats: Duration of tempo ramp in beats (0 = instant change)
+            
+        Returns:
+            Dict with synchronization results
+        """
+        if target_bpm <= 0:
+            logger.error(f"Invalid target BPM: {target_bpm}")
+            return {"success": False, "error": "Invalid target BPM"}
+            
+        results = {
+            "target_bpm": target_bpm,
+            "ramp_duration_beats": ramp_duration_beats,
+            "decks_synchronized": 0,
+            "decks_failed": 0,
+            "details": {}
+        }
+        
+        for deck_id, deck in self.decks.items():
+            try:
+                if hasattr(deck, 'beat_manager'):
+                    # Use BeatManager for tempo synchronization
+                    deck.beat_manager.handle_tempo_change(target_bpm, ramp_duration_beats)
+                    results["decks_synchronized"] += 1
+                    results["details"][deck_id] = {
+                        "success": True,
+                        "method": "BeatManager",
+                        "previous_bpm": deck.beat_manager.get_bpm()
+                    }
+                    logger.info(f"Deck {deck_id} synchronized to {target_bpm} BPM via BeatManager")
+                else:
+                    # Fallback for decks without BeatManager
+                    if hasattr(deck, 'set_tempo'):
+                        deck.set_tempo(target_bpm)
+                        results["decks_synchronized"] += 1
+                        results["details"][deck_id] = {
+                            "success": True,
+                            "method": "legacy_set_tempo",
+                            "previous_bpm": getattr(deck, 'bpm', 0)
+                        }
+                        logger.info(f"Deck {deck_id} synchronized to {target_bpm} BPM via legacy method")
+                    else:
+                        results["decks_failed"] += 1
+                        results["details"][deck_id] = {
+                            "success": False,
+                            "error": "No tempo control method available"
+                        }
+                        logger.warning(f"Deck {deck_id} has no tempo control method")
+                        
+            except Exception as e:
+                results["decks_failed"] += 1
+                results["details"][deck_id] = {
+                    "success": False,
+                    "error": str(e)
+                }
+                logger.error(f"Failed to synchronize deck {deck_id}: {e}")
+                
+        logger.info(f"Global synchronization complete: {results['decks_synchronized']} decks synchronized, {results['decks_failed']} failed")
+        return results
 
     def _play_global_sample(self, sample_id, volume=1.0, key_match_deck=None, repetitions=None):
         """Play a pre-processed global sample with optional key matching and looping"""

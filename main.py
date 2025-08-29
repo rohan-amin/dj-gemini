@@ -147,7 +147,7 @@ def run_dj_gemini():
             # Get event scheduler status
             scheduler_status = "unknown"
             pending_events = 0
-            if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler:
+            if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler is not None:
                 try:
                     scheduler_stats = audio_engine.event_scheduler.get_stats()
                     total_scheduled = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0)
@@ -208,7 +208,7 @@ def run_dj_gemini():
         if audio_engine: 
             try:
                 # Get final status before shutdown
-                if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler:
+                if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler is not None:
                     final_stats = audio_engine.event_scheduler.get_stats()
                     logger.info(f"Final event scheduler stats: {final_stats}")
                 

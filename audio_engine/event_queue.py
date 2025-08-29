@@ -127,6 +127,39 @@ class BeatAlignedEventQueue(EventQueue):
             
             logger.debug(f"BeatAlignedEventQueue: Scheduled event {event.action_id} for beat {beat_number}")
             return event.action_id
+            
+    def schedule_by_beat(self, event: ScheduledEvent, beat_number: float) -> str:
+        """
+        Schedule an event for a specific beat number.
+        This method takes the beat number directly instead of extracting from trigger_time.
+        
+        Args:
+            event: Event to schedule
+            beat_number: Beat number where event should execute
+            
+        Returns:
+            Event ID for cancellation
+        """
+        with self._lock:
+            beat_int = int(beat_number)
+            
+            if beat_int not in self._beat_events:
+                self._beat_events[beat_int] = []
+            
+            # Insert in priority order (higher priority first)
+            events = self._beat_events[beat_int]
+            insert_index = 0
+            for i, existing_event in enumerate(events):
+                if existing_event.priority < event.priority:
+                    insert_index = i
+                    break
+                insert_index = i + 1
+            
+            events.insert(insert_index, event)
+            self._stats["scheduled"] += 1
+            
+            logger.debug(f"BeatAlignedEventQueue: Scheduled event {event.action_id} for beat {beat_int}")
+            return event.action_id
     
     def get_next_event(self) -> Optional[ScheduledEvent]:
         """Get next beat-aligned event (should be called with current beat)"""
@@ -145,6 +178,38 @@ class BeatAlignedEventQueue(EventQueue):
                 self._stats["executed"] += len(events)
                 return events
             return []
+            
+    def get_events_up_to_beat(self, current_beat: float) -> List[ScheduledEvent]:
+        """
+        Get all events that should have fired by the current beat position.
+        This handles fractional beats and ensures events fire when we pass their scheduled position.
+        
+        Args:
+            current_beat: Current beat position (can be fractional)
+            
+        Returns:
+            List of events that should execute now
+        """
+        with self._lock:
+            events_to_execute = []
+            beats_to_remove = []
+            
+            # Check all scheduled beats
+            for scheduled_beat, event_list in self._beat_events.items():
+                # If current_beat >= scheduled_beat, the event should fire
+                if current_beat >= scheduled_beat:
+                    events_to_execute.extend(event_list)
+                    beats_to_remove.append(scheduled_beat)
+            
+            # Remove executed events from the queue
+            for beat in beats_to_remove:
+                del self._beat_events[beat]
+            
+            if events_to_execute:
+                self._stats["executed"] += len(events_to_execute)
+                logger.debug(f"BeatAlignedEventQueue: Executing {len(events_to_execute)} events up to beat {current_beat:.2f}")
+            
+            return events_to_execute
     
     def cancel_event(self, event_id: str) -> bool:
         """Cancel a beat-aligned event"""
@@ -295,6 +360,30 @@ class HybridEventQueue(EventQueue):
             logger.debug(f"HybridEventQueue: Routed event {event_id} to {event.event_type.value} queue")
             
             return event_id
+            
+    def schedule_beat_aligned(self, event: ScheduledEvent, beat_number: float) -> str:
+        """
+        Schedule an event to execute at a specific beat number.
+        This bypasses time-based routing and directly stores by beat position.
+        
+        Args:
+            event: Event to schedule
+            beat_number: Beat number where event should execute
+            
+        Returns:
+            Event ID for cancellation
+        """
+        with self._lock:
+            # Force event type to beat-aligned
+            event.event_type = EventType.BEAT_ALIGNED
+            
+            # Store directly in beat-aligned queue by beat number
+            event_id = self.beat_aligned_queue.schedule_by_beat(event, beat_number)
+            
+            self._stats["total_scheduled"] += 1
+            logger.debug(f"HybridEventQueue: Scheduled beat-aligned event {event_id} for beat {beat_number}")
+            
+            return event_id
     
     def get_next_event(self) -> Optional[ScheduledEvent]:
         """Get the next event that should execute now"""
@@ -305,15 +394,13 @@ class HybridEventQueue(EventQueue):
                 self._stats["total_executed"] += 1
                 return event
             
-            # Check beat-aligned queue
-            current_beat = self.audio_clock.get_current_beat()
-            if current_beat is not None:
-                beat_events = self.beat_aligned_queue.get_events_for_beat(int(current_beat))
-                if beat_events:
-                    # Return highest priority event
-                    event = max(beat_events, key=lambda e: e.priority)
-                    self._stats["total_executed"] += 1
-                    return event
+            # Check beat-aligned queue - Phase 4: Beat timing handled by EventScheduler  
+            # But still check for beat-aligned events that bypass time-based routing
+            beat_events = self.beat_aligned_queue.get_next_event()
+            if beat_events:
+                self._stats["total_executed"] += 1
+                logger.debug(f"HybridEventQueue: Executing beat-aligned event {beat_events.action_id}")
+                return beat_events
             
             # Check future queue
             event = self.future_queue.get_next_event()
