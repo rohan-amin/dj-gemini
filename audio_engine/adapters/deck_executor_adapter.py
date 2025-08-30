@@ -27,6 +27,9 @@ class DeckExecutorAdapter(ActionExecutor):
         self._deck = deck
         self._deck_id = getattr(deck, 'deck_id', 'unknown')
         
+        # Engine-level commands that should be routed to the engine
+        self._engine_commands = {'crossfade', 'bpm_match'}
+        
         # Map action types to deck methods
         self._action_methods = {
             'play': self._execute_play,
@@ -36,8 +39,7 @@ class DeckExecutorAdapter(ActionExecutor):
             'activate_loop': self._execute_activate_loop,
             'deactivate_loop': self._execute_deactivate_loop,
             'set_volume': self._execute_set_volume,
-            'set_tempo': self._execute_set_tempo,
-            'bpm_match': self._execute_bpm_match
+            'set_tempo': self._execute_set_tempo
         }
         
         # Validate deck has basic required methods
@@ -62,6 +64,10 @@ class DeckExecutorAdapter(ActionExecutor):
         Returns:
             True if execution was successful
         """
+        # Route engine-level commands to the engine
+        if action_type in self._engine_commands:
+            return self._execute_engine_command(action_type, parameters, execution_context)
+            
         if action_type not in self._action_methods:
             logger.error(f"Deck {self._deck_id}: Unsupported action type: {action_type}")
             return False
@@ -91,7 +97,7 @@ class DeckExecutorAdapter(ActionExecutor):
         Returns:
             True if this adapter can handle the action type
         """
-        return action_type in self._action_methods
+        return action_type in self._action_methods or action_type in self._engine_commands
     
     def get_supported_actions(self) -> list[str]:
         """
@@ -100,7 +106,7 @@ class DeckExecutorAdapter(ActionExecutor):
         Returns:
             List of action types this adapter can handle
         """
-        return list(self._action_methods.keys())
+        return list(self._action_methods.keys()) + list(self._engine_commands)
     
     def _execute_play(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
         """Execute play action"""
@@ -228,7 +234,7 @@ class DeckExecutorAdapter(ActionExecutor):
                         'start_frame': loop_start_frame,
                         'end_frame': loop_end_frame,
                         'repetitions': repetitions,
-                        'current_repetition': 0,
+                        'current_repetition': 1,  # Start at 1 since first play-through is repetition 1
                         'action_id': action_id,
                         'active': True
                     }
@@ -310,31 +316,40 @@ class DeckExecutorAdapter(ActionExecutor):
             logger.error(f"Deck {self._deck_id}: Error setting tempo: {e}")
             return False
     
-    def _execute_bpm_match(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """Execute BPM matching between decks"""
+    
+    def _execute_engine_command(self, action_type: str, parameters: Dict[str, Any], 
+                              execution_context: Dict[str, Any]) -> bool:
+        """Route engine-level commands to the engine"""
         try:
-            reference_deck_id = params.get('reference_deck')
-            follow_deck_id = params.get('follow_deck')
+            # Get engine reference from deck
+            engine = None
+            if hasattr(self._deck, '_engine'):
+                engine = self._deck._engine
+            elif hasattr(self._deck, 'engine'):
+                engine = self._deck.engine
             
-            if not reference_deck_id or not follow_deck_id:
-                logger.error(f"Deck {self._deck_id}: Missing reference_deck or follow_deck for BPM match")
+            if not engine:
+                logger.error(f"Deck {self._deck_id}: No engine reference found for engine command: {action_type}")
                 return False
             
-            # For now, just log the BPM match request
-            # This would need engine-level implementation to access other decks
-            logger.info(f"🎛️ BPM Match requested: {follow_deck_id} should match {reference_deck_id}")
-            logger.warning(f"Deck {self._deck_id}: BPM matching not yet implemented - requires engine-level coordination")
+            # Create action dict in the format expected by the engine
+            action_dict = {
+                'command': action_type,
+                'deck_id': self._deck_id,
+                'parameters': parameters,
+                'action_id': execution_context.get('action_id', f'{action_type}_{self._deck_id}')
+            }
             
-            # TODO: Implement actual BPM matching via engine reference
-            # This would require:
-            # 1. Get reference deck's current BPM
-            # 2. Set follow deck's BPM to match
-            # 3. Potentially handle tempo ramping for smooth transitions
+            logger.info(f"Deck {self._deck_id}: Routing engine command {action_type} to engine")
             
-            return True  # Return true for now to avoid errors
+            # Call the engine's action execution method
+            success = engine._execute_action(action_dict)
+            
+            # Engine uses False for success, True for failure (opposite convention)
+            return not success
             
         except Exception as e:
-            logger.error(f"Deck {self._deck_id}: Error in BPM match: {e}")
+            logger.error(f"Deck {self._deck_id}: Error executing engine command {action_type}: {e}")
             return False
     
     def get_deck_info(self) -> dict:

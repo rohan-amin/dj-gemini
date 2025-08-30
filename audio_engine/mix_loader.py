@@ -61,13 +61,17 @@ class MixConfigLoader:
             # Separate actions by trigger type
             immediate_actions = [action for action in actions if self._is_immediate_action(action)]
             beat_actions = [action for action in actions if self._is_beat_triggered_action(action)]
-            other_actions = [action for action in actions if not self._is_immediate_action(action) and not self._is_beat_triggered_action(action)]
+            loop_complete_actions = [action for action in actions if self._is_loop_complete_action(action)]
+            other_actions = [action for action in actions if not self._is_immediate_action(action) and 
+                           not self._is_beat_triggered_action(action) and not self._is_loop_complete_action(action)]
             
-            logger.info(f"Found {len(immediate_actions)} immediate actions, {len(beat_actions)} beat-triggered actions, and {len(other_actions)} other actions")
+            logger.info(f"Found {len(immediate_actions)} immediate actions, {len(beat_actions)} beat-triggered actions, "
+                       f"{len(loop_complete_actions)} loop-complete actions, and {len(other_actions)} other actions")
             
             # DEBUG: Show exactly which actions are in each category
             logger.info(f"Immediate actions: {[action.get('action_id') for action in immediate_actions]}")
             logger.info(f"Beat actions: {[action.get('action_id') for action in beat_actions]}")
+            logger.info(f"Loop-complete actions: {[action.get('action_id') for action in loop_complete_actions]}")
             logger.info(f"Other actions: {[action.get('action_id') for action in other_actions]}")
             
             # Execute immediate actions in proper order: load_track first, then play actions
@@ -98,6 +102,12 @@ class MixConfigLoader:
             # Pre-schedule all beat-triggered actions 
             self._schedule_beat_actions(beat_actions)
             
+            # Handle loop completion actions (for now, just log them)
+            for action in loop_complete_actions:
+                trigger = action.get('trigger', {})
+                logger.warning(f"Loop completion trigger not yet implemented for action {action.get('action_id')}: "
+                             f"depends on loop {trigger.get('loop_action_id')} from deck {trigger.get('source_deck_id')}")
+            
             # Handle other trigger types (for now, just log them)
             for action in other_actions:
                 trigger = action.get('trigger', {})
@@ -119,6 +129,11 @@ class MixConfigLoader:
         """Check if action is triggered by a beat event"""
         trigger = action.get('trigger', {})
         return trigger.get('type') == 'on_deck_beat'
+    
+    def _is_loop_complete_action(self, action: dict) -> bool:
+        """Check if action is triggered by loop completion"""
+        trigger = action.get('trigger', {})
+        return trigger.get('type') == 'on_loop_complete'
     
     def _execute_immediate_action(self, action: dict) -> None:
         """Execute actions that should happen immediately at startup"""

@@ -325,11 +325,10 @@ class MusicalTimingSystem:
     def _register_action_executors(self) -> None:
         """Register action executors with the composite executor."""
         try:
-            # Register deck-based executor for most actions
-            deck_actions = ['play', 'pause', 'stop', 'seek', 'activate_loop', 
-                           'deactivate_loop', 'set_volume', 'set_tempo']
+            # Register deck-based executor for all actions it supports
+            supported_actions = self._deck_executor.get_supported_actions()
             
-            for action_type in deck_actions:
+            for action_type in supported_actions:
                 if self._deck_executor.can_execute(action_type):
                     self._executor.register_executor(action_type, self._deck_executor)
             
