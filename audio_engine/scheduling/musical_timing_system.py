@@ -59,6 +59,9 @@ class MusicalTimingSystem:
         self._initialized = True
         self._processing_enabled = True
         
+        # Loop completion system
+        self._loop_completion_actions = {}  # loop_action_id -> [actions_to_trigger]
+        
         logger.info(f"MusicalTimingSystem initialized for deck {self._deck_id}")
     
     def schedule_beat_action(self, beat_number: float, action_type: str, 
@@ -135,6 +138,120 @@ class MusicalTimingSystem:
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error cancelling action {action_id}: {e}")
             return False
+    
+    def register_loop_completion_action(self, loop_action_id: str, action_type: str, 
+                                      parameters: Dict[str, Any], action_id: str, 
+                                      target_deck_id: Optional[str] = None, priority: int = 0) -> None:
+        """
+        Register an action to be executed when a specific loop completes.
+        
+        Args:
+            loop_action_id: ID of the loop action to wait for completion
+            action_type: Type of action to execute when loop completes
+            parameters: Action-specific parameters
+            action_id: Unique identifier for this dependent action
+            target_deck_id: Deck to execute action on (defaults to this deck)
+            priority: Action priority
+        """
+        if not self._initialized:
+            logger.error(f"Deck {self._deck_id}: Cannot register loop completion action - system not initialized")
+            return
+        
+        if loop_action_id not in self._loop_completion_actions:
+            self._loop_completion_actions[loop_action_id] = []
+        
+        completion_action = {
+            'action_id': action_id,
+            'action_type': action_type,
+            'parameters': parameters,
+            'target_deck_id': target_deck_id or self._deck_id,
+            'priority': priority
+        }
+        
+        self._loop_completion_actions[loop_action_id].append(completion_action)
+        
+        logger.info(f"Deck {self._deck_id}: Registered loop completion action {action_id} for loop {loop_action_id}")
+    
+    def handle_loop_completion(self, loop_action_id: str) -> int:
+        """
+        Handle loop completion by triggering all dependent actions.
+        
+        Args:
+            loop_action_id: ID of the loop that just completed
+            
+        Returns:
+            Number of actions triggered
+        """
+        if not self._initialized or not self._processing_enabled:
+            logger.warning(f"Deck {self._deck_id}: Loop completion handling disabled")
+            return 0
+        
+        if loop_action_id not in self._loop_completion_actions:
+            logger.debug(f"Deck {self._deck_id}: No completion actions registered for loop {loop_action_id}")
+            return 0
+        
+        actions = self._loop_completion_actions[loop_action_id]
+        triggered_count = 0
+        
+        for completion_action in actions:
+            try:
+                action_id = completion_action['action_id']
+                action_type = completion_action['action_type'] 
+                parameters = completion_action['parameters']
+                target_deck_id = completion_action['target_deck_id']
+                priority = completion_action['priority']
+                
+                logger.info(f"🔄 Deck {self._deck_id}: Loop {loop_action_id} completed - triggering action {action_id}")
+                
+                # If action targets this deck, execute immediately
+                if target_deck_id == self._deck_id:
+                    execution_context = {
+                        'action_id': action_id,
+                        'trigger_type': 'loop_completion',
+                        'source_loop_id': loop_action_id,
+                        'target_frame': 0  # Immediate execution
+                    }
+                    
+                    success = self._executor.execute_action(action_type, parameters, execution_context)
+                    if success:
+                        triggered_count += 1
+                        logger.info(f"✅ Deck {self._deck_id}: Executed completion action {action_id}")
+                    else:
+                        logger.error(f"❌ Deck {self._deck_id}: Failed to execute completion action {action_id}")
+                else:
+                    # Action targets different deck - route through engine
+                    try:
+                        engine = None
+                        if hasattr(self._deck, 'engine'):
+                            engine = self._deck.engine
+                        
+                        if engine:
+                            target_deck = engine._get_or_create_deck(target_deck_id)
+                            if target_deck and hasattr(target_deck, 'musical_timing_system') and target_deck.musical_timing_system:
+                                # Execute on target deck's musical timing system
+                                target_success = target_deck.musical_timing_system._executor.execute_action(
+                                    action_type, parameters, execution_context
+                                )
+                                if target_success:
+                                    triggered_count += 1
+                                    logger.info(f"✅ Deck {self._deck_id}: Cross-deck completion action {action_id} executed on {target_deck_id}")
+                                else:
+                                    logger.error(f"❌ Deck {self._deck_id}: Failed cross-deck completion action {action_id} on {target_deck_id}")
+                            else:
+                                logger.error(f"Deck {self._deck_id}: Target deck {target_deck_id} not found or no musical timing system")
+                        else:
+                            logger.error(f"Deck {self._deck_id}: No engine reference for cross-deck action {action_id}")
+                    except Exception as cross_deck_error:
+                        logger.error(f"Deck {self._deck_id}: Error in cross-deck execution for {action_id}: {cross_deck_error}")
+                    
+            except Exception as e:
+                logger.error(f"Deck {self._deck_id}: Error executing completion action {completion_action['action_id']}: {e}")
+        
+        # Remove the completed loop's actions since they've been triggered
+        del self._loop_completion_actions[loop_action_id]
+        
+        logger.info(f"Deck {self._deck_id}: Loop completion processed - triggered {triggered_count} actions for loop {loop_action_id}")
+        return triggered_count
     
     def process_audio_buffer(self, start_frame: int, end_frame: int) -> Dict[str, Any]:
         """
@@ -276,6 +393,8 @@ class MusicalTimingSystem:
                 'tempo_controller': tempo_stats,
                 'action_executor': executor_stats,
                 'beat_converter': beat_converter_info,
+                'loop_completion_actions': len(self._loop_completion_actions),
+                'pending_loop_completions': list(self._loop_completion_actions.keys()),
                 'timestamp': time.time()
             }
             

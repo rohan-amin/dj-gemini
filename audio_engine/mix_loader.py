@@ -102,11 +102,8 @@ class MixConfigLoader:
             # Pre-schedule all beat-triggered actions 
             self._schedule_beat_actions(beat_actions)
             
-            # Handle loop completion actions (for now, just log them)
-            for action in loop_complete_actions:
-                trigger = action.get('trigger', {})
-                logger.warning(f"Loop completion trigger not yet implemented for action {action.get('action_id')}: "
-                             f"depends on loop {trigger.get('loop_action_id')} from deck {trigger.get('source_deck_id')}")
+            # Register loop completion actions with the musical timing system
+            self._register_loop_completion_actions(loop_complete_actions)
             
             # Handle other trigger types (for now, just log them)
             for action in other_actions:
@@ -255,6 +252,51 @@ class MixConfigLoader:
                 
             except Exception as e:
                 logger.error(f"Error scheduling beat action {action.get('action_id')}: {e}")
+    
+    def _register_loop_completion_actions(self, loop_complete_actions: List[dict]) -> None:
+        """Register all loop completion actions with the musical timing system"""
+        
+        for action in loop_complete_actions:
+            try:
+                trigger = action.get('trigger', {})
+                loop_action_id = trigger.get('loop_action_id')  # The loop we're waiting for
+                source_deck_id = trigger.get('source_deck_id')  # Deck that has the loop
+                
+                if not loop_action_id or not source_deck_id:
+                    logger.warning(f"Skipping action {action.get('action_id')} - missing loop_action_id or source_deck_id")
+                    continue
+                
+                # Get the deck that will trigger the loop completion
+                source_deck = self.engine._get_or_create_deck(source_deck_id)
+                if not source_deck:
+                    logger.error(f"Source deck not found: {source_deck_id}")
+                    continue
+                
+                if not hasattr(source_deck, 'musical_timing_system') or not source_deck.musical_timing_system:
+                    logger.error(f"Source deck {source_deck_id} does not have musical timing system")
+                    continue
+                
+                # Get the target deck (where the action will execute)
+                target_deck_id = action.get('deck_id', source_deck_id)
+                
+                # Register the completion action with the source deck's musical timing system
+                action_type = action.get('command')
+                parameters = action.get('parameters', {})
+                action_id = action.get('action_id')
+                
+                source_deck.musical_timing_system.register_loop_completion_action(
+                    loop_action_id=loop_action_id,
+                    action_type=action_type,
+                    parameters=parameters,
+                    action_id=action_id,
+                    target_deck_id=target_deck_id,
+                    priority=0
+                )
+                
+                logger.info(f"Registered loop completion action: {action_id} -> {action_type} when {loop_action_id} completes on {source_deck_id}")
+                
+            except Exception as e:
+                logger.error(f"Error registering loop completion action {action.get('action_id')}: {e}")
     
     def get_scheduled_actions(self) -> Dict[str, Any]:
         """Get information about all scheduled actions"""

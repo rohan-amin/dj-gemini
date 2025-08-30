@@ -239,6 +239,21 @@ class DeckExecutorAdapter(ActionExecutor):
                         'active': True
                     }
                     
+                    # Always seek to loop start position (as requested in JSON)
+                    current_frame = self._deck.audio_thread_current_frame
+                    logger.info(f"🎯 Deck {self._deck_id}: Seeking to loop start at beat {start_at_beat}")
+                    logger.info(f"🎯 Frame position: {current_frame} → {loop_start_frame} (delta: {current_frame - loop_start_frame})")
+                    
+                    self._deck.audio_thread_current_frame = loop_start_frame
+                    self._deck._current_playback_frame_for_display = loop_start_frame
+                    
+                    # Clear ring buffer to prevent audio artifacts from old position
+                    if hasattr(self._deck, '_clear_ring_buffer') and callable(self._deck._clear_ring_buffer):
+                        self._deck._clear_ring_buffer("loop activation seek")
+                        logger.info(f"🎯 Deck {self._deck_id}: Ring buffer cleared after seek")
+                    
+                    logger.info(f"🎯 Deck {self._deck_id}: Seek complete - now at frame {self._deck.audio_thread_current_frame}")
+                    
                     logger.info(f"✅ Deck {self._deck_id}: Seamless loop activated - {action_id}")
                     return True
                     

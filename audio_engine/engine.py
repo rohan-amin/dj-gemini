@@ -197,17 +197,16 @@ class AudioEngine:
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
                 return False
         elif trigger_type == "on_loop_complete":
-            source_deck_id_val = trigger.get("source_deck_id")
-            if not source_deck_id_val:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' ('{source_deck_id_val}').")
-                return False
+            # Legacy on_loop_complete trigger removed - now handled by musical timing system
+            logger.warning(f"VALIDATION: Legacy on_loop_complete trigger found for action {action_id_for_log} - will be ignored")
+            pass
         elif trigger_type == "script_start":
             pass 
         else:
-            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq", "loop_completed"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -993,12 +992,9 @@ class AudioEngine:
                 logger.error(f"Invalid on_deck_beat trigger: {trigger}")
                 
         elif trigger_type == "on_loop_complete":
-            # Loop completion triggers will be handled dynamically by checking LoopManager
-            # Store the action for later execution when loops complete
-            if not hasattr(self, '_loop_completion_actions'):
-                self._loop_completion_actions = []
-            self._loop_completion_actions.append(action)
-            logger.debug(f"AudioEngine - Stored loop completion action: {action.get('action_id')}")
+            # Legacy loop completion system removed - now handled by musical timing system
+            logger.warning(f"Legacy on_loop_complete trigger removed for action {action.get('action_id')}")
+            pass
             
         else:
             logger.warning(f"Unknown trigger type: {trigger_type}")
@@ -1026,27 +1022,7 @@ class AudioEngine:
         logger.info("Event-driven script processing stopped.")
         self.shutdown_decks() 
 
-    def _process_loop_completion_immediate(self, deck_id, completed_action_id):
-        """Process loop completion triggers using the event scheduler"""
-        logger.debug(f"Processing loop completion for deck {deck_id}, action: {completed_action_id}")
-        
-        # Find and execute loop completion actions from stored list
-        if hasattr(self, '_loop_completion_actions'):
-            for action in self._loop_completion_actions:
-                trigger = action.get("trigger", {})
-                if (trigger.get("type") == "on_loop_complete" and 
-                    trigger.get("source_deck_id") == deck_id):
-                    
-                    # Check if we need a specific loop action ID
-                    required_action_id = trigger.get("loop_action_id")
-                    if required_action_id is None or required_action_id == completed_action_id:
-                        logger.info(f"Trigger MET: on_loop_complete for action '{action.get('action_id')}' (loop: {completed_action_id})")
-                        
-                        # Schedule the action for immediate execution
-                        self.event_scheduler.schedule_immediate_action(action, priority=75)
-                        
-                        # Note: LoopManager handles completion state internally
-                        logger.debug(f"Loop completion processed for deck {deck_id}, action: {completed_action_id}")
+    # Legacy loop completion method removed - now handled by musical timing system
 
     # OLD: Engine loop removed - replaced by event-driven scheduler
     # def _engine_loop(self):
@@ -1279,13 +1255,8 @@ class AudioEngine:
                 return False  # Engine convention: False = success
                 
             elif command == "loop_completed":
-                # Handle loop completion events from LoopManager
-                if not deck_id: logger.warning("'loop_completed' missing deck_id. Skipping."); return False
-                action_id = parameters.get("action_id")
-                if not action_id: logger.warning("'loop_completed' missing action_id. Skipping."); return False
-                
-                logger.info(f"AudioEngine - Processing loop completion event: deck {deck_id}, action {action_id}")
-                self._process_loop_completion_immediate(deck_id, action_id)
+                # Legacy loop completion system removed - now handled by musical timing system
+                logger.warning(f"Legacy loop_completed command received for deck {deck_id} - ignoring")
                 return False  # Engine convention: False = success
                 
             elif command == "loop_repetition_complete":

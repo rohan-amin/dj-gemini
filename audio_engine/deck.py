@@ -2474,6 +2474,11 @@ class Deck:
                 # === NEW: Frame-accurate seamless looping ===
                 if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
                     loop_info = self._frame_accurate_loop
+                    
+                    # Debug logging for all loops every 0.5 seconds
+                    if self.audio_thread_current_frame % 22050 == 0:  # Log every 0.5 seconds
+                        logger.info(f"🔍 DEBUG Loop {loop_info['action_id']}: current_frame={self.audio_thread_current_frame}, end_frame={loop_info['end_frame']}, diff={loop_info['end_frame'] - self.audio_thread_current_frame}")
+                    
                     if self.audio_thread_current_frame >= loop_info['end_frame']:
                         logger.info(f"🔄 Deck {self.deck_id}: Seamless loop jump - {loop_info['action_id']} "
                                    f"(frame {self.audio_thread_current_frame} → {loop_info['start_frame']})")
@@ -2483,9 +2488,29 @@ class Deck:
                         
                         # Track repetitions
                         loop_info['current_repetition'] += 1
-                        if loop_info['repetitions'] > 0 and loop_info['current_repetition'] >= loop_info['repetitions']:
+                        if loop_info['repetitions'] > 0 and loop_info['current_repetition'] > loop_info['repetitions']:
                             logger.info(f"🔄 Deck {self.deck_id}: Loop completed after {loop_info['repetitions']} repetitions")
-                            self._frame_accurate_loop['active'] = False
+                            
+                            # Store the completed loop's action_id before triggering completion handlers
+                            completed_action_id = loop_info['action_id']
+                            
+                            # Notify musical timing system of loop completion
+                            if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
+                                try:
+                                    triggered_count = self.musical_timing_system.handle_loop_completion(completed_action_id)
+                                    logger.info(f"🔄 Deck {self.deck_id}: Loop completion triggered {triggered_count} dependent actions")
+                                except Exception as e:
+                                    logger.error(f"Deck {self.deck_id}: Error handling loop completion for {completed_action_id}: {e}")
+                            
+                            # CRITICAL FIX: Only deactivate if this is still the same loop
+                            # (completion handler might have activated a new loop)
+                            if (hasattr(self, '_frame_accurate_loop') and 
+                                self._frame_accurate_loop and 
+                                self._frame_accurate_loop.get('action_id') == completed_action_id):
+                                logger.info(f"🛑 Deck {self.deck_id}: Deactivating completed loop {completed_action_id}")
+                                self._frame_accurate_loop['active'] = False
+                            else:
+                                logger.info(f"🔄 Deck {self.deck_id}: Loop {completed_action_id} completed, but new loop already active - not deactivating")
                 
                 # Keep display frame synchronized with actual frame in ring buffer architecture
                 with self._stream_lock:
