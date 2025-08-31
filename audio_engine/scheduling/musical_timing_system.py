@@ -220,17 +220,17 @@ class MusicalTimingSystem:
                     'target_frame': 0  # Immediate execution
                 }
                 
-                # If action targets this deck, execute immediately
+                # If action targets this deck, queue command via command queue system
                 if target_deck_id == self._deck_id:
-                    
-                    success = self._executor.execute_action(action_type, parameters, execution_context)
+                    # PROPER QUEUE-BASED APPROACH: All loop actions go through command queue
+                    success = self._queue_completion_command(action_type, parameters, action_id)
                     if success:
                         triggered_count += 1
-                        logger.info(f"✅ Deck {self._deck_id}: Executed completion action {action_id}")
+                        logger.info(f"✅ Deck {self._deck_id}: Queued completion command {action_id}")
                     else:
-                        logger.error(f"❌ Deck {self._deck_id}: Failed to execute completion action {action_id}")
+                        logger.error(f"❌ Deck {self._deck_id}: Failed to queue completion command {action_id}")
                 else:
-                    # Action targets different deck - route through engine
+                    # Action targets different deck - use clean command queue approach
                     try:
                         engine = None
                         if hasattr(self._deck, 'engine'):
@@ -239,21 +239,21 @@ class MusicalTimingSystem:
                         if engine:
                             target_deck = engine._get_or_create_deck(target_deck_id)
                             if target_deck and hasattr(target_deck, 'musical_timing_system') and target_deck.musical_timing_system:
-                                # Execute on target deck's musical timing system
-                                target_success = target_deck.musical_timing_system._executor.execute_action(
-                                    action_type, parameters, execution_context
+                                # Queue command on target deck's command queue
+                                target_success = target_deck.musical_timing_system._queue_completion_command(
+                                    action_type, parameters, action_id
                                 )
                                 if target_success:
                                     triggered_count += 1
-                                    logger.info(f"✅ Deck {self._deck_id}: Cross-deck completion action {action_id} executed on {target_deck_id}")
+                                    logger.info(f"✅ Deck {self._deck_id}: Cross-deck completion command {action_id} queued on {target_deck_id}")
                                 else:
-                                    logger.error(f"❌ Deck {self._deck_id}: Failed cross-deck completion action {action_id} on {target_deck_id}")
+                                    logger.error(f"❌ Deck {self._deck_id}: Failed to queue cross-deck completion command {action_id} on {target_deck_id}")
                             else:
                                 logger.error(f"Deck {self._deck_id}: Target deck {target_deck_id} not found or no musical timing system")
                         else:
                             logger.error(f"Deck {self._deck_id}: No engine reference for cross-deck action {action_id}")
                     except Exception as cross_deck_error:
-                        logger.error(f"Deck {self._deck_id}: Error in cross-deck execution for {action_id}: {cross_deck_error}")
+                        logger.error(f"Deck {self._deck_id}: Error in cross-deck command queuing for {action_id}: {cross_deck_error}")
                     
             except Exception as e:
                 logger.error(f"Deck {self._deck_id}: Error executing completion action {completion_action['action_id']}: {e}")
@@ -451,6 +451,65 @@ class MusicalTimingSystem:
             
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error during cleanup: {e}")
+    
+    def _queue_completion_command(self, action_type: str, parameters: Dict[str, Any], action_id: str) -> bool:
+        """
+        Queue a completion command using the deck's existing command queue system.
+        
+        Args:
+            action_type: Type of action (stop, activate_loop, etc.)
+            parameters: Action parameters
+            action_id: Action identifier
+            
+        Returns:
+            True if command was queued successfully
+        """
+        try:
+            # Import deck command constants
+            from ..deck import DECK_CMD_STOP, DECK_CMD_ACTIVATE_LOOP, DECK_CMD_PLAY, DECK_CMD_PAUSE, DECK_CMD_SEEK
+            
+            # Map action types to deck command constants
+            command_mapping = {
+                'stop': DECK_CMD_STOP,
+                'activate_loop': DECK_CMD_ACTIVATE_LOOP, 
+                'play': DECK_CMD_PLAY,
+                'pause': DECK_CMD_PAUSE,
+                'seek': DECK_CMD_SEEK
+            }
+            
+            if action_type not in command_mapping:
+                logger.error(f"Deck {self._deck_id}: Unsupported completion action type: {action_type}")
+                return False
+            
+            deck_command = command_mapping[action_type]
+            
+            # Queue the command using deck's existing command queue
+            if hasattr(self._deck, 'command_queue'):
+                # Format parameters for specific commands
+                if action_type == 'stop':
+                    self._deck.command_queue.put((deck_command, None))
+                elif action_type == 'activate_loop':
+                    # Convert to format expected by deck command handler
+                    command_data = {
+                        'start_beat': parameters.get('start_at_beat'),
+                        'length_beats': parameters.get('length_beats'),
+                        'repetitions': parameters.get('repetitions'),
+                        'action_id': action_id
+                    }
+                    self._deck.command_queue.put((deck_command, command_data))
+                else:
+                    # Generic parameter passing
+                    self._deck.command_queue.put((deck_command, parameters))
+                
+                logger.info(f"Deck {self._deck_id}: Queued {action_type} command for completion action {action_id}")
+                return True
+            else:
+                logger.error(f"Deck {self._deck_id}: No command queue available")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Deck {self._deck_id}: Error queuing completion command {action_id}: {e}")
+            return False
     
     def _register_action_executors(self) -> None:
         """Register action executors with the composite executor."""
