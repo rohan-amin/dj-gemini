@@ -1478,17 +1478,9 @@ class AudioEngine:
                 from_deck.fade_volume(0.0, duration_seconds)
                 to_deck.fade_volume(1.0, duration_seconds)
                 
-                # Schedule the source deck to stop after the fade completes
-                def stop_source_deck():
-                    from_deck.stop()
-                    logger.debug(f"Crossfade complete: stopped {from_deck_id}")
-                
-                # Schedule the stop after the fade duration
-                import threading
-                timer = threading.Timer(duration_seconds, stop_source_deck)
-                timer.start()
-                
-                logger.debug(f"Crossfading from {from_deck_id} to {to_deck_id} over {duration_seconds}s (will stop {from_deck_id} after fade)")
+                # CRITICAL FIX: Don't stop the source deck after crossfade
+                # Just leave it playing at 0 volume so it can be faded back up later if needed
+                logger.info(f"🎚️ CROSSFADE: {from_deck_id}→{to_deck_id} over {duration_seconds}s ({from_deck_id}: 100%→0%, {to_deck_id}: 0%→100%)")
                 return False  # Engine convention: False = success
             
             elif command == "bpm_match":

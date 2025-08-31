@@ -2349,8 +2349,14 @@ class Deck:
             start_frame = int(self.audio_thread_current_frame)
             
             # === CENTRALIZED LOOP MANAGEMENT ===
-            # Single point of loop boundary detection using LoopManager
-            if self.loop_manager.has_active_loop() or self.loop_manager.has_pending_loop():
+            # CRITICAL FIX: Disable legacy LoopManager when frame-accurate system is active
+            # Two loop systems running simultaneously causes conflicts and wrong repetition counts
+            has_frame_accurate_loop = (hasattr(self, '_frame_accurate_loop') and 
+                                     self._frame_accurate_loop and 
+                                     self._frame_accurate_loop.get('active'))
+            
+            # Only use legacy LoopManager if frame-accurate system is not active
+            if not has_frame_accurate_loop and (self.loop_manager.has_active_loop() or self.loop_manager.has_pending_loop()):
                 loop_result = self.loop_manager.check_boundaries(start_frame)
                 
                 # Handle loop actions returned by LoopManager
@@ -2486,21 +2492,30 @@ class Deck:
                         # Seamlessly jump back to loop start
                         self.audio_thread_current_frame = loop_info['start_frame']
                         
-                        # Track repetitions
+                        # Track repetitions (jumps)
                         loop_info['current_repetition'] += 1
-                        if loop_info['repetitions'] > 0 and loop_info['current_repetition'] > loop_info['repetitions']:
-                            logger.info(f"🔄 Deck {self.deck_id}: Loop completed after {loop_info['repetitions']} repetitions")
+                        # CRITICAL FIX: repetitions = total plays = jumps + 1, so stop when jumps >= repetitions
+                        if loop_info['repetitions'] > 0 and loop_info['current_repetition'] >= loop_info['repetitions']:
+                            logger.info(f"🔄 Deck {self.deck_id}: Loop completed after {loop_info['repetitions']} total plays")
                             
                             # Store the completed loop's action_id before triggering completion handlers
                             completed_action_id = loop_info['action_id']
                             
-                            # Notify musical timing system of loop completion
+                            # CRITICAL FIX: Offload loop completion actions from audio thread
+                            # Heavy actions like crossfades should not block audio processing
                             if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
-                                try:
-                                    triggered_count = self.musical_timing_system.handle_loop_completion(completed_action_id)
-                                    logger.info(f"🔄 Deck {self.deck_id}: Loop completion triggered {triggered_count} dependent actions")
-                                except Exception as e:
-                                    logger.error(f"Deck {self.deck_id}: Error handling loop completion for {completed_action_id}: {e}")
+                                def handle_completion_async():
+                                    try:
+                                        triggered_count = self.musical_timing_system.handle_loop_completion(completed_action_id)
+                                        logger.info(f"🔄 Deck {self.deck_id}: Loop completion triggered {triggered_count} dependent actions")
+                                    except Exception as e:
+                                        logger.error(f"Deck {self.deck_id}: Error handling loop completion for {completed_action_id}: {e}")
+                                
+                                # Execute loop completion actions in background thread to avoid blocking audio
+                                import threading
+                                completion_thread = threading.Thread(target=handle_completion_async, daemon=True)
+                                completion_thread.start()
+                                logger.debug(f"🔄 Deck {self.deck_id}: Loop completion offloaded to background thread")
                             
                             # CRITICAL FIX: Only deactivate if this is still the same loop
                             # (completion handler might have activated a new loop)
@@ -2509,6 +2524,16 @@ class Deck:
                                 self._frame_accurate_loop.get('action_id') == completed_action_id):
                                 logger.info(f"🛑 Deck {self.deck_id}: Deactivating completed loop {completed_action_id}")
                                 self._frame_accurate_loop['active'] = False
+                                
+                                # CRITICAL FIX: Continue normal playback after loop ends
+                                # Don't stop the deck, just continue playing from current position
+                                logger.info(f"🎵 Deck {self.deck_id}: Loop ended, continuing normal playback")
+                                # Keep _user_wants_to_play = True to continue playback
+                                with self._stream_lock:
+                                    if not self._user_wants_to_play:
+                                        logger.info(f"🎵 Deck {self.deck_id}: Restoring playback after loop completion")
+                                        self._user_wants_to_play = True
+                                
                             else:
                                 logger.info(f"🔄 Deck {self.deck_id}: Loop {completed_action_id} completed, but new loop already active - not deactivating")
                 
@@ -2528,6 +2553,9 @@ class Deck:
                     if processed_chunk is None:
                         logger.warning(f"Deck {self.deck_id} - processed_chunk is None after EQ - returning silence")
                         return np.zeros((out_frames, 2), dtype=np.float32)
+                    
+                    # CRITICAL FIX: Update volume fade before applying volume
+                    self._update_volume_fade()
                     
                     # Apply volume
                     processed_chunk = processed_chunk * self._volume

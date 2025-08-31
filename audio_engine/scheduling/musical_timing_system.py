@@ -170,7 +170,9 @@ class MusicalTimingSystem:
         
         self._loop_completion_actions[loop_action_id].append(completion_action)
         
-        logger.info(f"Deck {self._deck_id}: Registered loop completion action {action_id} for loop {loop_action_id}")
+        logger.info(f"🔗 Deck {self._deck_id}: Registered loop completion action {action_id} for loop {loop_action_id}")
+        logger.info(f"🔗 Action details: {action_type} on {target_deck_id or self._deck_id} with params {parameters}")
+        logger.info(f"🔗 Total completion actions registered: {len(self._loop_completion_actions)}")
     
     def handle_loop_completion(self, loop_action_id: str) -> int:
         """
@@ -182,16 +184,23 @@ class MusicalTimingSystem:
         Returns:
             Number of actions triggered
         """
+        logger.info(f"🔄 Deck {self._deck_id}: handle_loop_completion called for loop {loop_action_id}")
+        logger.info(f"🔄 System state: initialized={self._initialized}, processing_enabled={self._processing_enabled}")
+        logger.info(f"🔄 Registered completion loops: {list(self._loop_completion_actions.keys())}")
+        
         if not self._initialized or not self._processing_enabled:
             logger.warning(f"Deck {self._deck_id}: Loop completion handling disabled")
             return 0
         
         if loop_action_id not in self._loop_completion_actions:
-            logger.debug(f"Deck {self._deck_id}: No completion actions registered for loop {loop_action_id}")
+            logger.warning(f"Deck {self._deck_id}: No completion actions registered for loop {loop_action_id}")
+            logger.warning(f"Available loop completion actions: {list(self._loop_completion_actions.keys())}")
             return 0
         
         actions = self._loop_completion_actions[loop_action_id]
         triggered_count = 0
+        
+        logger.info(f"🔄 Deck {self._deck_id}: Processing {len(actions)} completion actions for {loop_action_id} simultaneously")
         
         for completion_action in actions:
             try:
@@ -203,14 +212,16 @@ class MusicalTimingSystem:
                 
                 logger.info(f"🔄 Deck {self._deck_id}: Loop {loop_action_id} completed - triggering action {action_id}")
                 
+                # Create execution context for both same-deck and cross-deck actions
+                execution_context = {
+                    'action_id': action_id,
+                    'trigger_type': 'loop_completion',
+                    'source_loop_id': loop_action_id,
+                    'target_frame': 0  # Immediate execution
+                }
+                
                 # If action targets this deck, execute immediately
                 if target_deck_id == self._deck_id:
-                    execution_context = {
-                        'action_id': action_id,
-                        'trigger_type': 'loop_completion',
-                        'source_loop_id': loop_action_id,
-                        'target_frame': 0  # Immediate execution
-                    }
                     
                     success = self._executor.execute_action(action_type, parameters, execution_context)
                     if success:

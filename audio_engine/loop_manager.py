@@ -343,9 +343,22 @@ class LoopManager:
         
     def _clear_current_loop(self):
         """Clear the current loop and reset state"""
+        # CRITICAL FIX: Cancel events BEFORE clearing loop state
+        current_loop_action_id = None
         if self.current_loop:
-            logger.debug(f"Deck {self.deck.deck_id} - Clearing loop: {self.current_loop.action_id}")
+            current_loop_action_id = self.current_loop.action_id
+            logger.debug(f"Deck {self.deck.deck_id} - Clearing loop: {current_loop_action_id}")
             
+            # Clear any pending loop completion events from the scheduler BEFORE nulling current_loop
+            if self._engine and hasattr(self._engine, 'event_scheduler'):
+                try:
+                    # Cancel any pending loop completion events for this loop
+                    self._engine.event_scheduler.cancel_action(f"loop_completion_{current_loop_action_id}")
+                    logger.debug(f"Deck {self.deck.deck_id} - Cancelled pending events for loop {current_loop_action_id}")
+                except Exception as e:
+                    logger.debug(f"Deck {self.deck.deck_id} - Could not cancel loop events (normal during cleanup): {e}")
+            
+        # Now safe to clear loop state
         self.current_loop = None
         self.state = LoopState.INACTIVE
         self.pending_loops.clear()
@@ -354,14 +367,6 @@ class LoopManager:
         if hasattr(self, '_loop_position_jump_pending'):
             self._loop_position_jump_pending = False
             self._pending_jump_frame = None
-        
-        # Clear any pending loop completion events from the scheduler
-        if self._engine and hasattr(self._engine, 'event_scheduler') and self.current_loop:
-            try:
-                # Cancel any pending loop completion events for this loop
-                self._engine.event_scheduler.cancel_action(f"loop_completion_{self.current_loop.action_id}")
-            except Exception as e:
-                logger.debug(f"Deck {self.deck.deck_id} - Could not cancel loop events (normal during cleanup): {e}")
         
     def _schedule_frame_accurate_loop_events(self, start_frame: int, end_frame: int, repetitions: int):
         """

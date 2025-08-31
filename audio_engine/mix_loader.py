@@ -68,6 +68,19 @@ class MixConfigLoader:
             logger.info(f"Found {len(immediate_actions)} immediate actions, {len(beat_actions)} beat-triggered actions, "
                        f"{len(loop_complete_actions)} loop-complete actions, and {len(other_actions)} other actions")
             
+            if loop_complete_actions:
+                logger.info("🔗 Loop completion actions found:")
+                for action in loop_complete_actions:
+                    trigger = action.get('trigger', {})
+                    loop_id = trigger.get('loop_action_id')
+                    source_deck = trigger.get('source_deck_id') 
+                    action_id = action.get('action_id')
+                    command = action.get('command')
+                    target_deck = action.get('deck_id', 'same')
+                    logger.info(f"🔗   {action_id}: {command} on {target_deck} when {loop_id} completes on {source_deck}")
+            else:
+                logger.warning("🚨 No loop completion actions found in mix configuration!")
+            
             # DEBUG: Show exactly which actions are in each category
             logger.info(f"Immediate actions: {[action.get('action_id') for action in immediate_actions]}")
             logger.info(f"Beat actions: {[action.get('action_id') for action in beat_actions]}")

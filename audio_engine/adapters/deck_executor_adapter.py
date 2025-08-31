@@ -118,15 +118,17 @@ class DeckExecutorAdapter(ActionExecutor):
             
             # Call appropriate deck method based on parameters
             if start_at_frame is not None:
-                success = self._deck.play(start_at_frame=start_at_frame)
-            elif start_at_beat is not None:
-                # Convert beat to frame using beat manager
+                # Deck doesn't support start_at_frame directly, convert to beat
                 if hasattr(self._deck, 'beat_manager'):
-                    target_frame = self._deck.beat_manager.get_frame_for_beat(start_at_beat)
-                    success = self._deck.play(start_at_frame=target_frame)
+                    target_beat = self._deck.beat_manager.get_beat_from_frame(start_at_frame)
+                    success = self._deck.play(start_at_beat=target_beat)
+                    logger.info(f"Deck {self._deck_id}: Converted frame {start_at_frame} to beat {target_beat} for play")
                 else:
-                    logger.error(f"Deck {self._deck_id}: No beat manager for beat-based play")
+                    logger.error(f"Deck {self._deck_id}: No beat manager for frame-based play")
                     return False
+            elif start_at_beat is not None:
+                # Direct beat-based play
+                success = self._deck.play(start_at_beat=start_at_beat)
             elif start_at_cue_name is not None:
                 success = self._deck.play(start_at_cue_name=start_at_cue_name)
             else:
@@ -234,7 +236,7 @@ class DeckExecutorAdapter(ActionExecutor):
                         'start_frame': loop_start_frame,
                         'end_frame': loop_end_frame,
                         'repetitions': repetitions,
-                        'current_repetition': 1,  # Start at 1 since first play-through is repetition 1
+                        'current_repetition': 0,  # CRITICAL FIX: Count jumps, not plays
                         'action_id': action_id,
                         'active': True
                     }
@@ -358,10 +360,21 @@ class DeckExecutorAdapter(ActionExecutor):
             logger.info(f"Deck {self._deck_id}: Routing engine command {action_type} to engine")
             
             # Call the engine's action execution method
-            success = engine._execute_action(action_dict)
+            engine_result = engine._execute_action(action_dict)
             
-            # Engine uses False for success, True for failure (opposite convention)
-            return not success
+            # CRITICAL FIX: Engine convention analysis:
+            # Looking at engine.py line 1492: "return False  # Engine convention: False = success"
+            # So: engine_result == False means SUCCESS, engine_result == True means FAILURE
+            # ActionExecutor expects: True = success, False = failure
+            # Therefore: return not engine_result (False->True, True->False)
+            success = not engine_result
+            
+            if success:
+                logger.info(f"Deck {self._deck_id}: Engine command {action_type} executed successfully (engine returned {engine_result})")
+            else:
+                logger.error(f"Deck {self._deck_id}: Engine command {action_type} failed (engine returned {engine_result})")
+            
+            return success
             
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error executing engine command {action_type}: {e}")
