@@ -243,12 +243,16 @@ class Deck:
         
         # === RING BUFFER ARCHITECTURE FOR STEREO AUDIO ===
         # Ring buffer for real-time audio (5 seconds at 44.1kHz stereo)
-        self.ring_buffer = RingBuffer(capacity_frames=4096, channels=2)  # ~93ms at 44.1kHz
+        self.ring_buffer = RingBuffer(capacity_frames=44100, channels=2)  # 1 second at 44.1kHz - balance of latency vs stability
         
         # Producer thread for heavy processing
         self._producer_thread = None
         self._producer_running = False
         self._producer_stop_event = threading.Event()
+        
+        # CRITICAL FIX: Thread synchronization for loop state
+        self._loop_state_lock = threading.RLock()  # Reentrant lock for loop state access
+        self._frame_accurate_loop = None  # Protected by _loop_state_lock
         
         # === PROFESSIONAL STEREO EQ SYSTEM ===
         # Per-stem tone EQs for musical shaping (stereo)
@@ -1285,64 +1289,46 @@ class Deck:
         
         # === NEW: Use Musical Timing System for Frame-Accurate Loop Activation ===
         # Check if we're already using frame-accurate looping to avoid conflicts
-        if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
-            logger.info(f"Deck {self.deck_id} - Frame-accurate loop already active, ignoring old loop manager call")
+        with self._loop_state_lock:
+            if self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
+                logger.info(f"Deck {self.deck_id} - Frame-accurate loop already active, ignoring old loop manager call")
+                return True
+        
+        # CLEAN DESIGN: All loops should be pre-scheduled at mix load time
+        # This function should only be called by the pre-scheduled action system
+        if not hasattr(self, 'musical_timing_system') or not self.musical_timing_system:
+            logger.error(f"Deck {self.deck_id} - Musical timing system not available for loop activation: {action_id}")
+            return False
+        
+        # Schedule loop activation using the frame-accurate system
+        scheduled_action_id = self.musical_timing_system.schedule_beat_action(
+            beat_number=start_beat,
+            action_type='activate_loop',
+            parameters={
+                'start_at_beat': start_beat,
+                'length_beats': length_beats,
+                'repetitions': repetitions
+            },
+            action_id=action_id,
+            priority=0  # High priority for loop activation
+        )
+        
+        if scheduled_action_id:
+            logger.info(f"Deck {self.deck_id} - Loop scheduled with frame-accurate timing: {scheduled_action_id} at beat {start_beat}")
             return True
-        
-        if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
-            try:
-                # Get current beat position to determine if we need immediate vs scheduled activation
-                current_beat = 0.0
-                if hasattr(self, 'beat_manager') and self.beat_manager:
-                    try:
-                        current_beat = self.beat_manager.get_current_beat()
-                    except:
-                        current_beat = 0.0
-                
-                # If the target beat has already passed or is very close, activate immediately
-                beat_threshold = 0.1  # If within 0.1 beats, activate immediately
-                
-                if current_beat >= (start_beat - beat_threshold):
-                    # Target beat has passed or is imminent - activate immediately via old system
-                    logger.warning(f"Deck {self.deck_id} - Beat {start_beat} has passed (current: {current_beat:.3f}) - using immediate activation")
-                    # Fall through to legacy system for immediate activation
-                else:
-                    # Schedule loop activation using the new frame-accurate system
-                    scheduled_action_id = self.musical_timing_system.schedule_beat_action(
-                        beat_number=start_beat,
-                        action_type='activate_loop',
-                        parameters={
-                            'start_at_beat': start_beat,
-                            'length_beats': length_beats,
-                            'repetitions': repetitions
-                        },
-                        action_id=action_id,
-                        priority=0  # High priority for loop activation
-                    )
-                    
-                    if scheduled_action_id:
-                        logger.info(f"Deck {self.deck_id} - Loop scheduled with frame-accurate timing: {scheduled_action_id} at beat {start_beat} (current: {current_beat:.3f})")
-                        return True
-                    else:
-                        logger.error(f"Deck {self.deck_id} - Failed to schedule frame-accurate loop activation")
-                        # Fall back to old system
-                    
-            except Exception as e:
-                logger.error(f"Deck {self.deck_id} - Error in frame-accurate loop scheduling: {e}")
-                # Fall back to old system
-        
-        # Legacy LoopManager system removed - only frame-accurate system available
-        logger.error(f"Deck {self.deck_id} - Frame-accurate timing system unavailable, cannot activate loop: {action_id}")
-        return False
+        else:
+            logger.error(f"Deck {self.deck_id} - Failed to schedule frame-accurate loop activation: {action_id}")
+            return False
 
     def deactivate_loop(self):
         """Deactivate the current loop using frame-accurate system"""
         logger.debug(f"Deck {self.deck_id} - Engine requests DEACTIVATE_LOOP.")
-        if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop:
-            self._frame_accurate_loop['active'] = False
-            logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated")
-        else:
-            logger.warning(f"Deck {self.deck_id} - No frame-accurate loop to deactivate")
+        with self._loop_state_lock:
+            if self._frame_accurate_loop:
+                self._frame_accurate_loop['active'] = False
+                logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated")
+            else:
+                logger.warning(f"Deck {self.deck_id} - No frame-accurate loop to deactivate")
 
     def stop_at_beat(self, beat_number):
         """Stop playback when reaching a specific beat"""
@@ -2092,15 +2078,16 @@ class Deck:
                                 loop_start_frame = self.beat_manager.get_frame_for_beat(start_beat)
                                 loop_end_frame = self.beat_manager.get_frame_for_beat(start_beat + length_beats)
                                 
-                                # Activate frame-accurate loop immediately
-                                self._frame_accurate_loop = {
-                                    'start_frame': loop_start_frame,
-                                    'end_frame': loop_end_frame,
-                                    'repetitions': repetitions,
-                                    'current_repetition': 0,
-                                    'action_id': action_id,
-                                    'active': True
-                                }
+                                # Activate frame-accurate loop immediately (thread-safe)
+                                with self._loop_state_lock:
+                                    self._frame_accurate_loop = {
+                                        'start_frame': loop_start_frame,
+                                        'end_frame': loop_end_frame,
+                                        'repetitions': repetitions,
+                                        'current_repetition': 0,
+                                        'action_id': action_id,
+                                        'active': True
+                                    }
                                 
                                 # Seek to loop start for seamless transition
                                 self.audio_thread_current_frame = loop_start_frame
@@ -2119,9 +2106,10 @@ class Deck:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing DEACTIVATE_LOOP")
                     # Use LoopManager for centralized loop deactivation
                     # Legacy loop_manager call removed - using frame-accurate system only
-                    if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop:
-                        self._frame_accurate_loop['active'] = False
-                        logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated on stop")
+                    with self._loop_state_lock:
+                        if self._frame_accurate_loop:
+                            self._frame_accurate_loop['active'] = False
+                            logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated on stop")
                     logger.debug(f"Deck {self.deck_id} AudioThread - Loop deactivated by LoopManager.")
 
                 elif command == DECK_CMD_STOP_AT_BEAT:
@@ -2233,6 +2221,21 @@ class Deck:
         
         while not self._producer_stop_event.is_set() and self._user_wants_to_play:
             try:
+                # CRITICAL FIX: Process pending loop completions from audio callback
+                # This ensures loop completion events are handled based on actual audio output
+                if hasattr(self, '_pending_loop_completions') and self._pending_loop_completions:
+                    for completed_action_id in self._pending_loop_completions:
+                        try:
+                            if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
+                                triggered_count = self.musical_timing_system.handle_loop_completion(completed_action_id)
+                                logger.info(f"🔄 Deck {self.deck_id}: AUDIO-OUTPUT-BASED loop completion handled - {completed_action_id} triggered {triggered_count} actions")
+                            else:
+                                logger.error(f"Deck {self.deck_id}: No musical timing system for loop completion {completed_action_id}")
+                        except Exception as e:
+                            logger.error(f"Deck {self.deck_id}: Error handling audio-output-based loop completion {completed_action_id}: {e}")
+                    
+                    # Clear processed completions
+                    self._pending_loop_completions = []
                 # CRITICAL FIX: Don't back off on startup - we need to fill the buffer quickly
                 available_data = self.out_ring.available_read() if self.out_ring else 0
                 
@@ -2470,8 +2473,12 @@ class Deck:
                 self.audio_thread_current_frame += input_chunk_size
                 
                 # === NEW: Frame-accurate seamless looping ===
-                if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
-                    loop_info = self._frame_accurate_loop
+                with self._loop_state_lock:
+                    loop_active = self._frame_accurate_loop and self._frame_accurate_loop.get('active')
+                    if loop_active:
+                        loop_info = self._frame_accurate_loop.copy()  # Copy for thread safety
+                
+                if loop_active:
                     
                     # Debug logging for all loops every 0.5 seconds
                     if self.audio_thread_current_frame % 22050 == 0:  # Log every 0.5 seconds
@@ -2495,16 +2502,13 @@ class Deck:
                             
                             # CRITICAL FIX: Deactivate completed loop FIRST to allow new loops to activate
                             logger.info(f"🛑 Deck {self.deck_id}: Deactivating completed loop {completed_action_id}")
-                            self._frame_accurate_loop['active'] = False
+                            with self._loop_state_lock:
+                                self._frame_accurate_loop['active'] = False
                             
-                            # CLEAN APPROACH: Queue loop completion actions via command queue
-                            # This prevents threading issues and uses existing proven command system
-                            if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
-                                try:
-                                    triggered_count = self.musical_timing_system.handle_loop_completion(completed_action_id)
-                                    logger.info(f"🔄 Deck {self.deck_id}: Loop completion queued {triggered_count} dependent commands")
-                                except Exception as e:
-                                    logger.error(f"Deck {self.deck_id}: Error queuing loop completion commands for {completed_action_id}: {e}")
+                            # OLD PRODUCER-THREAD-BASED COMPLETION DISABLED
+                            # This is now handled by the audio-output-based system in the audio callback
+                            # to ensure loop completion events happen when the user actually hears the loop complete
+                            logger.info(f"🔄 Deck {self.deck_id}: Producer loop end detected for {completed_action_id} - completion will be handled by audio output system")
                             
                             # CRITICAL FIX: Continue normal playback after loop ends
                             # Don't stop the deck, just continue playing from current position
@@ -2797,6 +2801,10 @@ class Deck:
         assert not hasattr(self, '_in_audio_callback'), "Nested audio callback detected!"
         self._in_audio_callback = True
         
+        # Track actual audio output position for loop completion accuracy
+        if not hasattr(self, '_audio_output_frame_position'):
+            self._audio_output_frame_position = 0
+        
         try:
             # === SIMPLE RING BUFFER PROCESSING (like beat_viewer_fixed) ===
             # NO complex logic in audio callback - this prevents hiccups!
@@ -2847,6 +2855,42 @@ class Deck:
                     self._startup_fade_active = False
                     logger.info(f"🔊 Deck {self.deck_id} - Startup fade-in complete")
             
+            # === CRITICAL FIX: Track actual audio output position for loop completion ===
+            # This ensures loop completions trigger based on what the user actually hears
+            self._audio_output_frame_position += frames
+            
+            # Check for loop completion based on ACTUAL audio output position
+            # This prevents premature loop completion due to buffer delays
+            with self._loop_state_lock:
+                if self._frame_accurate_loop and self._frame_accurate_loop.get('active'):
+                    # Initialize tracking if needed
+                    if 'output_start_position' not in self._frame_accurate_loop:
+                        self._frame_accurate_loop['output_start_position'] = self._audio_output_frame_position
+                        self._frame_accurate_loop['completed_cycles'] = 0
+                        logger.debug(f"🔄 Deck {self.deck_id}: Loop output tracking initialized at position {self._audio_output_frame_position}")
+                    
+                    # Check if we've completed a full loop cycle in the audio output
+                    loop_length = self._frame_accurate_loop['end_frame'] - self._frame_accurate_loop['start_frame']
+                    cycles_elapsed = (self._audio_output_frame_position - self._frame_accurate_loop['output_start_position']) // loop_length
+                    
+                    if cycles_elapsed > self._frame_accurate_loop['completed_cycles']:
+                        self._frame_accurate_loop['completed_cycles'] = cycles_elapsed
+                        logger.info(f"🔄 Deck {self.deck_id}: Audio output loop cycle completed - {self._frame_accurate_loop['action_id']} cycle {cycles_elapsed}")
+                        
+                        # Check if all repetitions are complete based on ACTUAL output
+                        if self._frame_accurate_loop['repetitions'] > 0 and cycles_elapsed >= self._frame_accurate_loop['repetitions']:
+                            logger.info(f"🔄 Deck {self.deck_id}: Loop output completion - {self._frame_accurate_loop['action_id']} after {self._frame_accurate_loop['repetitions']} cycles")
+                            
+                            # Store completion info and deactivate
+                            completed_action_id = self._frame_accurate_loop['action_id']
+                            self._frame_accurate_loop['active'] = False
+                            
+                            # Queue loop completion handling (avoiding complex operations in audio callback)
+                            if hasattr(self, '_pending_loop_completions'):
+                                self._pending_loop_completions.append(completed_action_id)
+                            else:
+                                self._pending_loop_completions = [completed_action_id]
+            
             # === STEREO OUTPUT ROUTING ===
             if self.device_output_channels == 2 and out.shape[1] == 2:
                 # Perfect stereo output
@@ -2883,10 +2927,14 @@ class Deck:
                 # print(f"DEBUG: Deck {self.deck_id} finished_callback: Not a seek, setting user_wants_to_play=False.")
                 self._user_wants_to_play = False
             
+            # Check natural end condition with thread-safe loop check
+            with self._loop_state_lock:
+                loop_is_active = self._frame_accurate_loop and self._frame_accurate_loop.get('active', False)
+            
             natural_end_condition = (
                 self.audio_thread_data is not None and
                 self.audio_thread_current_frame >= self.audio_thread_total_samples and
-                not (hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active', False))
+                not loop_is_active
             )
             if not was_seek and natural_end_condition :
                 logger.debug(f"DEBUG: Deck {self.deck_id} finished_callback - Track ended naturally. Resetting frames.")
