@@ -240,10 +240,17 @@ class LoopActionExecutor(ActionExecutor):
                 logger.warning(f"Loop end frame {end_frame} beyond track length, adjusting to {self._deck.total_frames}")
                 end_frame = self._deck.total_frames
             
-            # Execute frame-accurate loop activation
-            success = self._deck.loop_manager.activate_loop_direct(
-                start_frame, end_frame, repetitions, action_id
-            )
+            # Execute frame-accurate loop activation (legacy loop_manager removed)
+            # Store loop info in the deck for the producer thread to use
+            self._deck._frame_accurate_loop = {
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'repetitions': repetitions,
+                'current_repetition': 0,
+                'action_id': action_id,
+                'active': True
+            }
+            success = True
             
             if success:
                 logger.info(f"Activated loop {action_id}: beats {start_beat}-{start_beat + length_beats}, {repetitions} repetitions")
@@ -276,8 +283,12 @@ class LoopActionExecutor(ActionExecutor):
                 # TODO: Implement specific loop deactivation when loop manager supports it
                 logger.warning(f"Specific loop deactivation not yet supported: {loop_id}")
             
-            # Deactivate current loop
-            self._deck.loop_manager.deactivate_loop()
+            # Deactivate current loop (legacy loop_manager removed)
+            if hasattr(self._deck, '_frame_accurate_loop') and self._deck._frame_accurate_loop:
+                self._deck._frame_accurate_loop['active'] = False
+            else:
+                logger.warning(f"No frame-accurate loop to deactivate for action {action_id}")
+                return False
             logger.info(f"Deactivated loop via action {action_id}")
             return True
             

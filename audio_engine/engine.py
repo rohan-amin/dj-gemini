@@ -72,9 +72,7 @@ class AudioEngine:
             print(f"DEBUG: Creating deck {deck_id}")
             deck = Deck(deck_id, self.analyzer, engine_instance=self)
             
-            # Set engine reference in LoopManager for event-driven notifications
-            if hasattr(deck, 'loop_manager'):
-                deck.loop_manager.set_engine_reference(self)
+            # Legacy LoopManager reference removed - using frame-accurate system only
             
             # Phase 2: Store BeatManager reference for deck-specific beat operations
             if hasattr(deck, 'beat_manager'):
@@ -1056,16 +1054,15 @@ class AudioEngine:
                     # Build deck status string
                     deck_status = f"{deck_id}: {current_beat:.0f}/{total_beats} (BPM: {bpm:.2f})"
                     
-                    # Add loop status if active
-                    if hasattr(deck, 'loop_manager') and deck.loop_manager.has_active_loop():
-                        loop_info = deck.loop_manager.get_current_loop_info()
-                        if loop_info:
-                            loop_done = loop_info['repetitions_done']
-                            loop_total = loop_info['repetitions_total']
-                            if loop_total is not None:
-                                deck_status += f" [Loop: {loop_done}/{loop_total}]"
-                            else:
-                                deck_status += " [Loop: ∞]"
+                    # Add loop status if active (frame-accurate system)
+                    if hasattr(deck, '_frame_accurate_loop') and deck._frame_accurate_loop and deck._frame_accurate_loop.get('active'):
+                        loop_info = deck._frame_accurate_loop
+                        current_rep = loop_info.get('current_repetition', 0)
+                        total_reps = loop_info.get('repetitions', 1)
+                        if total_reps is not None:
+                            deck_status += f" [Loop: {current_rep}/{total_reps}]"
+                        else:
+                            deck_status += " [Loop: ∞]"
                     
                     deck_statuses.append(deck_status)
                 else:
@@ -1260,7 +1257,7 @@ class AudioEngine:
                 return False  # Engine convention: False = success
                 
             elif command == "loop_repetition_complete":
-                # Handle loop repetition completion events from LoopManager
+                # Handle loop repetition completion events (legacy LoopManager removed)
                 if not deck_id: logger.warning("'loop_repetition_complete' missing deck_id. Skipping."); return False
                 action_id = parameters.get("action_id")
                 repetition = parameters.get("repetition")
@@ -1270,13 +1267,10 @@ class AudioEngine:
                 
                 logger.info(f"AudioEngine - Processing loop repetition completion: deck {deck_id}, action {action_id}, repetition {repetition}/{total_repetitions}")
                 
-                # Get the deck and let its LoopManager handle the repetition completion
+                # Legacy LoopManager removed - loop completion handled by frame-accurate system
                 deck = self._get_or_create_deck(deck_id)
-                if hasattr(deck, 'loop_manager'):
-                    # Let the LoopManager handle the repetition completion logic
-                    deck.loop_manager.handle_loop_repetition_complete(repetition, total_repetitions)
-                else:
-                    logger.warning(f"Deck {deck_id} has no loop manager")
+                logger.info(f"AudioEngine - Loop repetition completion handled by frame-accurate system for deck {deck_id}")
+                # Note: Actual completion logic is now handled directly in the deck's audio thread
                         
                 return False  # Engine convention: False = success
             

@@ -219,7 +219,7 @@ class DeckExecutorAdapter(ActionExecutor):
             logger.info(f"🔄 Deck {self._deck_id}: Frame-accurate loop activation - {action_id} at beat {start_at_beat}")
             
             # === NEW: Frame-accurate seamless loop activation ===
-            # Instead of using the old loop_manager that causes artifacts,
+            # Legacy loop_manager removed - using frame-accurate system only,
             # we'll implement seamless looping by modifying the deck's playback position
             
             if hasattr(self._deck, 'beat_manager') and self._deck.beat_manager:
@@ -273,11 +273,13 @@ class DeckExecutorAdapter(ActionExecutor):
     def _execute_deactivate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
         """Execute loop deactivation"""
         try:
-            if hasattr(self._deck, 'loop_manager'):
-                self._deck.loop_manager.deactivate_loop()
+            # Use frame-accurate loop deactivation
+            if hasattr(self._deck, '_frame_accurate_loop') and self._deck._frame_accurate_loop:
+                self._deck._frame_accurate_loop['active'] = False
+                logger.info(f"Deck {self._deck_id}: Frame-accurate loop deactivated")
                 return True
             else:
-                logger.error(f"Deck {self._deck_id}: No loop manager available")
+                logger.error(f"Deck {self._deck_id}: No frame-accurate loop to deactivate")
                 return False
                 
         except Exception as e:
@@ -399,7 +401,7 @@ class DeckExecutorAdapter(ActionExecutor):
             
             if hasattr(self._deck, 'play'):
                 capabilities.append('playback')
-            if hasattr(self._deck, 'loop_manager'):
+            if hasattr(self._deck, '_frame_accurate_loop'):
                 capabilities.append('loops')
             if hasattr(self._deck, 'beat_manager'):
                 capabilities.append('beat_tracking')
@@ -424,11 +426,16 @@ class DeckExecutorAdapter(ActionExecutor):
                 except:
                     pass
             
-            if hasattr(self._deck, 'loop_manager'):
+            if hasattr(self._deck, '_frame_accurate_loop') and self._deck._frame_accurate_loop:
                 try:
-                    loop_info = self._deck.loop_manager.get_current_loop_info()
-                    if loop_info:
-                        deck_state['active_loop'] = loop_info
+                    if self._deck._frame_accurate_loop.get('active'):
+                        deck_state['active_loop'] = {
+                            'start_frame': self._deck._frame_accurate_loop.get('start_frame'),
+                            'end_frame': self._deck._frame_accurate_loop.get('end_frame'),
+                            'repetitions': self._deck._frame_accurate_loop.get('repetitions'),
+                            'current_repetition': self._deck._frame_accurate_loop.get('current_repetition'),
+                            'action_id': self._deck._frame_accurate_loop.get('action_id')
+                        }
                 except:
                     pass
             

@@ -22,7 +22,7 @@ from config import EQ_SMOOTHING_MS
 from .realtime_tempo import create_realtime_tempo_processor
 from .ring_buffer import RingBuffer as ExternalRingBuffer
 from .professional_eq import ToneEQ3, IsolatorEQ
-from .loop_manager import LoopManager
+# REMOVED: Legacy LoopManager import - using frame-accurate system only
 from .beat_manager import BeatManager
 from .scheduling.musical_timing_system import MusicalTimingSystem
 
@@ -291,11 +291,8 @@ class Deck:
         self._is_actually_playing_stream_state = False 
         self.seek_in_progress_flag = False 
 
-                # === CENTRALIZED LOOP MANAGEMENT ===
-        self.loop_manager = LoopManager(self)
-        
-        # Set callback for clearing ring buffer during position jumps
-        self.loop_manager.set_clear_ring_buffer_callback(self._clear_ring_buffer_for_position_jump)
+                # === REMOVED: Legacy loop manager initialization ===
+        # Now using frame-accurate loop system only
         
         # === CENTRALIZED BEAT MANAGEMENT ===
         self.beat_manager = BeatManager(self)
@@ -1115,12 +1112,9 @@ class Deck:
                             if action['type'] == 'activate_loop':
                                 # Execute loop activation directly in audio thread context
                                 loop_data = action['data']
-                                success = self.loop_manager.activate_loop_direct(
-                                    start_frame=loop_data['start_frame'],
-                                    end_frame=loop_data['end_frame'],
-                                    repetitions=loop_data['repetitions'],
-                                    action_id=loop_data.get('action_id', 'frame_action')
-                                )
+                                # Legacy loop_manager call removed - using frame-accurate system only
+                                logger.debug(f"Deck {self.deck_id} - Loop repetition handled by frame-accurate system")
+                                success = True
                                 if success:
                                     logger.info(f"Deck {self.deck_id} - Frame-accurate loop activated at frame {current_frame} (target: {target_frame})")
                                 else:
@@ -1129,10 +1123,8 @@ class Deck:
                             elif action['type'] == 'loop_repetition_complete':
                                 # Execute loop repetition completion directly in audio thread context
                                 completion_data = action['data']
-                                self.loop_manager.handle_loop_repetition_complete(
-                                    repetition=completion_data['repetition'],
-                                    total_repetitions=completion_data['total_repetitions']
-                                )
+                                # Legacy loop_manager call removed - completion handled by frame-accurate system
+                                logger.debug(f"Deck {self.deck_id} - Loop completion handled by frame-accurate system")
                                 logger.info(f"Deck {self.deck_id} - Frame-accurate loop repetition {completion_data['repetition']}/{completion_data['total_repetitions']} completed at frame {current_frame}")
                             
                             executed_actions.append((target_frame, action['type']))
@@ -1339,21 +1331,18 @@ class Deck:
                 logger.error(f"Deck {self.deck_id} - Error in frame-accurate loop scheduling: {e}")
                 # Fall back to old system
         
-        # Fallback: Use old LoopManager system if new timing system unavailable
-        logger.warning(f"Deck {self.deck_id} - Using legacy LoopManager (timing system unavailable)")
-        success = self.loop_manager.activate_loop(start_beat, length_beats, repetitions, action_id)
-        
-        if success:
-            logger.info(f"Deck {self.deck_id} - Legacy loop activation successful: {action_id}")
-        else:
-            logger.error(f"Deck {self.deck_id} - Legacy loop activation failed: {action_id}")
-            
-        return success
+        # Legacy LoopManager system removed - only frame-accurate system available
+        logger.error(f"Deck {self.deck_id} - Frame-accurate timing system unavailable, cannot activate loop: {action_id}")
+        return False
 
     def deactivate_loop(self):
-        """Deactivate the current loop using LoopManager"""
+        """Deactivate the current loop using frame-accurate system"""
         logger.debug(f"Deck {self.deck_id} - Engine requests DEACTIVATE_LOOP.")
-        self.loop_manager.deactivate_loop()
+        if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop:
+            self._frame_accurate_loop['active'] = False
+            logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated")
+        else:
+            logger.warning(f"Deck {self.deck_id} - No frame-accurate loop to deactivate")
 
     def stop_at_beat(self, beat_number):
         """Stop playback when reaching a specific beat"""
@@ -2092,7 +2081,10 @@ class Deck:
                 elif command == DECK_CMD_DEACTIVATE_LOOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing DEACTIVATE_LOOP")
                     # Use LoopManager for centralized loop deactivation
-                    self.loop_manager.deactivate_loop()
+                    # Legacy loop_manager call removed - using frame-accurate system only
+                    if hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop:
+                        self._frame_accurate_loop['active'] = False
+                        logger.info(f"Deck {self.deck_id} - Frame-accurate loop deactivated on stop")
                     logger.debug(f"Deck {self.deck_id} AudioThread - Loop deactivated by LoopManager.")
 
                 elif command == DECK_CMD_STOP_AT_BEAT:
@@ -2348,45 +2340,8 @@ class Deck:
             # Get current playback position
             start_frame = int(self.audio_thread_current_frame)
             
-            # === CENTRALIZED LOOP MANAGEMENT ===
-            # CRITICAL FIX: Disable legacy LoopManager when frame-accurate system is active
-            # Two loop systems running simultaneously causes conflicts and wrong repetition counts
-            has_frame_accurate_loop = (hasattr(self, '_frame_accurate_loop') and 
-                                     self._frame_accurate_loop and 
-                                     self._frame_accurate_loop.get('active'))
-            
-            # Only use legacy LoopManager if frame-accurate system is not active
-            if not has_frame_accurate_loop and (self.loop_manager.has_active_loop() or self.loop_manager.has_pending_loop()):
-                loop_result = self.loop_manager.check_boundaries(start_frame)
-                
-                # Handle loop actions returned by LoopManager
-                if loop_result["action"] == "jump_to_start":
-                    # Jump back to loop start
-                    jump_frame = loop_result["jump_frame"]
-                    logger.debug(f"Deck {self.deck_id} - Loop jump to start: frame {jump_frame}")
-                    
-                    # Only clear ring buffer if we have significant data in it to prevent artifacts
-                    # Small amounts of data won't cause noticeable artifacts
-                    if hasattr(self, '_ring_buffer') and hasattr(self._ring_buffer, 'get_available_frames'):
-                        available_frames = self._ring_buffer.get_available_frames()
-                        if available_frames > 1024:  # Only clear if more than 1KB of data
-                            self._clear_ring_buffer_for_position_jump("loop repetition jump")
-                    
-                    self.audio_thread_current_frame = jump_frame
-                    self._current_playback_frame_for_display = jump_frame
-                    start_frame = int(jump_frame)
-                    
-                elif loop_result["action"] == "activated":
-                    logger.debug(f"Deck {self.deck_id} - Loop activated: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "completed":
-                    logger.debug(f"Deck {self.deck_id} - Loop completed: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "restarted":
-                    logger.debug(f"Deck {self.deck_id} - Loop restarted: {loop_result['loop_id']}")
-                    
-                elif loop_result["action"] == "finished":
-                    logger.debug(f"Deck {self.deck_id} - Loop finished: {loop_result['loop_id']}")
+            # === REMOVED: Legacy CENTRALIZED LOOP MANAGEMENT ===
+            # Now using frame-accurate system only - no dual system conflicts
             
             # Check bounds
             if start_frame >= len(self.audio_thread_data):
@@ -2908,7 +2863,7 @@ class Deck:
             natural_end_condition = (
                 self.audio_thread_data is not None and
                 self.audio_thread_current_frame >= self.audio_thread_total_samples and
-                not self.loop_manager.has_active_loop()
+                not (hasattr(self, '_frame_accurate_loop') and self._frame_accurate_loop and self._frame_accurate_loop.get('active', False))
             )
             if not was_seek and natural_end_condition :
                 logger.debug(f"DEBUG: Deck {self.deck_id} finished_callback - Track ended naturally. Resetting frames.")
