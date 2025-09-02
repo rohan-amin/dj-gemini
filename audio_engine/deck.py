@@ -1384,22 +1384,25 @@ class Deck:
                 # Prime ring buffer with fresh audio after position jump
                 if hasattr(self, '_producer_startup_mode'):
                     self._producer_startup_mode = True
+
                 prefilled = 0
                 TARGET_BLOCK = 4096
-                while self.out_ring and prefilled < self.RING_BUFFER_SIZE:
-                    frames_needed = self.RING_BUFFER_SIZE - prefilled
-                    chunk_size = min(TARGET_BLOCK, frames_needed)
+                # Ensure at least one callback block (two TARGET_BLOCK chunks) is ready
+                prefill_target = min(self.RING_BUFFER_SIZE, TARGET_BLOCK * 2)
+                while self.out_ring and prefilled < prefill_target:
+                    chunk_size = min(TARGET_BLOCK, prefill_target - prefilled)
                     prefill = self._produce_chunk_rubberband(chunk_size)
                     if prefill is None:
                         break
                     self.out_ring.write(prefill)
                     prefilled += len(prefill)
 
-                if self.out_ring:
-                    self._wait_for_ring_buffer_ready()
+            # Lock released here; ensure buffer has data before continuing
+            if self.out_ring:
+                self._wait_for_ring_buffer_ready()
 
-                logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
-                return True
+            logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
+            return True
                 
         except Exception as e:
             logger.error(f"Deck {self.deck_id} - Error in seamless loop jump: {e}")
@@ -2990,7 +2993,8 @@ class Deck:
             
             # Read stereo audio from ring buffer (SIMPLE)
             if self.out_ring:
-                out, n = self.out_ring.read(frames)
+                with self._stream_lock:
+                    out, n = self.out_ring.read(frames)
                 if n < frames:
                     # Underrun: fill tail with zeros
                     out[n:] = 0.0
