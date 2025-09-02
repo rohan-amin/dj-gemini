@@ -1,0 +1,76 @@
+{
+  "mix_name": "Starships to Onemoretime Transition Simple",
+  "actions": [
+    {
+      "action_id": "load_reference",
+      "command": "load_track",
+      "deck_id": "deckA",
+      "parameters": {
+        "filepath": "audio_tracks/DJ's International - Starships (Original Mix).mp3"
+      },
+      "trigger": {
+        "type": "script_start"
+      }
+    },
+    {
+      "action_id": "load_follow",
+      "command": "load_track",
+      "deck_id": "deckB",
+      "parameters": {
+        "filepath": "audio_tracks/01 - One More Time.mp3"
+      },
+      "trigger": {
+        "type": "script_start"
+      }
+    },
+    {
+      "action_id": "play_reference",
+      "command": "play",
+      "deck_id": "deckA",
+      "parameters": {
+        "start_at_beat": 100
+      },
+      "trigger": {
+        "type": "script_start"
+      }
+    },
+    {
+      "action_id": "bpm_match_follow",
+      "command": "bpm_match",
+      "parameters": {
+        "reference_deck": "deckA",
+        "follow_deck": "deckB"
+      },
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 104
+      }
+    },
+    {
+      "action_id": "first_loop",
+      "command": "activate_loop",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_deck_beat",
+        "source_deck_id": "deckA",
+        "beat_number": 108
+      },
+      "parameters": {
+        "start_at_beat": 108,
+        "length_beats": 4,
+        "repetitions": 3
+      }
+    },
+    {
+      "action_id": "stop_after_loops",
+      "command": "stop",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_loop_complete",
+        "source_deck_id": "deckA",
+        "loop_action_id": "first_loop"
+      }
+    }
+  ]
+} 
