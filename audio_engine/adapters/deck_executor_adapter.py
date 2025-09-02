@@ -202,89 +202,66 @@ class DeckExecutorAdapter(ActionExecutor):
             return False
     
     def _execute_activate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """Execute seamless loop activation without audio artifacts"""
+        """Execute loop activation via centralized ActionLoopAdapter system"""
         try:
-            # Extract loop parameters
-            start_at_beat = params.get('start_at_beat')
-            length_beats = params.get('length_beats')
-            repetitions = params.get('repetitions', 1)
-            action_id = context.get('action_id', 'unknown_loop')
-            target_frame = context.get('target_frame')
-            
-            # Validate parameters
-            if start_at_beat is None or length_beats is None:
-                logger.error(f"Deck {self._deck_id}: Missing loop parameters")
+            # Use centralized loop management system (ActionLoopAdapter required)
+            if not (hasattr(self._deck, 'action_adapter') and self._deck.action_adapter):
+                logger.error(f"❌ Deck {self._deck_id}: ActionLoopAdapter not available - cannot activate loops")
                 return False
             
-            logger.info(f"🔄 Deck {self._deck_id}: Frame-accurate loop activation - {action_id} at beat {start_at_beat}")
+            action = {
+                'action_id': context.get('action_id', 'deck_executor_loop'),
+                'command': 'activate_loop',
+                'deck_id': self._deck_id,
+                'parameters': params
+            }
             
-            # === NEW: Frame-accurate seamless loop activation ===
-            # Legacy loop_manager removed - using frame-accurate system only,
-            # we'll implement seamless looping by modifying the deck's playback position
+            logger.info(f"🔄 Deck {self._deck_id}: Using centralized ActionLoopAdapter for loop management")
+            success = self._deck.action_adapter.handle_activate_loop_action(action)
             
-            if hasattr(self._deck, 'beat_manager') and self._deck.beat_manager:
-                try:
-                    # Calculate loop boundaries in frames
-                    loop_start_frame = self._deck.beat_manager.get_frame_for_beat(start_at_beat)
-                    loop_end_frame = self._deck.beat_manager.get_frame_for_beat(start_at_beat + length_beats)
-                    
-                    logger.info(f"🔄 Loop bounds: beat {start_at_beat}-{start_at_beat + length_beats} = "
-                               f"frames {loop_start_frame}-{loop_end_frame}")
-                    
-                    # Store loop info in the deck for the producer thread to use
-                    self._deck._frame_accurate_loop = {
-                        'start_frame': loop_start_frame,
-                        'end_frame': loop_end_frame,
-                        'repetitions': repetitions,
-                        'current_repetition': 0,  # CRITICAL FIX: Count jumps, not plays
-                        'action_id': action_id,
-                        'active': True
-                    }
-                    
-                    # Always seek to loop start position (as requested in JSON)
-                    current_frame = self._deck.audio_thread_current_frame
-                    logger.info(f"🎯 Deck {self._deck_id}: Seeking to loop start at beat {start_at_beat}")
-                    logger.info(f"🎯 Frame position: {current_frame} → {loop_start_frame} (delta: {current_frame - loop_start_frame})")
-                    
-                    self._deck.audio_thread_current_frame = loop_start_frame
-                    self._deck._current_playback_frame_for_display = loop_start_frame
-                    
-                    # Clear ring buffer to prevent audio artifacts from old position
-                    if hasattr(self._deck, '_clear_ring_buffer') and callable(self._deck._clear_ring_buffer):
-                        self._deck._clear_ring_buffer("loop activation seek")
-                        logger.info(f"🎯 Deck {self._deck_id}: Ring buffer cleared after seek")
-                    
-                    logger.info(f"🎯 Deck {self._deck_id}: Seek complete - now at frame {self._deck.audio_thread_current_frame}")
-                    
-                    logger.info(f"✅ Deck {self._deck_id}: Seamless loop activated - {action_id}")
-                    return True
-                    
-                except Exception as e:
-                    logger.error(f"Deck {self._deck_id}: Error calculating loop frames: {e}")
-                    return False
+            if success:
+                logger.info(f"✅ Deck {self._deck_id}: Loop activation successful via ActionLoopAdapter")
             else:
-                logger.error(f"Deck {self._deck_id}: No beat manager for frame calculation")
-                return False
+                logger.error(f"❌ Deck {self._deck_id}: Loop activation failed via ActionLoopAdapter")
+            
+            return success
                 
         except Exception as e:
-            logger.error(f"Deck {self._deck_id}: Error in seamless loop activation: {e}")
+            logger.error(f"Deck {self._deck_id}: Error in loop activation: {e}")
             return False
     
+# Legacy loop activation method removed - now uses centralized ActionLoopAdapter only
+    
     def _execute_deactivate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """Execute loop deactivation"""
+        """Execute loop deactivation via centralized ActionLoopAdapter system"""
         try:
-            # Use frame-accurate loop deactivation
-            if hasattr(self._deck, '_frame_accurate_loop') and self._deck._frame_accurate_loop:
-                self._deck._frame_accurate_loop['active'] = False
-                logger.info(f"Deck {self._deck_id}: Frame-accurate loop deactivated")
-                return True
-            else:
-                logger.error(f"Deck {self._deck_id}: No frame-accurate loop to deactivate")
+            # Use centralized loop management system (ActionLoopAdapter required)
+            if not (hasattr(self._deck, 'action_adapter') and self._deck.action_adapter):
+                logger.error(f"❌ Deck {self._deck_id}: ActionLoopAdapter not available - cannot deactivate loops")
                 return False
+            
+            action = {
+                'action_id': context.get('action_id', 'deck_executor_deactivate'),
+                'command': 'deactivate_loop',
+                'deck_id': self._deck_id,
+                'parameters': params
+            }
+            
+            logger.info(f"🔄 Deck {self._deck_id}: Using centralized ActionLoopAdapter for loop deactivation")
+            success = self._deck.action_adapter.handle_deactivate_loop_action(action)
+            
+            if success:
+                logger.info(f"✅ Deck {self._deck_id}: Loop deactivation successful via ActionLoopAdapter")
+            else:
+                logger.error(f"❌ Deck {self._deck_id}: Loop deactivation failed via ActionLoopAdapter")
+            
+            return success
                 
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error in loop deactivation: {e}")
             return False
+    
+# Legacy loop deactivation method removed - now uses centralized ActionLoopAdapter only
     
     def _execute_set_volume(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
         """Execute volume change"""

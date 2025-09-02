@@ -466,15 +466,15 @@ class MusicalTimingSystem:
         """
         try:
             # Import deck command constants
-            from ..deck import DECK_CMD_STOP, DECK_CMD_ACTIVATE_LOOP, DECK_CMD_PLAY, DECK_CMD_PAUSE, DECK_CMD_SEEK
+            from ..deck import DECK_CMD_STOP, DECK_CMD_PLAY, DECK_CMD_PAUSE, DECK_CMD_SEEK
             
-            # Map action types to deck command constants
+            # Map action types to deck command constants (loop commands removed)
             command_mapping = {
                 'stop': DECK_CMD_STOP,
-                'activate_loop': DECK_CMD_ACTIVATE_LOOP, 
                 'play': DECK_CMD_PLAY,
                 'pause': DECK_CMD_PAUSE,
                 'seek': DECK_CMD_SEEK
+                # activate_loop removed - will be reimplemented with new architecture
             }
             
             if action_type not in command_mapping:
