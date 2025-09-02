@@ -1371,7 +1371,12 @@ class Deck:
                 old_frame = self.audio_thread_current_frame
                 self.audio_thread_current_frame = valid_target_frame
                 self._current_playback_frame_for_display = valid_target_frame
-                
+
+                # Keep beat tracking aligned with the new position
+                self.beat_manager.update_from_frame(
+                    self.audio_thread_current_frame, self.audio_thread_sample_rate
+                )
+
                 # 4. Clear any pending audio data to prevent artifacts
                 if hasattr(self, '_pending_out') and self._pending_out is not None:
                     self._pending_out = None
