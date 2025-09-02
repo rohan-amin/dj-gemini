@@ -30,6 +30,8 @@ if PROJECT_ROOT_DIR not in sys.path:
 
 import config as app_config
 from audio_engine.audio_analyzer import AudioAnalyzer
+from audio_engine.stem_separation import create_stem_separator
+from audio_engine.extended_commands import validate_extended_command
 
 def setup_logging(log_level='INFO'):
     """Set up logging for preprocessing"""
@@ -53,7 +55,7 @@ def load_json_script(script_path):
 def analyze_script_requirements(script_data):
     """
     Analyze the script to extract all required audio transformations.
-    Enhanced with smart BPM analysis for bpm_match commands.
+    Enhanced with smart BPM analysis for bpm_match commands and stem separation detection.
     Returns a dict of {track_path: {transformations}}
     """
     logger = logging.getLogger(__name__)
@@ -85,7 +87,8 @@ def analyze_script_requirements(script_data):
                     requirements[file_path] = {
                         'tempos': set(),
                         'pitches': set(),
-                        'deck_ids': set()
+                        'deck_ids': set(),
+                        'needs_stems': False
                     }
                 requirements[file_path]['deck_ids'].add(deck_id)
     
@@ -128,6 +131,42 @@ def analyze_script_requirements(script_data):
                 requirements[file_path]['tempos'].update(bpm_set)
                 if bpm_set:
                     logger.info(f"Smart analysis predicted BPMs for {deck_id}: {sorted(bpm_set)}")
+    
+    # Third pass: detect stem-based commands
+    stem_commands = [
+        'set_stem_volume', 'fade_stem_volume', 'set_stem_eq', 'fade_stem_eq',
+        'solo_stem', 'mute_stem', 'isolate_stems', 'scratch_stem',
+        'stem_crossfade', 'add_stem_routing', 'stem_filter_sweep', 
+        'add_stem_reverb', 'analyze_stem_key', 'detect_stem_energy'
+    ]
+    
+    for action in actions:
+        command = action.get('command')
+        deck_id = action.get('deck_id')
+        
+        if command in stem_commands:
+            # This track needs stem separation
+            if deck_id and deck_id in deck_to_filepath:
+                file_path = deck_to_filepath[deck_id]
+                if file_path in requirements:
+                    requirements[file_path]['needs_stems'] = True
+                    logger.info(f"Detected stem command '{command}' - {os.path.basename(file_path)} requires stem separation")
+        
+        # Multi-deck stem commands (no specific deck_id)
+        elif command in ['stem_crossfade', 'add_stem_routing', 'remove_stem_routing', 'harmonic_mix', 'stem_sync']:
+            parameters = action.get('parameters', {})
+            # Check all deck references in parameters
+            deck_refs = []
+            for param_name in ['from_deck', 'to_deck', 'source_deck', 'target_deck', 'deck_a', 'deck_b', 'reference_deck']:
+                if param_name in parameters:
+                    deck_refs.append(parameters[param_name])
+            
+            for deck_ref in deck_refs:
+                if deck_ref in deck_to_filepath:
+                    file_path = deck_to_filepath[deck_ref]
+                    if file_path in requirements:
+                        requirements[file_path]['needs_stems'] = True
+                        logger.info(f"Detected multi-deck stem command '{command}' - {os.path.basename(file_path)} requires stem separation")
     
     return requirements
 
@@ -341,6 +380,40 @@ def process_audio_file(audio_filepath, requirements, analyzer):
             logger.error(f"  Pitch processing failed: {e}")
             return False
     
+    # Step 4: Process stem separation if needed
+    needs_stems = requirements.get('needs_stems', False)
+    if needs_stems:
+        logger.info(f"  Processing stem separation...")
+        
+        try:
+            # Create stem separator
+            stem_separator = create_stem_separator()
+            
+            # Check if stems already exist
+            stem_cache_dir = app_config.get_stems_cache_dir(audio_filepath)
+            stems_exist = all(
+                os.path.exists(os.path.join(stem_cache_dir, f"{stem}.npy"))
+                for stem in ['vocals', 'drums', 'bass', 'other']
+            )
+            
+            if stems_exist:
+                logger.info(f"    Stems already cached")
+            else:
+                logger.info(f"    Separating stems (this may take several minutes)...")
+                stem_result = stem_separator.separate_file(audio_filepath)
+                
+                if stem_result and stem_result.success:
+                    logger.info(f"    ✓ Stem separation completed: {len(stem_result.stems)} stems")
+                    for stem_name, stem_data in stem_result.stems.items():
+                        logger.debug(f"      {stem_name}: {len(stem_data.audio_data)} samples, RMS: {stem_data.rms_level:.4f}")
+                else:
+                    logger.warning(f"    Stem separation failed or returned no results")
+                    # Continue processing - stems are optional for some features
+        
+        except Exception as e:
+            logger.error(f"  Stem separation failed: {e}")
+            logger.warning(f"  Continuing without stems - some features may not work")
+    
     logger.info(f"  ✓ Completed: {os.path.basename(audio_filepath)}")
     return True
 
@@ -385,6 +458,22 @@ def main():
         logger.error("Failed to load script. Exiting.")
         return 1
     
+    # Validate extended commands in script
+    logger.info("Validating extended commands...")
+    actions = script_data.get('actions', [])
+    validation_errors = []
+    
+    for i, action in enumerate(actions):
+        try:
+            # Validate extended commands
+            is_valid, error_msg = validate_extended_command(action)
+            if not is_valid and error_msg:
+                # Only warn for extended commands, don't fail validation
+                command = action.get('command', 'unknown')
+                logger.warning(f"Action {i+1} ('{command}'): {error_msg}")
+        except Exception as e:
+            logger.debug(f"Command validation skipped for action {i+1}: {e}")
+    
     # Analyze requirements
     logger.info("Analyzing script requirements...")
     requirements = analyze_script_requirements(script_data)
@@ -396,18 +485,27 @@ def main():
     logger.info(f"Found {len(requirements)} tracks requiring preprocessing:")
     total_tempos = 0
     total_pitches = 0
+    total_stems = 0
     for track_path, req in requirements.items():
         track_name = os.path.basename(track_path)
         tempo_count = len(req['tempos'])
         pitch_count = len(req['pitches'])
+        needs_stems = req.get('needs_stems', False)
+        
         total_tempos += tempo_count
         total_pitches += pitch_count
-        logger.info(f"  {track_name}: {tempo_count} tempos, {pitch_count} pitches")
+        if needs_stems:
+            total_stems += 1
+        
+        stem_status = "+ stems" if needs_stems else ""
+        logger.info(f"  {track_name}: {tempo_count} tempos, {pitch_count} pitches {stem_status}")
         if tempo_count > 0:
             logger.debug(f"    Tempo BPMs: {sorted(req['tempos'])}")
     
     if total_tempos > 0:
         logger.info(f"Smart analysis + explicit commands: {total_tempos} total tempo variants to process")
+    if total_stems > 0:
+        logger.info(f"Stem separation required for {total_stems} tracks")
     
     # Initialize analyzer
     analyzer = AudioAnalyzer(

@@ -172,3 +172,30 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# DJ Gemini specific files
+# Exclude cached audio processing files but keep directory structure
+cache/*/
+!cache/.gitkeep
+
+# Exclude audio track files but keep directory structure
+audio_tracks/*
+!audio_tracks/.gitkeep
+!audio_tracks/README.md
+
+# DJ Gemini test files
+debug_*
+test_*
+temp_*
+
+# DJ Gemini mix configs
+mix_configs/*
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
