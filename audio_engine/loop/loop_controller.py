@@ -197,6 +197,28 @@ class LoopController:
                 timestamp=time.time()
             )
             self._event_publisher.publish(event)
+
+            # Reset drift tracking for this loop so we start with a clean slate
+            self._timing_history.pop(action_id, None)
+
+            # Reset the drift check timer to allow the loop to settle before comparison
+            self._last_beat_check = time.time()
+
+            # Ensure BeatManager is aligned with the current frame before drift checks
+            try:
+                sample_rate = getattr(
+                    self._deck,
+                    'audio_thread_sample_rate',
+                    getattr(self._deck, 'sample_rate', 44100),
+                )
+                if hasattr(self._beat_converter, '_beat_manager'):
+                    beat_manager = self._beat_converter._beat_manager
+                    if hasattr(beat_manager, 'update_from_frame'):
+                        beat_manager.update_from_frame(current_frame, sample_rate)
+            except Exception as e:
+                logger.debug(
+                    f"🔄 Could not update BeatManager for loop activation {action_id}: {e}"
+                )
             
             # Update statistics
             self._stats['loops_activated'] += 1
