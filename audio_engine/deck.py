@@ -1375,6 +1375,13 @@ class Deck:
                 # 4. Clear any pending audio data to prevent artifacts
                 if hasattr(self, '_pending_out') and self._pending_out is not None:
                     self._pending_out = None
+
+                # Prime ring buffer with fresh audio after position jump
+                if hasattr(self, '_producer_startup_mode'):
+                    self._producer_startup_mode = True
+                prefill = self._produce_chunk_rubberband(self.sample_rate // 16)
+                if self.out_ring and prefill is not None:
+                    self.out_ring.write(prefill)
                 
                 logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
                 return True
