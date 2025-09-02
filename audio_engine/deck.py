@@ -1363,10 +1363,10 @@ class Deck:
                     frames_cleared = self.out_ring.available_read()
                     self.out_ring.clear()
                     logger.info(f"Deck {self.deck_id} - Ring buffer cleared for seamless jump ({frames_cleared} frames)")
-                
+
                 # 2. Reset RubberBand stretcher to handle position discontinuity
                 self._reset_rubberband_for_position_jump(is_loop_jump=True)
-                
+
                 # 3. Update position atomically
                 old_frame = self.audio_thread_current_frame
                 self.audio_thread_current_frame = valid_target_frame
@@ -1381,29 +1381,30 @@ class Deck:
                 if hasattr(self, '_pending_out') and self._pending_out is not None:
                     self._pending_out = None
 
-                # Prime ring buffer with fresh audio after position jump
+                # Mark producer to refill buffer after jump
                 if hasattr(self, '_producer_startup_mode'):
                     self._producer_startup_mode = True
 
-                prefilled = 0
-                TARGET_BLOCK = 4096
-                # Ensure at least one callback block (two TARGET_BLOCK chunks) is ready
-                prefill_target = min(self.RING_BUFFER_SIZE, TARGET_BLOCK * 2)
-                while self.out_ring and prefilled < prefill_target:
-                    chunk_size = min(TARGET_BLOCK, prefill_target - prefilled)
-                    prefill = self._produce_chunk_rubberband(chunk_size)
-                    if prefill is None:
-                        break
-                    self.out_ring.write(prefill)
-                    prefilled += len(prefill)
+            # --- Lock released before priming ring buffer ---
+            prefilled = 0
+            TARGET_BLOCK = 4096
+            # Ensure at least one callback block (two TARGET_BLOCK chunks) is ready
+            prefill_target = min(self.RING_BUFFER_SIZE, TARGET_BLOCK * 2)
+            while self.out_ring and prefilled < prefill_target:
+                chunk_size = min(TARGET_BLOCK, prefill_target - prefilled)
+                prefill = self._produce_chunk_rubberband(chunk_size)
+                if prefill is None:
+                    break
+                self.out_ring.write(prefill)
+                prefilled += len(prefill)
 
-            # Lock released here; ensure buffer has data before continuing
+            # Ensure buffer has data before continuing
             if self.out_ring:
                 self._wait_for_ring_buffer_ready()
 
             logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
             return True
-                
+
         except Exception as e:
             logger.error(f"Deck {self.deck_id} - Error in seamless loop jump: {e}")
             return False
