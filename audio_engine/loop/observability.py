@@ -674,6 +674,18 @@ class ObservabilityIntegrator:
         
         logger.info("🔄 ObservabilityIntegrator initialized")
     
+    def add_loop_controller(self, deck_id: str, loop_controller) -> None:
+        """
+        Register a loop controller with the observability system.
+        
+        Args:
+            deck_id: Identifier for the deck
+            loop_controller: LoopController instance to monitor
+        """
+        # For now, just log the registration
+        # In the future, could add deck-specific monitoring
+        logger.info(f"🔄 Registered loop controller for deck {deck_id} with observability system")
+    
     def start_monitoring(self, check_interval: float = 30.0) -> None:
         """Start comprehensive monitoring."""
         self.health_monitor.start_monitoring(check_interval)

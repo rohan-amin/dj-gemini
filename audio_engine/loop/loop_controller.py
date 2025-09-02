@@ -440,6 +440,11 @@ class LoopController:
         """
         Check completion condition - iteration count vs target.
         
+        We complete the loop when we've finished the planned number of iterations.
+        The boundary crossing detection happens at the END of each iteration,
+        so when current_iterations equals planned_iterations, we've completed
+        all the required iterations and should stop.
+        
         Args:
             current_iterations: Current number of completed iterations
             planned_iterations: Target number of iterations
@@ -447,6 +452,7 @@ class LoopController:
         Returns:
             True if loop should be completed
         """
+        # Complete when we've finished all planned iterations
         return current_iterations >= planned_iterations
     
     def _update_loop_position_tracking(self, action_id: str, loop_state: LoopState, current_frame: int) -> None:
@@ -1073,16 +1079,35 @@ class LoopController:
             if track_length > 0:
                 target_frame = max(0, min(target_frame, track_length - 1))
             
-            # FIXED: Use lightweight loop jump instead of disruptive deck.seek()
-            # deck.seek() restarts the entire audio stream, causing cutouts
-            # For loops, we just need to reset the internal playback position
+            # FIXED: Use seamless in-stream loop jump that coordinates audio pipeline
+            # without stopping and restarting the audio stream
+            if hasattr(self._deck, '_perform_seamless_loop_jump_in_stream'):
+                # Use deck's seamless in-stream jump that coordinates RubberBand without restart
+                old_frame = getattr(self._deck, 'audio_thread_current_frame', 0)
+                success = self._deck._perform_seamless_loop_jump_in_stream(target_frame)
+                
+                if success:
+                    logger.info(f"🔄 SEAMLESS LOOP JUMP: {old_frame} → {target_frame} (in-stream coordination)")
+                    return True
+                else:
+                    logger.error(f"🔄 Seamless in-stream jump failed, falling back to command queue")
+            
+            # Fallback: command queue approach (causes restart but works)
+            if hasattr(self._deck, 'seek_for_loop_jump'):
+                old_frame = getattr(self._deck, 'audio_thread_current_frame', 0)
+                success = self._deck.seek_for_loop_jump(target_frame)
+                
+                if success:
+                    logger.warning(f"🔄 COMMAND QUEUE LOOP JUMP: {old_frame} → {target_frame} (causes restart)")
+                    return True
+            
+            # Final fallback: direct frame manipulation 
             if hasattr(self._deck, 'audio_thread_current_frame'):
-                # Direct frame position reset for seamless looping
                 old_frame = getattr(self._deck, 'audio_thread_current_frame', 0)
                 self._deck.audio_thread_current_frame = target_frame
                 self._deck._current_playback_frame_for_display = target_frame
                 
-                logger.info(f"🔄 LIGHTWEIGHT LOOP JUMP: {old_frame} → {target_frame} (no audio restart)")
+                logger.warning(f"🔄 DIRECT FRAME JUMP: {old_frame} → {target_frame} (minimal coordination)")
                 return True
             
             # Final fallback: use command queue for thread-safe seeking

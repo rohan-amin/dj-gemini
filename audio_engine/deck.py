@@ -497,6 +497,30 @@ class Deck:
         else:
             logger.debug(f"Deck {self.deck_id} - Ring buffer clear requested for {reason} but no ring buffer active")
 
+    def _reset_rubberband_for_position_jump(self, is_loop_jump: bool = False):
+        """
+        Reset RubberBand stretcher for position jumps to prevent audio artifacts.
+        
+        When the audio position jumps (seek or loop jump), the RubberBand stretcher
+        needs to be reset because it expects sequential audio input. Without this
+        reset, the stretcher produces silence or corrupted audio.
+        
+        Args:
+            is_loop_jump: True if this is a loop jump (for logging)
+        """
+        try:
+            with self._rb_lock:
+                if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
+                    # Reset the stretcher to clean state
+                    self.rubberband_stretcher.reset()
+                    
+                    jump_type = "loop jump" if is_loop_jump else "position jump"
+                    logger.info(f"Deck {self.deck_id} - RubberBand stretcher reset for {jump_type}")
+                else:
+                    logger.debug(f"Deck {self.deck_id} - No RubberBand stretcher to reset")
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Error resetting RubberBand for position jump: {e}")
+
     # === PROFESSIONAL STEREO EQ API METHODS ===
     
     def set_stem_eq(self, stem_name, low_db=0.0, mid_db=0.0, high_db=0.0, enabled=None):
@@ -1282,6 +1306,83 @@ class Deck:
         self.command_queue.put((DECK_CMD_SEEK, {'frame': valid_target_frame, 
                                                'was_playing_intent': was_playing_intent}))
 
+    def seek_for_loop_jump(self, target_frame: int) -> bool:
+        """
+        Optimized seek specifically for loop jump-backs that maintains
+        audio continuity without restart artifacts.
+        
+        This method coordinates proper audio pipeline state management
+        including RubberBand stretcher reset and ring buffer clearing
+        while avoiding the startup artifacts of regular seeks.
+        
+        Args:
+            target_frame: Target frame position for the loop jump
+            
+        Returns:
+            True if the seek was successful
+        """
+        logger.info(f"Deck {self.deck_id} - Loop-optimized seek to frame {target_frame}")
+        
+        valid_target_frame = max(0, min(target_frame, self.total_frames - 1 if self.total_frames > 0 else 0))
+        
+        with self._stream_lock:
+            # Update display position immediately for UI responsiveness
+            self._current_playback_frame_for_display = valid_target_frame
+            
+        # Use command queue for proper audio thread coordination
+        # Add loop_jump flag to distinguish from regular seeks
+        self.command_queue.put((DECK_CMD_SEEK, {
+            'frame': valid_target_frame, 
+            'was_playing_intent': True,  # Always continue playing for loop jumps
+            'is_loop_jump': True  # Flag to avoid restart artifacts
+        }))
+        
+        return True
+
+    def _perform_seamless_loop_jump_in_stream(self, target_frame: int) -> bool:
+        """
+        Perform a seamless loop jump within the existing audio stream without restart.
+        
+        This method coordinates the audio pipeline (RubberBand + ring buffer) 
+        synchronously to avoid the stream restart that seek_for_loop_jump causes.
+        
+        Args:
+            target_frame: Target frame position for the loop jump
+            
+        Returns:
+            True if the jump was successful
+        """
+        logger.info(f"Deck {self.deck_id} - Seamless in-stream loop jump to frame {target_frame}")
+        
+        valid_target_frame = max(0, min(target_frame, self.total_frames - 1 if self.total_frames > 0 else 0))
+        
+        try:
+            with self._stream_lock:
+                # 1. Clear ring buffer immediately to prevent old audio artifacts
+                if self.out_ring:
+                    frames_cleared = self.out_ring.available_read()
+                    self.out_ring.clear()
+                    logger.info(f"Deck {self.deck_id} - Ring buffer cleared for seamless jump ({frames_cleared} frames)")
+                
+                # 2. Reset RubberBand stretcher to handle position discontinuity
+                self._reset_rubberband_for_position_jump(is_loop_jump=True)
+                
+                # 3. Update position atomically
+                old_frame = self.audio_thread_current_frame
+                self.audio_thread_current_frame = valid_target_frame
+                self._current_playback_frame_for_display = valid_target_frame
+                
+                # 4. Clear any pending audio data to prevent artifacts
+                if hasattr(self, '_pending_out') and self._pending_out is not None:
+                    self._pending_out = None
+                
+                logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Deck {self.deck_id} - Error in seamless loop jump: {e}")
+            return False
+
     # Loop management methods removed - will be reimplemented with new architecture
 
     def stop_at_beat(self, beat_number):
@@ -2048,7 +2149,13 @@ class Deck:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Audio data set internally for playback.")
 
                 elif command == DECK_CMD_PLAY:
-                    logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY")
+                    is_loop_continuation = data.get('is_loop_continuation', False)
+                    
+                    if is_loop_continuation:
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY for loop continuation")
+                    else:
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY")
+                        
                     with self._stream_lock: 
                         if self.audio_thread_data is None: 
                             logger.debug(f"Deck {self.deck_id} AudioThread - No audio data for PLAY.")
@@ -2063,11 +2170,13 @@ class Deck:
                         
                         self._current_playback_frame_for_display = self.audio_thread_current_frame
 
-                        # CRITICAL: Clear ring buffer for new stream to prevent artifacts
-                        self._clear_ring_buffer_for_position_jump("new stream creation")
+                        # For loop continuations, skip ring buffer clearing since it was already done in SEEK
+                        if not is_loop_continuation:
+                            # CRITICAL: Clear ring buffer for new stream to prevent artifacts
+                            self._clear_ring_buffer_for_position_jump("new stream creation")
                         
-                        # Reset startup fade for new stream
-                        if hasattr(self, '_startup_fade_active'):
+                        # For loop continuations, don't reset startup fade to avoid artifacts
+                        if not is_loop_continuation and hasattr(self, '_startup_fade_active'):
                             self._startup_fade_active = False
                             logger.debug(f"Deck {self.deck_id} AudioThread - Startup fade reset for new stream.")
 
@@ -2142,21 +2251,44 @@ class Deck:
                 elif command == DECK_CMD_SEEK:
                     new_frame = data['frame']
                     was_playing_intent = data['was_playing_intent']
-                    logger.debug(f"Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
+                    is_loop_jump = data.get('is_loop_jump', False)
+                    
+                    if is_loop_jump:
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing LOOP JUMP to frame {new_frame}")
+                    else:
+                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
+                    
                     with self._stream_lock:
                         # CRITICAL: Clear ring buffer on seek to prevent old audio artifacts
-                        self._clear_ring_buffer_for_position_jump("seek operation")
+                        self._clear_ring_buffer_for_position_jump("loop jump" if is_loop_jump else "seek operation")
+                        
+                        # CRITICAL: Reset RubberBand stretcher for position jumps
+                        # This prevents the stretcher from expecting sequential audio
+                        self._reset_rubberband_for_position_jump(is_loop_jump)
+                        
                         self.audio_thread_current_frame = new_frame
                         self._current_playback_frame_for_display = new_frame 
                         self._user_wants_to_play = was_playing_intent 
                         # Loop state handled by LoopManager
                         
-                        # Reset startup fade
-                        if hasattr(self, '_startup_fade_active'):
+                        # For loop jumps, don't reset startup fade (avoid artifacts)
+                        # For regular seeks, reset startup fade as before
+                        if not is_loop_jump and hasattr(self, '_startup_fade_active'):
                             self._startup_fade_active = False
+                            
                     if was_playing_intent: 
-                        logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
-                        self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
+                        if is_loop_jump:
+                            # For loop jumps, re-queue PLAY but avoid startup artifacts
+                            # The audio thread coordinates the jump properly
+                            logger.debug(f"Deck {self.deck_id} AudioThread - LOOP JUMP: Re-queueing PLAY for seamless continuation")
+                            self.command_queue.put((DECK_CMD_PLAY, {
+                                'start_frame': new_frame,
+                                'is_loop_continuation': True  # Flag to avoid startup fade
+                            }))
+                        else:
+                            # For regular seeks, re-queue PLAY command as before
+                            logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
+                            self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
                     else: 
                         with self._stream_lock: self._is_actually_playing_stream_state = False
                         logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Was paused, position updated.")
