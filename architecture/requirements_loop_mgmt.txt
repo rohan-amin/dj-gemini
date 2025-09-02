@@ -1,0 +1,176 @@
+# DJ Loop Management System Requirements
+# Version: 1.0
+# Date: 2025-08-31
+
+## 1. Core Loop Definition
+- **Loop Identity**: Each loop must have a unique identifier (`action_id`)
+- **Temporal Boundaries**: Define loop start and end points in beats (musical timing)
+- **Fractional Beat Support**: Support loop lengths shorter than a full beat (e.g., 0.2 beats for tight loops)
+- **Precise Beat Positioning**: Allow fractional beat positions (e.g., beat 108.0 to 108.2)
+- **Iteration Count**: Specify exact number of loop iterations/repetitions
+- **Frame Accuracy**: Convert beat positions to sample frames for precise audio positioning
+
+## 2. Loop Lifecycle Management
+- **Activation**: Seamlessly activate a loop at a specific beat position
+- **Iteration Tracking**: Accurately count how many times the loop has played
+- **Completion Detection**: Detect when the specified number of iterations is complete
+- **Deactivation**: Clean loop termination without audio artifacts
+
+## 3. Audio Continuity Requirements
+- **Seamless Jumps**: Loop back to start position without audible clicks or gaps
+- **Buffer Management**: Ensure ring buffer doesn't underrun during loop jumps
+- **Thread Safety**: Coordinate between producer thread and audio callback thread
+- **Timing Precision**: Maintain musical timing accuracy throughout loop execution
+
+## 4. Sequential Loop Chaining
+- **Loop Dependencies**: Support loops that activate after previous loops complete
+- **Transition Management**: Smooth transitions between different loop sections
+- **Conditional Activation**: Loops can be conditionally activated based on completion events
+
+## 5. Multiple Action Triggers
+- **Completion Events**: Trigger multiple actions simultaneously when a loop completes
+- **Action Types**: Support various action types (stop, play, activate_loop, volume changes, etc.)
+- **Target Flexibility**: Actions can target same deck or different decks
+- **Event Queuing**: Properly queue and execute multiple completion actions
+
+## 6. State Management
+- **Loop Status**: Track active/inactive state per loop
+- **Iteration Counter**: Maintain accurate count of completed iterations
+- **Timing History**: Track loop timing for debugging and validation
+- **Thread-Safe Access**: All state modifications must be thread-safe
+
+## 7. Integration Requirements
+- **Beat Manager Integration**: Use existing beat timing system for musical accuracy
+- **Event Scheduling**: Integrate with event scheduling system for completion actions
+- **Audio Engine Coordination**: Work seamlessly with existing audio pipeline
+- **Musical Timing System**: Leverage existing musical timing infrastructure
+
+## 8. Error Handling & Validation
+- **Bounds Checking**: Validate loop boundaries don't exceed track length
+- **State Validation**: Ensure loop state remains consistent across threads
+- **Graceful Degradation**: Handle errors without crashing audio playback
+- **Debug Logging**: Comprehensive logging for troubleshooting loop issues
+
+## 9. Configuration Interface
+- **JSON Configuration**: Support loop definition via mix configuration files
+- **Action-Defined Format**: Maintain existing action-based configuration format where actions are listed chronologically
+- **DJ Workflow Alignment**: Configuration reflects the chronological order of DJ controller button presses during mix creation
+- **Fractional Beat Configuration**: Support fractional beat values in loop configuration (e.g., start: 108.0, end: 108.2)
+- **Runtime Control**: Allow loop activation/deactivation during playback
+- **Parameter Updates**: Support dynamic loop parameter changes
+- **Tight Loop Validation**: Validate that fractional loops maintain audio quality and timing precision
+- **Configuration Preservation**: Do not restructure existing JSON format - maintain action-centric approach rather than loop-centric
+
+## 10. Performance Requirements
+- **Low Latency**: Loop operations must not introduce audio latency
+- **Minimal Overhead**: Loop management shouldn't impact audio performance
+- **Memory Efficiency**: Efficient memory usage for loop state management
+- **Real-time Safety**: All loop operations must be real-time audio safe
+
+## 11. Observability & Logging Requirements
+- **Loop Activation Logging**: At INFO level, log when a loop starts with format: `"🔄 LOOP START: {loop_id} on {deck_id} - {iterations} iterations planned"`
+- **Iteration Progress Logging**: At INFO level, log each loop iteration with format: `"🔄 LOOP ITERATION: {loop_id} on {deck_id} - iteration {current}/{total} complete"`
+- **Loop Completion Logging**: At INFO level, log when a loop completes with format: `"🔄 LOOP COMPLETE: {loop_id} on {deck_id} - {total_iterations} iterations finished"`
+- **Loop Jump Logging**: At INFO level, log each seamless jump with timing information
+- **State Change Visibility**: All major state changes must be visible at INFO log level
+- **Performance Metrics**: Log loop timing accuracy and any timing drift
+
+## 12. Architecture Principles & Design Patterns
+
+### 12.1 Separation of Concerns
+- **Loop State Manager**: Single component responsible for loop state (active loops, iteration counts, timing)
+- **Loop Audio Controller**: Single component responsible for audio positioning and jumps
+- **Loop Event Publisher**: Single component responsible for publishing loop lifecycle events
+- **Loop Completion Handler**: Single component responsible for triggering completion actions
+
+### 12.2 Single Responsibility Principle
+- Each class/module should have exactly one reason to change
+- Loop timing logic separate from audio buffer management
+- Event publishing separate from event handling
+- State management separate from audio processing
+
+### 12.3 Event-Driven Architecture
+- **Publisher-Subscriber Pattern**: Loop events published to subscribers
+- **Asynchronous Event Handling**: Completion actions executed asynchronously
+- **Event Queue Management**: Proper queuing and ordering of loop events
+- **Loose Coupling**: Components communicate via events, not direct dependencies
+
+### 12.4 Thread Safety & Concurrency
+- **Immutable State Objects**: Use immutable objects for loop state where possible
+- **Atomic Operations**: All state updates must be atomic
+- **Lock Hierarchies**: Establish clear lock ordering to prevent deadlocks
+- **Reader-Writer Locks**: Use appropriate lock types for read-heavy vs write-heavy operations
+
+### 12.5 Error Handling Strategy
+- **Fail Fast**: Detect errors early and fail with clear error messages
+- **Graceful Degradation**: System continues to function even when individual loops fail
+- **Error Propagation**: Clear error propagation paths from low-level to high-level components
+- **Recovery Mechanisms**: Ability to recover from transient errors without user intervention
+
+### 12.6 Testability & Maintainability
+- **Dependency Injection**: All dependencies injected for easy mocking
+- **Pure Functions**: State transformation functions should be pure where possible
+- **Interface Segregation**: Small, focused interfaces rather than large, monolithic ones
+- **Clear Abstractions**: Well-defined abstractions that hide implementation details
+
+### 12.7 Performance & Memory Management
+- **Object Pooling**: Reuse loop state objects to minimize garbage collection
+- **Lazy Loading**: Load loop data only when needed
+- **Memory Bounds**: Clear memory usage bounds for loop state management
+- **Real-time Constraints**: All operations must complete within audio buffer deadline
+
+### 12.8 Configuration & Flexibility
+- **Strategy Pattern**: Pluggable strategies for different loop behaviors
+- **Configuration Validation**: Validate loop configurations at load time
+- **Runtime Reconfiguration**: Support changing loop parameters without restart
+- **Default Behaviors**: Sensible defaults for all configuration parameters
+
+## 13. Centralized Loop Management Architecture
+
+### 13.1 Single Source of Truth
+- **Unified Loop State**: All loop state must be managed by a single, centralized component
+- **Atomic State Transitions**: All loop state changes must be atomic and consistent across the entire system
+- **Single Thread Ownership**: Loop lifecycle management should be owned by a single thread (preferably the producer thread where musical timing context exists)
+- **Centralized Loop Registry**: One authoritative registry of all active loops and their states
+
+### 13.2 Elimination of Cross-Thread State Sharing
+- **No Shared Mutable State**: Eliminate shared lists like `_pending_loop_completions` that require complex synchronization
+- **Message Passing**: Use immutable messages/events to communicate between threads rather than shared state
+- **Clear Ownership**: Each piece of loop state should have exactly one owner thread
+- **Thread Boundaries**: Clearly defined boundaries between threads with minimal shared state
+
+### 13.3 Simplified Event Flow
+- **Linear Event Flow**: Loop events should flow in a clear, linear path: Detection → Validation → Action
+- **Single Event Source**: All loop events should originate from the same component
+- **Synchronous Completion**: Loop completion detection and immediate state updates should happen synchronously in the same thread
+- **Event Ordering**: Guaranteed ordering of loop events to prevent race conditions
+
+### 13.4 Unified Loop Controller
+- **Single Control Point**: One component responsible for all loop operations (start, iterate, complete)
+- **Musical Context Awareness**: Loop controller must have access to musical timing information
+- **Frame-Accurate Positioning**: Direct control over audio frame positioning for seamless jumps
+- **State Consistency**: Guarantee that loop state is always consistent with actual audio position
+
+### 13.5 Elimination of Fragmented Handling
+- **No Cross-System Dependencies**: Loop completion handling should not span multiple systems (audio thread + producer thread + timing system)
+- **Consolidated Logic**: All loop logic consolidated into a single, cohesive system
+- **Direct Action Execution**: Loop completion actions executed directly by loop controller, not via complex coordination mechanisms
+- **Simplified Debugging**: Single place to debug all loop-related issues
+
+## 14. Critical Anti-Patterns to Avoid
+- **Distributed Loop State**: Never split loop state across multiple threads or systems
+- **Asynchronous State Updates**: Never update loop state asynchronously from loop detection
+- **Complex Synchronization**: Avoid complex locking schemes or shared mutable data structures
+- **Cross-Thread Completion Handling**: Never handle loop completion events in a different thread than where they're detected
+- **Layered Event Systems**: Avoid multiple layers of event systems coordinating loop completion
+
+## 15. Success Criteria
+- **Audio Continuity**: Loops play without any audible gaps, clicks, or interruptions
+- **Timing Accuracy**: Loop iterations maintain perfect musical timing
+- **Deterministic Behavior**: Same loop configuration always produces identical behavior
+- **Thread Safety**: System remains stable under concurrent load
+- **Debuggability**: Issues can be traced through clear, linear log messages
+- **Performance**: Loop operations complete within real-time audio constraints
+- **Reliability**: System handles edge cases and errors gracefully without audio dropouts
+
+This requirements document serves as the complete specification for building a robust, maintainable, and reliable DJ loop management system that eliminates the fragmented architecture problems that have been causing audio interruptions.
