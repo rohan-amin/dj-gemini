@@ -5,8 +5,12 @@ non-flushing stop so buffered audio can drain. Run with a local audio
 file to verify all loop iterations are heard before playback stops.
 """
 
+import os
 import sys
 import time
+
+# Ensure the repository root is on sys.path when run as a script.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
 from audio_engine.deck import Deck
