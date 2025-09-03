@@ -194,7 +194,6 @@ class AudioEngine:
                         action.get("action_id"),
                     )
                 else:
-                    # Fallback: execute directly if scheduler unavailable or stopped
                     logger.info(
                         "handle_loop_complete: executing action %s directly (scheduler inactive)",
                         action.get("action_id"),
