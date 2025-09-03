@@ -1892,7 +1892,7 @@ class Deck:
                 command, data = self.command_queue.get(timeout=0.1)
                 logger.debug(f"Deck {self.deck_id} AudioThread - Received command: {command}")
 
-                if command in [DECK_CMD_LOAD_AUDIO, DECK_CMD_PLAY, DECK_CMD_SEEK, DECK_CMD_STOP, DECK_CMD_SHUTDOWN]:
+                if command in [DECK_CMD_LOAD_AUDIO, DECK_CMD_PLAY, DECK_CMD_SEEK, DECK_CMD_SHUTDOWN]:
                     if _current_stream_in_thread:
                         logger.debug(f"Deck {self.deck_id} AudioThread - Command {command} clearing existing stream.")
                         _current_stream_in_thread.abort(ignore_errors=True)
@@ -1994,6 +1994,16 @@ class Deck:
                     # Stop producer thread so no new audio is generated
                     self._producer_stop_event.set()
                     self._producer_running = False
+
+                    # Gracefully handle the current stream depending on flush behavior
+                    if _current_stream_in_thread:
+                        if flush:
+                            _current_stream_in_thread.abort(ignore_errors=True)
+                        else:
+                            if _current_stream_in_thread.active:
+                                _current_stream_in_thread.stop(ignore_errors=True)
+                        _current_stream_in_thread.close(ignore_errors=True)
+                        _current_stream_in_thread = None
 
                     # Only clear the ring buffer if caller explicitly requested
                     # an immediate stop. Otherwise allow existing audio to drain
