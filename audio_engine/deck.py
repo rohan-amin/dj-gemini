@@ -1991,17 +1991,19 @@ class Deck:
                     if data is not None and isinstance(data, dict):
                         flush = data.get("flush", True)
 
-                    # Stop producer thread
+                    # Stop producer thread so no new audio is generated
                     self._producer_stop_event.set()
                     self._producer_running = False
 
-                    # Clear any buffered audio so playback stops immediately
-                    self._clear_ring_buffer_for_position_jump("stop command")
-
-
-                    # Clear any buffered audio so playback stops immediately
+                    # Only clear the ring buffer if caller explicitly requested
+                    # an immediate stop. Otherwise allow existing audio to drain
+                    # naturally so loop completions can play out fully.
                     if flush:
                         self._clear_ring_buffer_for_position_jump("stop command")
+                    else:
+                        logger.debug(
+                            f"Deck {self.deck_id} AudioThread - STOP without flush: allowing buffer to drain"
+                        )
 
                     # Clean up RubberBand resources
                     self._cleanup_rubberband_on_stop()
