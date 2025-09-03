@@ -1134,7 +1134,10 @@ class AudioEngine:
             elif command == "stop":
                 if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
-                flush = parameters.get("flush", True)
+                # Default to non-flushing stop so any buffered audio (e.g. final
+                # loop iteration) can play out unless the caller explicitly
+                # requests an immediate stop.
+                flush = parameters.get("flush", False)
                 deck.stop(flush=flush)
                 return False  # Engine convention: False = success
             
