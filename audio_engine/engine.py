@@ -176,7 +176,7 @@ class AudioEngine:
         # Could implement error recovery logic here
 
     def handle_loop_complete(self, deck_id: str, loop_action_id: str):
-        """Dispatch actions registered for a completed loop"""
+        """Execute actions registered for a completed loop"""
         actions = self._loop_completion_actions.get(deck_id, {}).pop(loop_action_id, [])
         if deck_id in self._loop_completion_actions and not self._loop_completion_actions[deck_id]:
             del self._loop_completion_actions[deck_id]
@@ -200,9 +200,7 @@ class AudioEngine:
                     )
                     self._execute_action(action)
             except Exception as e:
-                logger.error(
-                    f"Error executing loop completion action {action.get('action_id')}: {e}"
-                )
+                logger.error(f"Error executing loop completion action {action.get('action_id')}: {e}")
 
     def _validate_action(self, action, action_index):
         command = action.get("command")
@@ -1136,7 +1134,8 @@ class AudioEngine:
             elif command == "stop":
                 if not deck_id: logger.warning("'stop' missing deck_id. Skipping."); return False
                 deck = self._get_or_create_deck(deck_id)
-                deck.stop()
+                flush = parameters.get("flush", True)
+                deck.stop(flush=flush)
                 return False  # Engine convention: False = success
             
             elif command == "seek_and_play":
