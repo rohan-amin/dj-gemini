@@ -1990,22 +1990,23 @@ class Deck:
                     # Stop producer thread
                     self._producer_stop_event.set()
                     self._producer_running = False
+
+                    # Clear any buffered audio so playback stops immediately
+                    self._clear_ring_buffer_for_position_jump("stop command")
+
                     # Clean up RubberBand resources
                     self._cleanup_rubberband_on_stop()
-                    with self._stream_lock: 
-                        # GRACEFUL STOP: Let buffered audio play out completely
-                        # Don't clear ring buffer immediately - let it drain naturally
-                        buffered_frames = self.out_ring.available_read() if self.out_ring else 0
-                        logger.info(f"Deck {self.deck_id} - Graceful stop: {buffered_frames} frames will play out")
-                        
-                        self.audio_thread_current_frame = 0 
-                        self._current_playback_frame_for_display = 0 
+
+                    with self._stream_lock:
+                        self.audio_thread_current_frame = 0
+                        self._current_playback_frame_for_display = 0
                         self._is_actually_playing_stream_state = False
-                        
+
                         # Reset startup fade
                         if hasattr(self, '_startup_fade_active'):
                             self._startup_fade_active = False
-                    logger.debug(f"Deck {self.deck_id} AudioThread - State reset for STOP (graceful).")
+
+                    logger.debug(f"Deck {self.deck_id} AudioThread - State reset for STOP (immediate).")
 
                 elif command == DECK_CMD_SEEK:
                     new_frame = data['frame']
