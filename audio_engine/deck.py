@@ -289,6 +289,14 @@ class Deck:
         self._is_actually_playing_stream_state = False 
         self.seek_in_progress_flag = False 
 
+        # === LOOP STATE ===
+        self._loop_active = False
+        self._loop_start_frame = 0
+        self._loop_end_frame = 0
+        self._loop_repetitions_total = 0
+        self._loop_repetitions_done = 0
+        self._current_loop_action_id = None
+
         
         # === CENTRALIZED BEAT MANAGEMENT ===
         self.beat_manager = BeatManager(self)
@@ -792,8 +800,8 @@ class Deck:
             self.stems_available = False
 
 
-    def _build_stem_mix_chunk(self, start_frame, num_frames):
-        """Build audio chunk from stems with per-stem EQ applied"""
+    def _build_stem_mix_chunk_from_frame(self, start_frame, num_frames):
+        """Build audio chunk from stems with per-stem EQ applied starting at a specific frame"""
         try:
             if not self.stems_available or not self.stem_data:
                 # Fallback to original audio
@@ -1286,6 +1294,37 @@ class Deck:
             'target_frame': target_frame,
             'beat_number': beat_number
         }))
+
+    def activate_loop(self, start_beat: float, length_beats: float, repetitions: int = None, action_id: str = None):
+        """Activate a beat-synchronized loop"""
+        if self.total_frames == 0 or self.bpm <= 0:
+            logger.warning(f"Deck {self.deck_id} - Cannot activate loop: track not loaded or BPM invalid")
+            return False
+
+        start_frame = self.beat_manager.get_frame_for_beat(start_beat)
+        end_frame = self.beat_manager.get_frame_for_beat(start_beat + length_beats)
+
+        with self._stream_lock:
+            self._loop_active = True
+            self._loop_start_frame = int(start_frame)
+            self._loop_end_frame = int(end_frame)
+            self._loop_repetitions_total = repetitions or 0
+            self._loop_repetitions_done = 0
+            self._current_loop_action_id = action_id
+
+            if self.audio_thread_current_frame < self._loop_start_frame or self.audio_thread_current_frame > self._loop_end_frame:
+                self.audio_thread_current_frame = self._loop_start_frame
+                self._current_playback_frame_for_display = self._loop_start_frame
+
+        logger.info(f"🔄 LOOP START: {action_id} on {self.deck_id} - {repetitions} iterations planned")
+        return True
+
+    def deactivate_loop(self):
+        """Deactivate any active loop"""
+        with self._stream_lock:
+            self._loop_active = False
+            self._current_loop_action_id = None
+        logger.info(f"Deck {self.deck_id} - Loop deactivated")
 
     # === MUSICAL TIMING SYSTEM API ===
     # Public methods for scheduling sample-accurate musical actions
@@ -2522,95 +2561,50 @@ class Deck:
         
         return chunk.reshape(-1, 2)  # Ensure correct stereo shape for ring buffer
     def _build_stem_mix_chunk(self, target_frames):
-        """Build audio chunk from stems with per-stem processing"""
+        """Build audio chunk from stems with per-stem processing and loop handling"""
         if self.audio_thread_data is None or len(self.audio_thread_data) == 0:
             return None
 
-        # Get current playback position
-        start_frame = int(self.audio_thread_current_frame)
-        end_frame = start_frame + target_frames
-        
-        # Store original end frame for loop detection
-        original_end_frame = end_frame
+        output = np.zeros((target_frames, 2), dtype=np.float32)
+        frames_remaining = target_frames
+        out_pos = 0
 
-        # Check bounds
-        if start_frame >= len(self.audio_thread_data):
-            return None
+        while frames_remaining > 0:
+            if self._loop_active and self.audio_thread_current_frame >= self._loop_end_frame:
+                self._loop_repetitions_done += 1
+                logger.info(f"🔄 LOOP ITERATION: {self._current_loop_action_id} on {self.deck_id} - iteration {self._loop_repetitions_done}/{self._loop_repetitions_total or '∞'} complete")
+                if self._loop_repetitions_total and self._loop_repetitions_done >= self._loop_repetitions_total:
+                    self._loop_active = False
+                    if self.engine:
+                        logger.info(f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished")
+                        self.engine.handle_loop_complete(self.deck_id, self._current_loop_action_id)
+                if self._loop_active:
+                    logger.info(f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start")
+                    self.audio_thread_current_frame = self._loop_start_frame
+                    self._current_playback_frame_for_display = self._loop_start_frame
 
-        # Get audio chunk
-        if end_frame > len(self.audio_thread_data):
-            # Handle end-of-track
-            available_frames = len(self.audio_thread_data) - start_frame
-            chunk = np.zeros(target_frames, dtype=np.float32)
-            if available_frames > 0:
-                chunk[:available_frames] = self.audio_thread_data[start_frame:start_frame + available_frames]
-            self.audio_thread_current_frame = len(self.audio_thread_data)  # End of track
-            
-            # Keep display frame synchronized with actual frame in ring buffer architecture  
-            with self._stream_lock:
-                self._current_playback_frame_for_display = len(self.audio_thread_data)
-        else:
-            chunk = self.audio_thread_data[start_frame:end_frame]
-            self.audio_thread_current_frame = end_frame
-            
-            # Keep display frame synchronized with actual frame in ring buffer architecture
-            with self._stream_lock:
-                self._current_playback_frame_for_display = end_frame
-            
-                    
-                
-                # Check if we would cross the loop end frame with this chunk (only for active loops)
-                        
+            start_frame = int(self.audio_thread_current_frame)
+            part_frames = frames_remaining
+            if self._loop_active and start_frame + part_frames > self._loop_end_frame:
+                part_frames = self._loop_end_frame - start_frame
 
-        # If stems are available, build mix from stems with per-stem EQ
-        if self.stems_available and self.stem_data:
-            # Initialize stereo mix chunk
-            mix_chunk = np.zeros((len(chunk), 2), dtype=np.float32)
-            
-            # Use current audio thread frame position for stem alignment
-            current_stem_frame = int(self.audio_thread_current_frame) - len(chunk)
-            
-            for stem_name, stem_audio in self.stem_data.items():
-                if current_stem_frame + len(chunk) <= len(stem_audio) and current_stem_frame >= 0:
-                    stem_chunk = stem_audio[current_stem_frame:current_stem_frame + len(chunk)]
-                    
-                    # Ensure stem chunk is stereo
-                    if stem_chunk.ndim == 1:
-                        stem_chunk = np.column_stack([stem_chunk, stem_chunk])
-                    elif stem_chunk.ndim == 2 and stem_chunk.shape[1] == 1:
-                        stem_chunk = np.column_stack([stem_chunk[:, 0], stem_chunk[:, 0]])
-                    
-                    # Apply per-stem tone EQ if enabled
-                    if (stem_name in self.stem_tone_eqs and 
-                        self.stem_eq_enabled.get(stem_name, False)):
-                        try:
-                            # Process each channel separately for EQ
-                            stem_chunk_eq_left = self.stem_tone_eqs[stem_name].process_block(stem_chunk[:, 0])
-                            stem_chunk_eq_right = self.stem_tone_eqs[stem_name].process_block(stem_chunk[:, 1])
-                            stem_chunk = np.column_stack([stem_chunk_eq_left.flatten(), stem_chunk_eq_right.flatten()])
-                        except Exception as e:
-                            logger.warning(f"Deck {self.deck_id} - Stem EQ error for {stem_name}: {e}")
-                    
-                    # Apply stem volume
-                    stem_volume = self.stem_volumes.get(stem_name, 1.0)
-                    stem_chunk = stem_chunk * stem_volume
-                    
-                    # Add to mix
-                    mix_chunk += stem_chunk
-            
-            chunk = mix_chunk
-        else:
-            # Convert mono original audio to stereo
-            if chunk.ndim == 1:
-                chunk = np.column_stack([chunk, chunk])
+            chunk_part = self._build_stem_mix_chunk_from_frame(start_frame, part_frames)
+            if chunk_part is None:
+                chunk_part = np.zeros(part_frames, dtype=np.float32)
 
-        # Ensure chunk is a valid numpy array before reshaping
-        if not isinstance(chunk, np.ndarray):
-            chunk = np.asarray(chunk, dtype=np.float32)
-        if chunk.size == 0:
-            chunk = np.zeros((target_frames, 2), dtype=np.float32)
-        
-        return chunk.reshape(-1, 2)  # Ensure correct stereo shape for ring buffer
+            if chunk_part.ndim == 1:
+                chunk_part = np.column_stack([chunk_part, chunk_part])
+            elif chunk_part.ndim == 2 and chunk_part.shape[1] == 1:
+                chunk_part = np.column_stack([chunk_part[:, 0], chunk_part[:, 0]])
+
+            output[out_pos:out_pos + part_frames] = chunk_part
+
+            self.audio_thread_current_frame += part_frames
+            self._current_playback_frame_for_display = self.audio_thread_current_frame
+            frames_remaining -= part_frames
+            out_pos += part_frames
+
+        return output
 
     def _sd_callback(self, outdata, frames, time_info, status_obj):
         """Hybrid ring buffer + seamless loop audio callback for zero-latency transitions"""

@@ -29,15 +29,17 @@ class DeckExecutorAdapter(ActionExecutor):
         
         # Engine-level commands that should be routed to the engine
         self._engine_commands = {'crossfade', 'bpm_match'}
-        
+
         # Map action types to deck methods
         self._action_methods = {
             'play': self._execute_play,
-            'pause': self._execute_pause, 
+            'pause': self._execute_pause,
             'stop': self._execute_stop,
             'seek': self._execute_seek,
             'set_volume': self._execute_set_volume,
-            'set_tempo': self._execute_set_tempo
+            'set_tempo': self._execute_set_tempo,
+            'activate_loop': self._execute_activate_loop,
+            'deactivate_loop': self._execute_deactivate_loop
         }
         
         # Validate deck has basic required methods
@@ -247,6 +249,33 @@ class DeckExecutorAdapter(ActionExecutor):
                 
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error setting tempo: {e}")
+            return False
+
+    def _execute_activate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        """Execute activate_loop action"""
+        try:
+            start_at_beat = params.get('start_at_beat') or params.get('start_beat')
+            length_beats = params.get('length_beats')
+            repetitions = params.get('repetitions')
+
+            if start_at_beat is None or length_beats is None:
+                logger.error(f"Deck {self._deck_id}: Missing loop parameters")
+                return False
+
+            action_id = context.get('action_id')
+            return bool(self._deck.activate_loop(start_at_beat, length_beats, repetitions, action_id))
+
+        except Exception as e:
+            logger.error(f"Deck {self._deck_id}: Error activating loop: {e}")
+            return False
+
+    def _execute_deactivate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        """Execute deactivate_loop action"""
+        try:
+            self._deck.deactivate_loop()
+            return True
+        except Exception as e:
+            logger.error(f"Deck {self._deck_id}: Error deactivating loop: {e}")
             return False
     
     
