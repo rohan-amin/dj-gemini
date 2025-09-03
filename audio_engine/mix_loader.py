@@ -57,20 +57,31 @@ class MixConfigLoader:
             
             # Process all actions in the mix
             actions = mix_config.get('actions', [])
-            
+
             # Separate actions by trigger type
-            immediate_actions = [action for action in actions if self._is_immediate_action(action)]
-            beat_actions = [action for action in actions if self._is_beat_triggered_action(action)]
-            other_actions = [action for action in actions if not self._is_immediate_action(action) and 
-                           not self._is_beat_triggered_action(action)]
-            
-            logger.info(f"Found {len(immediate_actions)} immediate actions, {len(beat_actions)} beat-triggered actions, "
-                       f"and {len(other_actions)} other actions")
-            
+            immediate_actions = [a for a in actions if self._is_immediate_action(a)]
+            beat_actions = [a for a in actions if self._is_beat_triggered_action(a)]
+            loop_complete_actions = [a for a in actions if self._is_loop_complete_action(a)]
+            other_actions = [
+                a for a in actions
+                if not self._is_immediate_action(a)
+                and not self._is_beat_triggered_action(a)
+                and not self._is_loop_complete_action(a)
+            ]
+
+            logger.info(
+                "Found %d immediate actions, %d beat-triggered actions, %d loop-complete actions, and %d other actions",
+                len(immediate_actions),
+                len(beat_actions),
+                len(loop_complete_actions),
+                len(other_actions),
+            )
+
             # DEBUG: Show exactly which actions are in each category
-            logger.info(f"Immediate actions: {[action.get('action_id') for action in immediate_actions]}")
-            logger.info(f"Beat actions: {[action.get('action_id') for action in beat_actions]}")
-            logger.info(f"Other actions: {[action.get('action_id') for action in other_actions]}")
+            logger.info(f"Immediate actions: {[a.get('action_id') for a in immediate_actions]}")
+            logger.info(f"Beat actions: {[a.get('action_id') for a in beat_actions]}")
+            logger.info(f"Loop-complete actions: {[a.get('action_id') for a in loop_complete_actions]}")
+            logger.info(f"Other actions: {[a.get('action_id') for a in other_actions]}")
             
             # Execute immediate actions in proper order: load_track first, then play actions
             load_actions = [action for action in immediate_actions if action.get('command') == 'load_track']
@@ -97,13 +108,18 @@ class MixConfigLoader:
             for action in other_immediate:
                 self._execute_immediate_action(action)
             
-            # Pre-schedule all beat-triggered actions 
+            # Pre-schedule all beat-triggered actions
             self._schedule_beat_actions(beat_actions)
-            
+
+            # Register loop-complete actions with the engine for later dispatch
+            self._register_loop_complete_actions(loop_complete_actions)
+
             # Handle other trigger types (for now, just log them)
             for action in other_actions:
                 trigger = action.get('trigger', {})
-                logger.warning(f"Unsupported trigger type for action {action.get('action_id')}: {trigger.get('type')}")
+                logger.warning(
+                    f"Unsupported trigger type for action {action.get('action_id')}: {trigger.get('type')}"
+                )
             
             logger.info(f"Mix configuration loaded successfully: {len(self.scheduled_actions)} actions scheduled")
             return True
@@ -121,6 +137,11 @@ class MixConfigLoader:
         """Check if action is triggered by a beat event"""
         trigger = action.get('trigger', {})
         return trigger.get('type') == 'on_deck_beat'
+
+    def _is_loop_complete_action(self, action: dict) -> bool:
+        """Check if action should execute when a loop finishes"""
+        trigger = action.get('trigger', {})
+        return trigger.get('type') == 'on_loop_complete'
     
     
     def _execute_immediate_action(self, action: dict) -> None:
@@ -243,8 +264,33 @@ class MixConfigLoader:
                 
             except Exception as e:
                 logger.error(f"Error scheduling beat action {action.get('action_id')}: {e}")
-    
-    
+
+
+    def _register_loop_complete_actions(self, actions: List[dict]) -> None:
+        """Store loop-complete actions for dispatch when loops finish"""
+        for action in actions:
+            trigger = action.get('trigger', {})
+            deck_id = trigger.get('source_deck_id')
+            loop_action_id = trigger.get('loop_action_id')
+
+            if deck_id and loop_action_id:
+                self.engine._loop_completion_actions.setdefault(deck_id, {}).setdefault(
+                    loop_action_id, []
+                ).append(action)
+                logger.info(
+                    "Registered on_loop_complete action %s for deck %s loop %s",
+                    action.get('action_id'),
+                    deck_id,
+                    loop_action_id,
+                )
+            else:
+                logger.warning(
+                    "Invalid on_loop_complete trigger for action %s: %s",
+                    action.get('action_id'),
+                    trigger,
+                )
+
+
     def get_scheduled_actions(self) -> Dict[str, Any]:
         """Get information about all scheduled actions"""
         return self.scheduled_actions.copy()

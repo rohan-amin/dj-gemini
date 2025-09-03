@@ -176,15 +176,33 @@ class AudioEngine:
         # Could implement error recovery logic here
 
     def handle_loop_complete(self, deck_id: str, loop_action_id: str):
-        """Execute actions registered for a completed loop"""
+        """Dispatch actions registered for a completed loop"""
         actions = self._loop_completion_actions.get(deck_id, {}).pop(loop_action_id, [])
         if deck_id in self._loop_completion_actions and not self._loop_completion_actions[deck_id]:
             del self._loop_completion_actions[deck_id]
         for action in actions:
             try:
-                self._execute_action(action)
+                # Prefer scheduling via EventScheduler so actions run on the main
+                # dispatch thread. However, the scheduler may exist but not be
+                # running (e.g. when operating in frame-accurate mode). In that
+                # case the queued action would never execute, so fall back to
+                # direct execution.
+                if self.event_scheduler and self.event_scheduler.is_running():
+                    self.event_scheduler.schedule_immediate_action(action)
+                    logger.info(
+                        "handle_loop_complete: scheduled action %s via EventScheduler",
+                        action.get("action_id"),
+                    )
+                else:
+                    logger.info(
+                        "handle_loop_complete: executing action %s directly (scheduler inactive)",
+                        action.get("action_id"),
+                    )
+                    self._execute_action(action)
             except Exception as e:
-                logger.error(f"Error executing loop completion action {action.get('action_id')}: {e}")
+                logger.error(
+                    f"Error executing loop completion action {action.get('action_id')}: {e}"
+                )
 
     def _validate_action(self, action, action_index):
         command = action.get("command")
