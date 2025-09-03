@@ -60,9 +60,12 @@ class AudioEngine:
         
         # Event-driven architecture replaces old polling system
         self._all_actions_from_script = []
-        self.is_processing_script_actions = False 
-        
-        self._script_start_time = 0 
+        self.is_processing_script_actions = False
+
+        self._script_start_time = 0
+
+        # Mapping of loop completions to pending actions
+        self._loop_completion_actions = {}
         
         logger.debug("AudioEngine - Initialized.")
         
@@ -108,11 +111,12 @@ class AudioEngine:
         
         # Register handlers for deck-specific commands
         deck_commands = [
-            "load_track", "play", "pause", "stop", "seek_and_play", 
+            "load_track", "play", "pause", "stop", "seek_and_play",
             "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume",
             "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample",
             "set_stem_eq", "enable_stem_eq", "set_stem_volume",
-            "set_master_eq", "set_all_stem_eq"
+            "set_master_eq", "set_all_stem_eq",
+            "activate_loop", "deactivate_loop"
         ]
         
         for command in deck_commands:
@@ -171,6 +175,17 @@ class AudioEngine:
         logger.error(f"Event scheduler error: {error}")
         # Could implement error recovery logic here
 
+    def handle_loop_complete(self, deck_id: str, loop_action_id: str):
+        """Execute actions registered for a completed loop"""
+        actions = self._loop_completion_actions.get(deck_id, {}).pop(loop_action_id, [])
+        if deck_id in self._loop_completion_actions and not self._loop_completion_actions[deck_id]:
+            del self._loop_completion_actions[deck_id]
+        for action in actions:
+            try:
+                self._execute_action(action)
+            except Exception as e:
+                logger.error(f"Error executing loop completion action {action.get('action_id')}: {e}")
+
     def _validate_action(self, action, action_index):
         command = action.get("command")
         action_id_for_log = action.get('action_id', f"action_idx_{action_index+1}")
@@ -197,13 +212,19 @@ class AudioEngine:
             if not source_deck_id_val or not isinstance(beat_number_val, (int, float)):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
                 return False
+        elif trigger_type == "on_loop_complete":
+            source_deck_id_val = trigger.get("source_deck_id")
+            loop_action_id_val = trigger.get("loop_action_id")
+            if not source_deck_id_val or not loop_action_id_val:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' or 'loop_action_id'.")
+                return False
         elif trigger_type == "script_start":
-            pass 
+            pass
         else:
-            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
+            logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat', 'on_loop_complete'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq", "activate_loop", "deactivate_loop"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
@@ -300,6 +321,20 @@ class AudioEngine:
             except (ValueError, TypeError):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'fade_eq' parameters not valid numbers. Params: {params}")
                 return False
+        elif command == "activate_loop":
+            params = action.get("parameters", {})
+            if params.get("start_at_beat") is None or params.get("length_beats") is None:
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' missing 'start_at_beat' or 'length_beats'.")
+                return False
+            if "repetitions" in params:
+                try:
+                    reps = int(params["repetitions"])
+                    if reps < 1:
+                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'repetitions' must be positive.")
+                        return False
+                except (ValueError, TypeError):
+                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'repetitions' must be integer.")
+                    return False
 
         elif command == "set_stem_eq":
             params = action.get("parameters", {})
@@ -936,8 +971,16 @@ class AudioEngine:
                 logger.debug(f"AudioEngine - Scheduled beat action {event_id} for deck {source_deck_id} beat {target_beat} (BeatManager)")
             else:
                 logger.error(f"Invalid on_deck_beat trigger: {trigger}")
-                
-            
+
+        elif trigger_type == "on_loop_complete":
+            source_deck_id = trigger.get("source_deck_id")
+            loop_action_id = trigger.get("loop_action_id")
+            if source_deck_id and loop_action_id:
+                self._loop_completion_actions.setdefault(source_deck_id, {}).setdefault(loop_action_id, []).append(action)
+                logger.debug(f"AudioEngine - Registered on_loop_complete action for deck {source_deck_id} loop {loop_action_id}")
+            else:
+                logger.error(f"Invalid on_loop_complete trigger: {trigger}")
+
         else:
             logger.warning(f"Unknown trigger type: {trigger_type}")
 
@@ -1109,6 +1152,23 @@ class AudioEngine:
                     deck.stop_at_beat(beat_number)
                 except ValueError:
                     logger.warning(f"Invalid 'beat_number' value for 'stop_at_beat': {parameters['beat_number']}. Skipping.")
+
+            elif command == "activate_loop":
+                if not deck_id: logger.warning("activate_loop missing deck_id. Skipping."); return False
+                deck = self._get_or_create_deck(deck_id)
+                start_beat = float(parameters.get("start_at_beat"))
+                length_beats = float(parameters.get("length_beats"))
+                repetitions = parameters.get("repetitions")
+                action_id = action_dict.get("action_id")
+                deck.activate_loop(start_beat, length_beats, repetitions, action_id)
+                return False
+
+            elif command == "deactivate_loop":
+                if not deck_id: logger.warning("deactivate_loop missing deck_id. Skipping."); return False
+                deck = self._get_or_create_deck(deck_id)
+                deck.deactivate_loop()
+                return False
+
 
                 
             
