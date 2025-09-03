@@ -10,7 +10,7 @@ from ..interfaces.scheduling_interfaces import ScheduledAction
 from .frame_queue import PriorityFrameQueue
 from .action_scheduler import MusicalActionScheduler
 from .tempo_controller import TempoController
-from ..execution.action_executor import CompositeActionExecutor, LoopActionExecutor, PlaybackActionExecutor
+from ..execution.action_executor import CompositeActionExecutor, PlaybackActionExecutor
 from ..adapters.beat_manager_adapter import BeatManagerAdapter
 from ..adapters.deck_executor_adapter import DeckExecutorAdapter
 
@@ -59,8 +59,6 @@ class MusicalTimingSystem:
         self._initialized = True
         self._processing_enabled = True
         
-        # Loop completion system
-        self._loop_completion_actions = {}  # loop_action_id -> [actions_to_trigger]
         
         logger.info(f"MusicalTimingSystem initialized for deck {self._deck_id}")
     
@@ -74,7 +72,7 @@ class MusicalTimingSystem:
         
         Args:
             beat_number: Musical beat number where action should execute (1-based)
-            action_type: Type of action ('activate_loop', 'play', 'stop', etc.)
+            action_type: Type of action ('play', 'stop', etc.)
             parameters: Action-specific parameters
             action_id: Optional unique identifier (auto-generated if None)
             priority: Action priority (lower number = higher priority)
@@ -139,130 +137,7 @@ class MusicalTimingSystem:
             logger.error(f"Deck {self._deck_id}: Error cancelling action {action_id}: {e}")
             return False
     
-    def register_loop_completion_action(self, loop_action_id: str, action_type: str, 
-                                      parameters: Dict[str, Any], action_id: str, 
-                                      target_deck_id: Optional[str] = None, priority: int = 0) -> None:
-        """
-        Register an action to be executed when a specific loop completes.
-        
-        Args:
-            loop_action_id: ID of the loop action to wait for completion
-            action_type: Type of action to execute when loop completes
-            parameters: Action-specific parameters
-            action_id: Unique identifier for this dependent action
-            target_deck_id: Deck to execute action on (defaults to this deck)
-            priority: Action priority
-        """
-        if not self._initialized:
-            logger.error(f"Deck {self._deck_id}: Cannot register loop completion action - system not initialized")
-            return
-        
-        if loop_action_id not in self._loop_completion_actions:
-            self._loop_completion_actions[loop_action_id] = []
-        
-        completion_action = {
-            'action_id': action_id,
-            'action_type': action_type,
-            'parameters': parameters,
-            'target_deck_id': target_deck_id or self._deck_id,
-            'priority': priority
-        }
-        
-        self._loop_completion_actions[loop_action_id].append(completion_action)
-        
-        logger.info(f"🔗 Deck {self._deck_id}: Registered loop completion action {action_id} for loop {loop_action_id}")
-        logger.info(f"🔗 Action details: {action_type} on {target_deck_id or self._deck_id} with params {parameters}")
-        logger.info(f"🔗 Total completion actions registered: {len(self._loop_completion_actions)}")
     
-    def handle_loop_completion(self, loop_action_id: str) -> int:
-        """
-        Handle loop completion by triggering all dependent actions.
-        
-        Args:
-            loop_action_id: ID of the loop that just completed
-            
-        Returns:
-            Number of actions triggered
-        """
-        logger.info(f"🔄 Deck {self._deck_id}: handle_loop_completion called for loop {loop_action_id}")
-        logger.info(f"🔄 System state: initialized={self._initialized}, processing_enabled={self._processing_enabled}")
-        logger.info(f"🔄 Registered completion loops: {list(self._loop_completion_actions.keys())}")
-        
-        if not self._initialized or not self._processing_enabled:
-            logger.warning(f"Deck {self._deck_id}: Loop completion handling disabled")
-            return 0
-        
-        if loop_action_id not in self._loop_completion_actions:
-            logger.warning(f"Deck {self._deck_id}: No completion actions registered for loop {loop_action_id}")
-            logger.warning(f"Available loop completion actions: {list(self._loop_completion_actions.keys())}")
-            return 0
-        
-        actions = self._loop_completion_actions[loop_action_id]
-        triggered_count = 0
-        
-        logger.info(f"🔄 Deck {self._deck_id}: Processing {len(actions)} completion actions for {loop_action_id} simultaneously")
-        
-        for completion_action in actions:
-            try:
-                action_id = completion_action['action_id']
-                action_type = completion_action['action_type'] 
-                parameters = completion_action['parameters']
-                target_deck_id = completion_action['target_deck_id']
-                priority = completion_action['priority']
-                
-                logger.info(f"🔄 Deck {self._deck_id}: Loop {loop_action_id} completed - triggering action {action_id}")
-                
-                # Create execution context for both same-deck and cross-deck actions
-                execution_context = {
-                    'action_id': action_id,
-                    'trigger_type': 'loop_completion',
-                    'source_loop_id': loop_action_id,
-                    'target_frame': 0  # Immediate execution
-                }
-                
-                # If action targets this deck, queue command via command queue system
-                if target_deck_id == self._deck_id:
-                    # PROPER QUEUE-BASED APPROACH: All loop actions go through command queue
-                    success = self._queue_completion_command(action_type, parameters, action_id)
-                    if success:
-                        triggered_count += 1
-                        logger.info(f"✅ Deck {self._deck_id}: Queued completion command {action_id}")
-                    else:
-                        logger.error(f"❌ Deck {self._deck_id}: Failed to queue completion command {action_id}")
-                else:
-                    # Action targets different deck - use clean command queue approach
-                    try:
-                        engine = None
-                        if hasattr(self._deck, 'engine'):
-                            engine = self._deck.engine
-                        
-                        if engine:
-                            target_deck = engine._get_or_create_deck(target_deck_id)
-                            if target_deck and hasattr(target_deck, 'musical_timing_system') and target_deck.musical_timing_system:
-                                # Queue command on target deck's command queue
-                                target_success = target_deck.musical_timing_system._queue_completion_command(
-                                    action_type, parameters, action_id
-                                )
-                                if target_success:
-                                    triggered_count += 1
-                                    logger.info(f"✅ Deck {self._deck_id}: Cross-deck completion command {action_id} queued on {target_deck_id}")
-                                else:
-                                    logger.error(f"❌ Deck {self._deck_id}: Failed to queue cross-deck completion command {action_id} on {target_deck_id}")
-                            else:
-                                logger.error(f"Deck {self._deck_id}: Target deck {target_deck_id} not found or no musical timing system")
-                        else:
-                            logger.error(f"Deck {self._deck_id}: No engine reference for cross-deck action {action_id}")
-                    except Exception as cross_deck_error:
-                        logger.error(f"Deck {self._deck_id}: Error in cross-deck command queuing for {action_id}: {cross_deck_error}")
-                    
-            except Exception as e:
-                logger.error(f"Deck {self._deck_id}: Error executing completion action {completion_action['action_id']}: {e}")
-        
-        # Remove the completed loop's actions since they've been triggered
-        del self._loop_completion_actions[loop_action_id]
-        
-        logger.info(f"Deck {self._deck_id}: Loop completion processed - triggered {triggered_count} actions for loop {loop_action_id}")
-        return triggered_count
     
     def process_audio_buffer(self, start_frame: int, end_frame: int) -> Dict[str, Any]:
         """
@@ -404,8 +279,6 @@ class MusicalTimingSystem:
                 'tempo_controller': tempo_stats,
                 'action_executor': executor_stats,
                 'beat_converter': beat_converter_info,
-                'loop_completion_actions': len(self._loop_completion_actions),
-                'pending_loop_completions': list(self._loop_completion_actions.keys()),
                 'timestamp': time.time()
             }
             
@@ -468,13 +341,12 @@ class MusicalTimingSystem:
             # Import deck command constants
             from ..deck import DECK_CMD_STOP, DECK_CMD_PLAY, DECK_CMD_PAUSE, DECK_CMD_SEEK
             
-            # Map action types to deck command constants (loop commands removed)
+            # Map action types to deck command constants
             command_mapping = {
                 'stop': DECK_CMD_STOP,
                 'play': DECK_CMD_PLAY,
                 'pause': DECK_CMD_PAUSE,
                 'seek': DECK_CMD_SEEK
-                # activate_loop removed - will be reimplemented with new architecture
             }
             
             if action_type not in command_mapping:
@@ -488,15 +360,6 @@ class MusicalTimingSystem:
                 # Format parameters for specific commands
                 if action_type == 'stop':
                     self._deck.command_queue.put((deck_command, None))
-                elif action_type == 'activate_loop':
-                    # Convert to format expected by deck command handler
-                    command_data = {
-                        'start_beat': parameters.get('start_at_beat'),
-                        'length_beats': parameters.get('length_beats'),
-                        'repetitions': parameters.get('repetitions'),
-                        'action_id': action_id
-                    }
-                    self._deck.command_queue.put((deck_command, command_data))
                 else:
                     # Generic parameter passing
                     self._deck.command_queue.put((deck_command, parameters))

@@ -1,5 +1,5 @@
 # dj-gemini/audio_engine/deck.py
-# Hybrid Ring Buffer + Professional EQ + Seamless Loop Architecture
+# Hybrid Ring Buffer + Professional EQ Architecture
 
 import os
 import threading
@@ -22,11 +22,8 @@ from config import EQ_SMOOTHING_MS
 from .realtime_tempo import create_realtime_tempo_processor
 from .ring_buffer import RingBuffer as ExternalRingBuffer
 from .professional_eq import ToneEQ3, IsolatorEQ
-# REMOVED: Legacy LoopManager import - using frame-accurate system only
 from .beat_manager import BeatManager
 from .scheduling.musical_timing_system import MusicalTimingSystem
-from .loop.loop_controller import LoopController
-from .adapters.beat_manager_adapter import BeatManagerAdapter
 
 # Check for RubberBand availability
 try:
@@ -60,7 +57,6 @@ DECK_CMD_PLAY = "PLAY"
 DECK_CMD_PAUSE = "PAUSE"
 DECK_CMD_STOP = "STOP"   
 DECK_CMD_SEEK = "SEEK" 
-# Loop management commands removed - will be reimplemented with new architecture
 DECK_CMD_SHUTDOWN = "SHUTDOWN"
 DECK_CMD_STOP_AT_BEAT = "STOP_AT_BEAT"
 DECK_CMD_SET_TEMPO = "SET_TEMPO"
@@ -251,7 +247,6 @@ class Deck:
         self._producer_running = False
         self._producer_stop_event = threading.Event()
         
-        # Loop state management removed - will be reimplemented with new architecture
         
         # === PROFESSIONAL STEREO EQ SYSTEM ===
         # Per-stem tone EQs for musical shaping (stereo)
@@ -294,8 +289,6 @@ class Deck:
         self._is_actually_playing_stream_state = False 
         self.seek_in_progress_flag = False 
 
-                # === REMOVED: Legacy loop manager initialization ===
-        # Now using frame-accurate loop system only
         
         # === CENTRALIZED BEAT MANAGEMENT ===
         self.beat_manager = BeatManager(self)
@@ -308,25 +301,12 @@ class Deck:
             logger.error(f"Deck {self.deck_id} - Failed to initialize musical timing system: {e}")
             self.musical_timing_system = None
         
-        # === LOOP MANAGEMENT SYSTEM (Centralized Loop Controller) ===
-        try:
-            # Create beat manager adapter for the loop controller
-            self.beat_manager_adapter = BeatManagerAdapter(self.beat_manager)
-            
-            # Initialize the centralized loop controller
-            self.loop_controller = LoopController(self, self.beat_manager_adapter)
-            logger.info(f"Deck {self.deck_id} - Loop management system initialized")
-        except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Failed to initialize loop management system: {e}")
-            self.loop_controller = None
-            self.beat_manager_adapter = None
         
         # Note: Engine reference will be set when deck is added to engine
         
         # --- Synchronized beat state (DEPRECATED - use beat_manager instead) ---
         self._last_synchronized_beat = 0
 
-        # Loop queue handled by LoopManager
 
         # Add tempo state
         self._playback_tempo = 1.0  # 1.0 = original speed
@@ -400,8 +380,6 @@ class Deck:
         self._pending_phase_offset_beats = 0.0
         self._phase_offset_applied = False
 
-        self.enable_hard_seek_on_loop = True  # PATCH: Toggle for hard seek buffer zeroing on loop activation
-        self._just_activated_loop_flush_count = 0  # PATCH: For double-flush after loop activation
 
         # --- Scratch state (isolated) ---
         self._scratch_active = False
@@ -480,7 +458,7 @@ class Deck:
         Clear ring buffer to prevent audio artifacts during position jumps.
         
         This is critical for preventing "double beat" and other artifacts when:
-        - Loop activation causes immediate position jumps
+        - Position jumps cause immediate changes
         - Seeking to new positions
         - Starting playback at specific beats
         """
@@ -497,25 +475,20 @@ class Deck:
         else:
             logger.debug(f"Deck {self.deck_id} - Ring buffer clear requested for {reason} but no ring buffer active")
 
-    def _reset_rubberband_for_position_jump(self, is_loop_jump: bool = False):
+    def _reset_rubberband_for_position_jump(self):
         """
         Reset RubberBand stretcher for position jumps to prevent audio artifacts.
         
-        When the audio position jumps (seek or loop jump), the RubberBand stretcher
+        When the audio position jumps (seek), the RubberBand stretcher
         needs to be reset because it expects sequential audio input. Without this
         reset, the stretcher produces silence or corrupted audio.
-        
-        Args:
-            is_loop_jump: True if this is a loop jump (for logging)
         """
         try:
             with self._rb_lock:
                 if hasattr(self, 'rubberband_stretcher') and self.rubberband_stretcher:
                     # Reset the stretcher to clean state
                     self.rubberband_stretcher.reset()
-                    
-                    jump_type = "loop jump" if is_loop_jump else "position jump"
-                    logger.info(f"Deck {self.deck_id} - RubberBand stretcher reset for {jump_type}")
+                    logger.info(f"Deck {self.deck_id} - RubberBand stretcher reset for position jump")
                 else:
                     logger.debug(f"Deck {self.deck_id} - No RubberBand stretcher to reset")
         except Exception as e:
@@ -1016,7 +989,7 @@ class Deck:
             return False
         
         if self.bpm <= 0: 
-            logger.warning(f"Deck {self.deck_id} - BPM is {self.bpm}. Beat-length loops require a positive BPM.")
+            logger.warning(f"Deck {self.deck_id} - BPM is {self.bpm}. Beat-length calculations require a positive BPM.")
 
         # Store the ORIGINAL beat positions (before any tempo changes)
         self.original_beat_positions = {}
@@ -1085,7 +1058,6 @@ class Deck:
         with self._stream_lock:
             self._current_playback_frame_for_display = 0 
             self._user_wants_to_play = False 
-            # Loop state handled by LoopManager 
         
         # Initialize real-time tempo processor
         if self._use_realtime_tempo:
@@ -1149,24 +1121,7 @@ class Deck:
                         self._pending_frame_actions.get_nowait()
                         
                         try:
-                            if action['type'] == 'activate_loop':
-                                # Execute loop activation directly in audio thread context
-                                loop_data = action['data']
-                                # Legacy loop_manager call removed - using frame-accurate system only
-                                logger.debug(f"Deck {self.deck_id} - Loop repetition handled by frame-accurate system")
-                                success = True
-                                if success:
-                                    logger.info(f"Deck {self.deck_id} - Frame-accurate loop activated at frame {current_frame} (target: {target_frame})")
-                                else:
-                                    logger.warning(f"Deck {self.deck_id} - Frame-accurate loop activation failed at frame {current_frame}")
-                            
-                            elif action['type'] == 'loop_repetition_complete':
-                                # Execute loop repetition completion directly in audio thread context
-                                completion_data = action['data']
-                                # Legacy loop_manager call removed - completion handled by frame-accurate system
-                                logger.debug(f"Deck {self.deck_id} - Loop completion handled by frame-accurate system")
-                                logger.info(f"Deck {self.deck_id} - Frame-accurate loop repetition {completion_data['repetition']}/{completion_data['total_repetitions']} completed at frame {current_frame}")
-                            
+                            # Handle actions here (currently none implemented)
                             executed_actions.append((target_frame, action['type']))
                             
                         except Exception as e:
@@ -1290,7 +1245,6 @@ class Deck:
         with self._stream_lock:
             self._user_wants_to_play = False
             self._current_playback_frame_for_display = 0 
-            # Loop state handled by LoopManager 
         self.command_queue.put((DECK_CMD_STOP, None))
 
     def seek(self, target_frame): 
@@ -1302,114 +1256,9 @@ class Deck:
             self._current_playback_frame_for_display = valid_target_frame
             if was_playing_intent: 
                 self.seek_in_progress_flag = True
-            # Loop state handled by LoopManager 
         self.command_queue.put((DECK_CMD_SEEK, {'frame': valid_target_frame, 
                                                'was_playing_intent': was_playing_intent}))
 
-    def seek_for_loop_jump(self, target_frame: int) -> bool:
-        """
-        Optimized seek specifically for loop jump-backs that maintains
-        audio continuity without restart artifacts.
-        
-        This method coordinates proper audio pipeline state management
-        including RubberBand stretcher reset and ring buffer clearing
-        while avoiding the startup artifacts of regular seeks.
-        
-        Args:
-            target_frame: Target frame position for the loop jump
-            
-        Returns:
-            True if the seek was successful
-        """
-        logger.info(f"Deck {self.deck_id} - Loop-optimized seek to frame {target_frame}")
-        
-        valid_target_frame = max(0, min(target_frame, self.total_frames - 1 if self.total_frames > 0 else 0))
-        
-        with self._stream_lock:
-            # Update display position immediately for UI responsiveness
-            self._current_playback_frame_for_display = valid_target_frame
-            
-        # Use command queue for proper audio thread coordination
-        # Add loop_jump flag to distinguish from regular seeks
-        self.command_queue.put((DECK_CMD_SEEK, {
-            'frame': valid_target_frame, 
-            'was_playing_intent': True,  # Always continue playing for loop jumps
-            'is_loop_jump': True  # Flag to avoid restart artifacts
-        }))
-        
-        return True
-
-    def _perform_seamless_loop_jump_in_stream(self, target_frame: int) -> bool:
-        """
-        Perform a seamless loop jump within the existing audio stream without restart.
-        
-        This method coordinates the audio pipeline (RubberBand + ring buffer) 
-        synchronously to avoid the stream restart that seek_for_loop_jump causes.
-        
-        Args:
-            target_frame: Target frame position for the loop jump
-            
-        Returns:
-            True if the jump was successful
-        """
-        logger.info(f"Deck {self.deck_id} - Seamless in-stream loop jump to frame {target_frame}")
-        
-        valid_target_frame = max(0, min(target_frame, self.total_frames - 1 if self.total_frames > 0 else 0))
-        
-        try:
-            with self._stream_lock:
-                # 1. Clear ring buffer immediately to prevent old audio artifacts
-                if self.out_ring:
-                    frames_cleared = self.out_ring.available_read()
-                    self.out_ring.clear()
-                    logger.info(f"Deck {self.deck_id} - Ring buffer cleared for seamless jump ({frames_cleared} frames)")
-
-                # 2. Reset RubberBand stretcher to handle position discontinuity
-                self._reset_rubberband_for_position_jump(is_loop_jump=True)
-
-                # 3. Update position atomically
-                old_frame = self.audio_thread_current_frame
-                self.audio_thread_current_frame = valid_target_frame
-                self._current_playback_frame_for_display = valid_target_frame
-
-                # Keep beat tracking aligned with the new position
-                self.beat_manager.update_from_frame(
-                    self.audio_thread_current_frame, self.audio_thread_sample_rate
-                )
-
-                # 4. Clear any pending audio data to prevent artifacts
-                if hasattr(self, '_pending_out') and self._pending_out is not None:
-                    self._pending_out = None
-
-                # Mark producer to refill buffer after jump
-                if hasattr(self, '_producer_startup_mode'):
-                    self._producer_startup_mode = True
-
-            # --- Lock released before priming ring buffer ---
-            prefilled = 0
-            TARGET_BLOCK = 4096
-            # Ensure at least one callback block (two TARGET_BLOCK chunks) is ready
-            prefill_target = min(self.RING_BUFFER_SIZE, TARGET_BLOCK * 2)
-            while self.out_ring and prefilled < prefill_target:
-                chunk_size = min(TARGET_BLOCK, prefill_target - prefilled)
-                prefill = self._produce_chunk_rubberband(chunk_size)
-                if prefill is None:
-                    break
-                self.out_ring.write(prefill)
-                prefilled += len(prefill)
-
-            # Ensure buffer has data before continuing
-            if self.out_ring:
-                self._wait_for_ring_buffer_ready()
-
-            logger.info(f"Deck {self.deck_id} - Seamless jump: {old_frame} → {valid_target_frame} (no restart)")
-            return True
-
-        except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Error in seamless loop jump: {e}")
-            return False
-
-    # Loop management methods removed - will be reimplemented with new architecture
 
     def stop_at_beat(self, beat_number):
         """Stop playback when reaching a specific beat"""
@@ -1451,7 +1300,7 @@ class Deck:
         
         Args:
             beat_number: Musical beat number where action should execute (1-based)
-            action_type: Type of action ('play', 'pause', 'stop', 'activate_loop', etc.)
+            action_type: Type of action ('play', 'pause', 'stop', etc.)
             parameters: Action-specific parameters (optional)
             action_id: Optional unique identifier (auto-generated if None)
             priority: Action priority (lower number = higher priority)
@@ -1460,8 +1309,8 @@ class Deck:
             Action ID for cancellation/tracking, or empty string if failed
             
         Example:
-            # Schedule loop activation at beat 32
-            action_id = deck.schedule_musical_action(32.0, 'activate_loop', {
+            # Schedule action at beat 32
+            action_id = deck.schedule_musical_action(32.0, 'custom_action', {
                 'start_at_beat': 32.0,
                 'length_beats': 8.0,
                 'repetitions': 4
@@ -1525,152 +1374,7 @@ class Deck:
         
         return self.musical_timing_system.get_system_stats()
 
-    # === LOOP MANAGEMENT METHODS ===
     
-    def create_loop(self, action_id: str, start_beat: float, end_beat: float, iterations: int) -> bool:
-        """
-        Create a new loop definition.
-        
-        Args:
-            action_id: Unique identifier for this loop
-            start_beat: Loop start position in beats (1-based)
-            end_beat: Loop end position in beats (1-based)
-            iterations: Number of times to repeat the loop
-            
-        Returns:
-            True if loop was created successfully
-        """
-        if not hasattr(self, 'loop_controller') or not self.loop_controller:
-            logger.error(f"Deck {self.deck_id} - Loop controller not available")
-            return False
-        
-        return self.loop_controller.create_loop(action_id, start_beat, end_beat, iterations)
-    
-    def activate_loop(self, action_id: str, start_at_beat: float = None) -> bool:
-        """
-        Activate a loop, starting its playback cycle.
-        
-        Args:
-            action_id: ID of the loop to activate
-            start_at_beat: Optional beat to start the loop at (None = immediate)
-            
-        Returns:
-            True if loop was activated successfully
-        """
-        if not hasattr(self, 'loop_controller') or not self.loop_controller:
-            logger.error(f"Deck {self.deck_id} - Loop controller not available")
-            return False
-        
-        return self.loop_controller.activate_loop(action_id, start_at_beat)
-    
-    def cancel_loop(self, action_id: str) -> bool:
-        """
-        Cancel a loop (remove it from registry).
-        
-        Args:
-            action_id: ID of loop to cancel
-            
-        Returns:
-            True if loop was found and cancelled
-        """
-        if not hasattr(self, 'loop_controller') or not self.loop_controller:
-            return False
-        
-        return self.loop_controller.cancel_loop(action_id)
-    
-    def get_loop_stats(self) -> dict:
-        """
-        Get loop controller statistics.
-        
-        Returns:
-            Dictionary with loop statistics
-        """
-        if not hasattr(self, 'loop_controller') or not self.loop_controller:
-            return {'error': 'Loop controller not available'}
-        
-        return self.loop_controller.get_stats()
-    
-    def get_active_loops(self) -> dict:
-        """
-        Get all currently active loops.
-        
-        Returns:
-            Dictionary mapping action_id to LoopState
-        """
-        if not hasattr(self, 'loop_controller') or not self.loop_controller:
-            return {}
-        
-        return self.loop_controller.get_active_loops()
-    
-# Phase 7 loop configuration methods removed - using existing action-based format
-    
-    def _handle_loop_event(self, event: dict) -> None:
-        """
-        Handle loop events from the loop controller.
-        
-        This method processes loop lifecycle events (iterations, completions, errors)
-        and coordinates with other systems like the musical timing system for
-        completion actions.
-        
-        Args:
-            event: Event dictionary from loop controller
-        """
-        try:
-            event_type = event.get('type')
-            action_id = event.get('action_id', 'unknown')
-            
-            if event_type == 'iteration':
-                # Log loop iteration for monitoring
-                iteration = event.get('iteration', 0)
-                total = event.get('total_iterations', 0)
-                logger.debug(f"🔄 Deck {self.deck_id} - Loop {action_id} iteration {iteration}/{total}")
-                
-                # Update any UI or monitoring systems if needed
-                self._notify_loop_iteration(action_id, iteration, total)
-                
-            elif event_type == 'completion':
-                # Handle loop completion
-                total_iterations = event.get('total_iterations', 0)
-                logger.info(f"🔄 Deck {self.deck_id} - Loop {action_id} completed - {total_iterations} iterations")
-                
-                # Trigger completion actions through musical timing system
-                if hasattr(self, 'musical_timing_system') and self.musical_timing_system:
-                    try:
-                        self.musical_timing_system.handle_loop_completion(action_id)
-                    except Exception as e:
-                        logger.error(f"Deck {self.deck_id} - Error handling loop completion in musical timing system: {e}")
-                
-                # Update any UI or monitoring systems
-                self._notify_loop_completion(action_id, total_iterations)
-                
-            # REMOVED: jump_back event handling - now using proper deck.seek() coordination
-            # The loop controller now uses deck.seek() which properly coordinates with producer thread
-            
-            elif event_type == 'error':
-                # Handle loop errors
-                error_msg = event.get('error', 'Unknown error')
-                logger.error(f"🔄 Deck {self.deck_id} - Loop {action_id} error: {error_msg}")
-                
-                # Notify error handling systems
-                self._notify_loop_error(action_id, error_msg)
-                
-            else:
-                logger.warning(f"🔄 Deck {self.deck_id} - Unknown loop event type: {event_type}")
-        
-        except Exception as e:
-            logger.error(f"Deck {self.deck_id} - Error handling loop event: {e}")
-    
-    def _notify_loop_iteration(self, action_id: str, iteration: int, total: int) -> None:
-        """Notify systems about loop iteration (can be extended for UI updates)."""
-        pass  # Placeholder for future UI integration
-    
-    def _notify_loop_completion(self, action_id: str, total_iterations: int) -> None:
-        """Notify systems about loop completion (can be extended for UI updates)."""
-        pass  # Placeholder for future UI integration
-    
-    def _notify_loop_error(self, action_id: str, error_msg: str) -> None:
-        """Notify systems about loop errors (can be extended for error handling)."""
-        pass  # Placeholder for future error handling integration
 
     def _get_tempo_cache_filepath(self, target_bpm):
         """Generate cache filepath for tempo-processed audio using new structure"""
@@ -1805,7 +1509,7 @@ class Deck:
             logger.info(f"Deck {self.deck_id} - MAIN THREAD: Pitch shift applied successfully! Audio now playing at new pitch.")
 
     def _scale_beat_positions(self, tempo_ratio):
-        """Scale all beat positions, cue points, and loop positions to match the new tempo"""
+        """Scale all beat positions and cue points to match the new tempo"""
         logger.debug(f"Deck {self.deck_id} - Scaling positions by tempo ratio {tempo_ratio:.3f}")
         
         # Scale beat timestamps - FIXED: use original timestamps to avoid cumulative scaling
@@ -2165,7 +1869,6 @@ class Deck:
                         self.audio_thread_total_samples = data['total_frames'] 
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0
-                        # Loop state handled by LoopManager
                     
                     # Initialize RubberBand stretcher for consistent audio processing
                     if RUBBERBAND_STREAMING_AVAILABLE:
@@ -2175,12 +1878,7 @@ class Deck:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Audio data set internally for playback.")
 
                 elif command == DECK_CMD_PLAY:
-                    is_loop_continuation = data.get('is_loop_continuation', False)
-                    
-                    if is_loop_continuation:
-                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY for loop continuation")
-                    else:
-                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY")
+                    logger.debug(f"Deck {self.deck_id} AudioThread - Processing PLAY")
                         
                     with self._stream_lock: 
                         if self.audio_thread_data is None: 
@@ -2196,13 +1894,10 @@ class Deck:
                         
                         self._current_playback_frame_for_display = self.audio_thread_current_frame
 
-                        # For loop continuations, skip ring buffer clearing since it was already done in SEEK
-                        if not is_loop_continuation:
-                            # CRITICAL: Clear ring buffer for new stream to prevent artifacts
-                            self._clear_ring_buffer_for_position_jump("new stream creation")
+                        # CRITICAL: Clear ring buffer for new stream to prevent artifacts
+                        self._clear_ring_buffer_for_position_jump("new stream creation")
                         
-                        # For loop continuations, don't reset startup fade to avoid artifacts
-                        if not is_loop_continuation and hasattr(self, '_startup_fade_active'):
+                        if hasattr(self, '_startup_fade_active'):
                             self._startup_fade_active = False
                             logger.debug(f"Deck {self.deck_id} AudioThread - Startup fade reset for new stream.")
 
@@ -2267,7 +1962,6 @@ class Deck:
                         self.audio_thread_current_frame = 0 
                         self._current_playback_frame_for_display = 0 
                         self._is_actually_playing_stream_state = False
-                        # Loop state handled by LoopManager
                         
                         # Reset startup fade
                         if hasattr(self, '_startup_fade_active'):
@@ -2277,49 +1971,33 @@ class Deck:
                 elif command == DECK_CMD_SEEK:
                     new_frame = data['frame']
                     was_playing_intent = data['was_playing_intent']
-                    is_loop_jump = data.get('is_loop_jump', False)
                     
-                    if is_loop_jump:
-                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing LOOP JUMP to frame {new_frame}")
-                    else:
-                        logger.debug(f"Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
+                    logger.debug(f"Deck {self.deck_id} AudioThread - Processing SEEK to frame {new_frame}, was_playing_intent: {was_playing_intent}")
                     
                     with self._stream_lock:
                         # CRITICAL: Clear ring buffer on seek to prevent old audio artifacts
-                        self._clear_ring_buffer_for_position_jump("loop jump" if is_loop_jump else "seek operation")
+                        self._clear_ring_buffer_for_position_jump("seek operation")
                         
                         # CRITICAL: Reset RubberBand stretcher for position jumps
                         # This prevents the stretcher from expecting sequential audio
-                        self._reset_rubberband_for_position_jump(is_loop_jump)
+                        self._reset_rubberband_for_position_jump()
                         
                         self.audio_thread_current_frame = new_frame
                         self._current_playback_frame_for_display = new_frame 
                         self._user_wants_to_play = was_playing_intent 
-                        # Loop state handled by LoopManager
                         
-                        # For loop jumps, don't reset startup fade (avoid artifacts)
-                        # For regular seeks, reset startup fade as before
-                        if not is_loop_jump and hasattr(self, '_startup_fade_active'):
+                        # Reset startup fade for regular seeks
+                        if hasattr(self, '_startup_fade_active'):
                             self._startup_fade_active = False
                             
                     if was_playing_intent: 
-                        if is_loop_jump:
-                            # For loop jumps, re-queue PLAY but avoid startup artifacts
-                            # The audio thread coordinates the jump properly
-                            logger.debug(f"Deck {self.deck_id} AudioThread - LOOP JUMP: Re-queueing PLAY for seamless continuation")
-                            self.command_queue.put((DECK_CMD_PLAY, {
-                                'start_frame': new_frame,
-                                'is_loop_continuation': True  # Flag to avoid startup fade
-                            }))
-                        else:
-                            # For regular seeks, re-queue PLAY command as before
-                            logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
-                            self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
+                        # Re-queue PLAY command
+                        logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Re-queueing PLAY command.")
+                        self.command_queue.put((DECK_CMD_PLAY, {'start_frame': new_frame}))
                     else: 
                         with self._stream_lock: self._is_actually_playing_stream_state = False
                         logger.debug(f"Deck {self.deck_id} AudioThread - SEEK: Was paused, position updated.")
                 
-                # Loop command processing removed - will be reimplemented with new architecture
 
                 elif command == DECK_CMD_STOP_AT_BEAT:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing STOP_AT_BEAT")
@@ -2540,33 +2218,6 @@ class Deck:
                         except Exception as e:
                             logger.error(f"Deck {self.deck_id} - Error in musical timing system: {e}")
                     
-                    # === LOOP MANAGEMENT SYSTEM PROCESSING ===
-                    # Process active loops for frame-accurate iteration and completion detection
-                    if hasattr(self, 'loop_controller') and self.loop_controller:
-                        try:
-                            # Get current frame position for loop processing
-                            current_frame = int(self.audio_thread_current_frame)
-                            
-                            # Process all active loops for this frame
-                            loop_events = self.loop_controller.process_active_loops(current_frame)
-                            
-                            # Handle loop events (completions, iterations, errors)
-                            if loop_events:
-                                for event in loop_events:
-                                    self._handle_loop_event(event)
-                            
-                            # Periodic loop statistics logging (every 5000 chunks for less noise)
-                            if not hasattr(self, '_loop_stats_counter'):
-                                self._loop_stats_counter = 0
-                            self._loop_stats_counter += 1
-                            
-                            if self._loop_stats_counter % 5000 == 0:
-                                loop_stats = self.loop_controller.get_stats()
-                                if loop_stats.get('active_loops', 0) > 0:
-                                    logger.debug(f"Deck {self.deck_id} - Loop stats: {loop_stats}")
-                        
-                        except Exception as e:
-                            logger.error(f"Deck {self.deck_id} - Error in loop management system: {e}")
                         
                 except Exception as e:
                     logger.debug(f"Deck {self.deck_id} - Error updating BeatManager: {e}")
@@ -2700,9 +2351,7 @@ class Deck:
                 with self._stream_lock:
                     self._current_playback_frame_for_display = self.audio_thread_current_frame
                     
-                    # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
                     
-                    # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
                     
                     # Apply master isolator EQ
                     if self.master_isolator and processed_chunk is not None:
@@ -2908,18 +2557,10 @@ class Deck:
             with self._stream_lock:
                 self._current_playback_frame_for_display = end_frame
             
-            # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
-                # Loop boundaries handled by centralized LoopManager (no duplicate detection needed)
-                
-                # Loop start detection handled by centralized LoopManager
+                    
                 
                 # Check if we would cross the loop end frame with this chunk (only for active loops)
-                # Loop end detection handled by centralized LoopManager
-                    # Loop end detection handled by centralized LoopManager
-                    # Loop repetition handling moved to centralized LoopManager
-                    
-                    # Loop continuation logic moved to centralized LoopManager
-                    # Loop completion logic moved to centralized LoopManager
+                        
 
         # If stems are available, build mix from stems with per-stem EQ
         if self.stems_available and self.stem_data:
@@ -3122,13 +2763,6 @@ class Deck:
             except Exception as e:
                 logger.warning(f"Deck {self.deck_id} - Error cleaning up musical timing system: {e}")
         
-        # Clean up loop management system
-        if hasattr(self, 'loop_controller') and self.loop_controller:
-            try:
-                self.loop_controller.cleanup()
-                logger.debug(f"Deck {self.deck_id} - Loop management system cleaned up")
-            except Exception as e:
-                logger.warning(f"Deck {self.deck_id} - Error cleaning up loop management system: {e}")
         
         logger.debug(f"DEBUG: Deck {self.deck_id} - Shutdown complete.")
 
@@ -3226,8 +2860,8 @@ class Deck:
 
 
 if __name__ == '__main__':
-    # (Test block remains the same as the version that worked for you)
-    logger.debug("--- Deck Class Standalone Test (with Looping and Cue Points) ---")
+    # Test block - loop functionality removed
+    logger.debug("--- Deck Class Standalone Test (with Cue Points) ---")
     import sys
     CURRENT_DIR_OF_DECK_PY = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT_FOR_DECK_TEST = os.path.dirname(CURRENT_DIR_OF_DECK_PY) 
@@ -3248,7 +2882,7 @@ if __name__ == '__main__':
     test_file_name = "starships.mp3" 
     test_audio_file = os.path.join(app_config.AUDIO_TRACKS_DIR, test_file_name)
     dummy_cue_filepath = test_audio_file + ".cue" 
-    dummy_cue_data = { "intro_start": {"start_beat": 1}, "drop1": {"start_beat": 65}, "loop_point_beat_5": {"start_beat": 5} } 
+    dummy_cue_data = { "intro_start": {"start_beat": 1}, "drop1": {"start_beat": 65} } 
     try:
         with open(dummy_cue_filepath, 'w') as f: json.dump(dummy_cue_data, f, indent=4)
         logger.debug(f"DEBUG: Test - Created/Updated dummy cue file: {dummy_cue_filepath}")
@@ -3257,41 +2891,11 @@ if __name__ == '__main__':
     else:
         if deck.load_track(test_audio_file):
             logger.info(f"\nTrack loaded: {deck.deck_id}. BPM: {deck.bpm}, SR: {deck.sample_rate}")
-            if deck.bpm == 0: logger.warning("WARNING: BPM is 0, loop length calc will be incorrect.")
             logger.debug("\nPlaying from CUE 'intro_start'..."); deck.play(start_at_cue_name="intro_start")
-            time.sleep(0.2); logger.debug("Playing for ~2.0s to reach near beat 5..."); time.sleep(2.0) 
-            start_loop_beat = 5; loop_len_beats = 4; num_reps = 3
-            logger.debug(f"\nActivating {loop_len_beats}-beat loop @ beat {start_loop_beat} for {num_reps} reps...")
-            # Loop functionality removed - will be reimplemented with new architecture
-            # deck.activate_loop(start_beat=start_loop_beat, length_beats=loop_len_beats, repetitions=num_reps)
-            loop_single_duration = (60.0 / deck.bpm * loop_len_beats if deck.bpm > 0 else 1.0)
-            wait_for_loop_and_post = (loop_single_duration * num_reps) + 2.5 
-            logger.debug(f"Waiting for loop ({num_reps} reps of ~{loop_single_duration:.2f}s) + ~2s post-loop (total ~{wait_for_loop_and_post:.2f}s)...")
-            time.sleep(wait_for_loop_and_post) 
-            logger.debug(f"\nAfter finite loop, Frame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, Active: {deck.is_active()}")
-            next_loop_start_beat = 0
-            if deck.bpm > 0 and deck.sample_rate > 0 and len(deck.beat_timestamps) > 0:
-                current_time_after_loop = deck.get_current_display_frame() / float(deck.sample_rate)
-                current_beat_idx = np.searchsorted(deck.beat_timestamps, current_time_after_loop, side='right')
-                next_loop_start_beat = current_beat_idx + 4 
-                next_loop_start_beat = min(next_loop_start_beat, len(deck.beat_timestamps)) 
-                if next_loop_start_beat <= 0 and len(deck.beat_timestamps) > 0 : next_loop_start_beat = len(deck.beat_timestamps) // 2 
-            else: next_loop_start_beat = 25 
-            logger.debug(f"\nActivating infinite loop @ beat {next_loop_start_beat} for {loop_len_beats} beats (plays 5s)...")
-            if next_loop_start_beat > 0: 
-                # Loop functionality removed - will be reimplemented with new architecture
-                # deck.activate_loop(start_beat=next_loop_start_beat, length_beats=loop_len_beats) 
-                time.sleep(5)
-                logger.debug(f"\nDeactivating loop, playing 2s more...")
-                # Loop functionality removed - will be reimplemented with new architecture  
-                # deck.deactivate_loop()
-                time.sleep(0.1) 
-                if deck.is_active(): logger.debug(f"DEBUG: Test - Continuing after deactivation. Frame: {deck.get_current_display_frame()}"); time.sleep(2)
-                else: logger.debug("DEBUG: Test - Not active after deactivate. Re-requesting play."); deck.play(); time.sleep(2)
-            else: logger.warning("WARNING: Test - Could not determine valid start for infinite loop. Skipping.")
+            time.sleep(0.2); logger.debug("Playing for ~5.0s..."); time.sleep(5.0) 
             logger.debug("\nStopping playback..."); deck.stop(); time.sleep(0.5) 
             logger.debug(f"\nFinal Frame: {deck.get_current_display_frame()}, UserWantsPlay: {deck._user_wants_to_play}, Active: {deck.is_active()}")
-            logger.debug("\nLooping Test finished.")
+            logger.debug("\nBasic playback test finished.")
         else: logger.error(f"Failed to load track: {deck.deck_id}")
     deck.shutdown() 
     if os.path.exists(dummy_cue_filepath):

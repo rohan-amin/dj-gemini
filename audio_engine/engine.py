@@ -18,10 +18,7 @@ from .audio_analyzer import AudioAnalyzer
 from .deck import Deck
 from .audio_clock import AudioClock
 from .event_scheduler import EventScheduler
-from .loop import (
-    ObservabilityIntegrator,
-    LoopSystemHealthMonitor
-)
+# Loop system removed
 # LoopConfigurationManager removed - using existing action-based format
 
 # Event-driven architecture replaces old polling system 
@@ -57,9 +54,6 @@ class AudioEngine:
         self.event_scheduler.set_engine_reference(self)
         logger.debug("AudioEngine - Set EventScheduler engine reference for Phase 3")
         
-        # Phase 7: Initialize loop observability only (config management uses existing action format)
-        self.loop_observability = None  # Will be created when first deck is added
-        logger.info("🔄 AudioEngine - Loop observability ready (using existing action-based format)")
         
         # Debug: log engine instance ID
         logger.debug(f"AudioEngine - Engine instance {id(self)} created with audio clock {id(self.audio_clock)}")
@@ -76,7 +70,7 @@ class AudioEngine:
         self._register_event_handlers()
 
     def _get_or_create_deck(self, deck_id):
-        """Get existing deck or create new one with Phase 7 loop management integration"""
+        """Get existing deck or create new one"""
         if deck_id not in self.decks:
             print(f"DEBUG: Creating deck {deck_id}")
             deck = Deck(deck_id, self.analyzer, engine_instance=self)
@@ -90,31 +84,6 @@ class AudioEngine:
             else:
                 logger.warning(f"AudioEngine - Deck {deck_id} has no beat_manager attribute")
                 
-            # Phase 7.1: Initialize completion system and action adapter for this deck
-            if hasattr(deck, 'loop_controller'):
-                try:
-                    # Initialize completion system with this engine as the deck manager
-                    deck.loop_controller.initialize_completion_system(deck_manager=self)
-                    logger.info(f"🔄 Phase 7 - Initialized completion system for deck {deck_id}")
-                    
-                    # Phase 2.2: Create ActionLoopAdapter for this deck
-                    from audio_engine.loop.action_adapter import create_action_adapter_for_deck
-                    deck.action_adapter = create_action_adapter_for_deck(deck, self.event_scheduler)
-                    logger.info(f"🔄 Phase 2.2 - Created ActionLoopAdapter for deck {deck_id}")
-                    
-                    # Create system-wide observability if this is the first deck
-                    if self.loop_observability is None:
-                        from audio_engine.loop.observability import ObservabilityIntegrator
-                        # Initialize with first deck's loop controller
-                        self.loop_observability = ObservabilityIntegrator(deck.loop_controller)
-                        logger.info("🔄 Phase 7 - Created system-wide observability integrator")
-                    
-                    # Register this deck's loop controller with observability
-                    self.loop_observability.add_loop_controller(deck_id, deck.loop_controller)
-                    logger.debug(f"🔄 Phase 7 - Registered deck {deck_id} with observability system")
-                    
-                except Exception as e:
-                    logger.error(f"Phase 7 - Failed to initialize loop management for deck {deck_id}: {e}")
             
             # Add deck to dictionary FIRST
             self.decks[deck_id] = deck
@@ -140,11 +109,10 @@ class AudioEngine:
         # Register handlers for deck-specific commands
         deck_commands = [
             "load_track", "play", "pause", "stop", "seek_and_play", 
-            "activate_loop", "deactivate_loop", "stop_at_beat", 
-            "set_tempo", "set_pitch", "set_volume", "fade_volume",
+            "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume",
             "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample",
             "set_stem_eq", "enable_stem_eq", "set_stem_volume",
-            "set_master_eq", "set_all_stem_eq", "loop_completed", "loop_repetition_complete"
+            "set_master_eq", "set_all_stem_eq"
         ]
         
         for command in deck_commands:
@@ -229,49 +197,19 @@ class AudioEngine:
             if not source_deck_id_val or not isinstance(beat_number_val, (int, float)):
                 logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_deck_beat' trigger missing 'source_deck_id' ('{source_deck_id_val}') or valid 'beat_number' ('{beat_number_val}').")
                 return False
-        elif trigger_type == "on_loop_complete":
-            # Phase 2.2: on_loop_complete triggers now handled by ActionLoopAdapter
-            source_deck_id = trigger.get("source_deck_id")
-            loop_action_id = trigger.get("loop_action_id")
-            if not source_deck_id or not loop_action_id:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'on_loop_complete' trigger missing 'source_deck_id' or 'loop_action_id'.")
-                return False
-            logger.debug(f"VALIDATION: on_loop_complete trigger found for action {action_id_for_log} - will be handled by ActionLoopAdapter")
         elif trigger_type == "script_start":
             pass 
         else:
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Unsupported trigger type: '{trigger_type}'. Supported: 'script_start', 'on_deck_beat'.")
             return False
         
-        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "activate_loop", "deactivate_loop", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
+        deck_specific_commands = ["play", "pause", "stop", "seek_and_play", "load_track", "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume", "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample", "set_stem_eq", "enable_stem_eq", "set_stem_volume", "set_master_eq", "set_all_stem_eq"]
         engine_level_commands = ["crossfade", "bpm_match"] 
         
         if command in deck_specific_commands and not action.get("deck_id"):
             logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): Command '{command}' is missing 'deck_id'.")
             return False
         
-        if command == "activate_loop":
-            params = action.get("parameters", {})
-            if params.get("start_at_beat") is None or params.get("length_beats") is None:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' missing 'start_at_beat' or 'length_beats' in parameters. Params: {params}")
-                return False
-            try: 
-                float(params["start_at_beat"])
-                float(params["length_beats"])
-                if params.get("repetitions") is not None: # Optional, but if present, check if int
-                    if not (isinstance(params["repetitions"], str) and params["repetitions"].lower() == "infinite"):
-                        int(params["repetitions"])
-            except (ValueError, TypeError):
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'activate_loop' parameters not valid numbers/type. Params: {params}")
-                return False
-        elif command == "loop_completed":
-            params = action.get("parameters", {})
-            if not action.get("deck_id"):
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'loop_completed' missing 'deck_id'.")
-                return False
-            if not params.get("action_id"):
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'loop_completed' missing 'action_id' in parameters.")
-                return False
         elif command == "set_tempo":
             params = action.get("parameters", {})
             if params.get("target_bpm") is None:
@@ -550,11 +488,11 @@ class AudioEngine:
         elif command == "seek_and_play":
             params = action.get("parameters", {})
             # Must have exactly one of the seek targets
-            seek_targets = ["start_at_beat", "start_at_cue_name", "start_at_loop"]
+            seek_targets = ["start_at_beat", "start_at_cue_name"]
             found_targets = [target for target in seek_targets if target in params]
             
             if len(found_targets) != 1:
-                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'seek_and_play' must have exactly one of: 'start_at_beat', 'start_at_cue_name', or 'start_at_loop'. Found: {found_targets}")
+                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'seek_and_play' must have exactly one of: 'start_at_beat', 'start_at_cue_name'. Found: {found_targets}")
                 return False
             
             target = found_targets[0]
@@ -571,35 +509,6 @@ class AudioEngine:
                 cue_name = params["start_at_cue_name"]
                 if not isinstance(cue_name, str) or not cue_name.strip():
                     logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_cue_name' must be a non-empty string. Value: {cue_name}")
-                    return False
-            elif target == "start_at_loop":
-                loop_params = params["start_at_loop"]
-                if not isinstance(loop_params, dict):
-                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' must be an object. Value: {loop_params}")
-                    return False
-                
-                if loop_params.get("start_at_beat") is None or loop_params.get("length_beats") is None:
-                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' requires 'start_at_beat' and 'length_beats'. Params: {loop_params}")
-                    return False
-                
-                try:
-                    start_beat = float(loop_params["start_at_beat"])
-                    length_beats = float(loop_params["length_beats"])
-                    if start_beat < 0 or length_beats <= 0:
-                        logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_beat' must be non-negative and 'length_beats' must be positive. Values: {start_beat}, {length_beats}")
-                        return False
-                    
-                    # Validate repetitions if present
-                    repetitions = loop_params.get("repetitions")
-                    if repetitions is not None:
-                        if not (isinstance(repetitions, str) and repetitions.lower() == "infinite"):
-                            try:
-                                int(repetitions)
-                            except (ValueError, TypeError):
-                                logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'repetitions' must be an integer or 'infinite'. Value: {repetitions}")
-                                return False
-                except (ValueError, TypeError):
-                    logger.error(f"VALIDATION FAIL (Action ID: {action_id_for_log}): 'start_at_loop' parameters not valid numbers. Params: {loop_params}")
                     return False
         
         elif command == "ramp_tempo":
@@ -1028,23 +937,6 @@ class AudioEngine:
             else:
                 logger.error(f"Invalid on_deck_beat trigger: {trigger}")
                 
-        elif trigger_type == "on_loop_complete":
-            # Phase 2.2: Register this action with ActionLoopAdapter for completion handling
-            source_deck_id = trigger.get("source_deck_id")
-            loop_action_id = trigger.get("loop_action_id")
-            
-            if source_deck_id and loop_action_id:
-                deck = self._get_or_create_deck(source_deck_id)
-                if hasattr(deck, 'action_adapter') and deck.action_adapter:
-                    deck.action_adapter.register_completion_trigger(action, action)
-                    logger.info(f"Phase 2.2: Registered on_loop_complete trigger for loop {loop_action_id} -> action {action.get('action_id')}")
-                    return False  # Don't execute now, will be triggered by completion
-                else:
-                    logger.warning(f"Phase 2.2: Deck {source_deck_id} has no ActionLoopAdapter - on_loop_complete trigger ignored")
-            else:
-                logger.error(f"Phase 2.2: Invalid on_loop_complete trigger for action {action.get('action_id')}")
-            
-            return False
             
         else:
             logger.warning(f"Unknown trigger type: {trigger_type}")
@@ -1072,13 +964,6 @@ class AudioEngine:
         logger.info("Event-driven script processing stopped.")
         self.shutdown_decks() 
 
-    # Legacy loop completion method removed - now handled by musical timing system
-
-    # OLD: Engine loop removed - replaced by event-driven scheduler
-    # def _engine_loop(self):
-    #     # This method has been replaced by the EventScheduler._execution_loop
-    #     pass 
-        logger.debug("Engine loop finished - replaced by event-driven scheduler")
 
     def _print_beat_indicator(self):
         """Print a clear beat indicator showing current status of all decks"""
@@ -1106,15 +991,6 @@ class AudioEngine:
                     # Build deck status string
                     deck_status = f"{deck_id}: {current_beat:.0f}/{total_beats} (BPM: {bpm:.2f})"
                     
-                    # Add loop status if active (frame-accurate system)
-                    if hasattr(deck, '_frame_accurate_loop') and deck._frame_accurate_loop and deck._frame_accurate_loop.get('active'):
-                        loop_info = deck._frame_accurate_loop
-                        current_rep = loop_info.get('current_repetition', 0)
-                        total_reps = loop_info.get('repetitions', 1)
-                        if total_reps is not None:
-                            deck_status += f" [Loop: {current_rep}/{total_reps}]"
-                        else:
-                            deck_status += " [Loop: ∞]"
                     
                     deck_statuses.append(deck_status)
                 else:
@@ -1215,27 +1091,8 @@ class AudioEngine:
                     cue_name = parameters["start_at_cue_name"]
                     deck.play(start_at_cue_name=cue_name)
                     logger.info(f"Seeking and playing deck {deck_id} from cue '{cue_name}'")
-                elif "start_at_loop" in parameters:
-                    loop_params = parameters["start_at_loop"]
-                    start_beat = float(loop_params.get("start_at_beat"))
-                    length_beats = float(loop_params.get("length_beats"))
-                    repetitions = loop_params.get("repetitions")
-                    
-                    # Convert repetitions to proper format
-                    if repetitions is not None:
-                        if isinstance(repetitions, str) and repetitions.lower() == "infinite":
-                            repetitions = None
-                        else:
-                            try:
-                                repetitions = int(repetitions)
-                            except ValueError:
-                                logger.warning("Invalid repetitions value, defaulting to infinite")
-                                repetitions = None
-                    
-                    deck.activate_loop(start_beat=start_beat, length_beats=length_beats, repetitions=repetitions)
-                    logger.info(f"Seeking and playing deck {deck_id} with loop: beat {start_beat}, length {length_beats}, reps {repetitions}")
                 else:
-                    logger.warning("'seek_and_play' requires one of: 'start_at_beat', 'start_at_cue_name', or 'start_at_loop' in parameters. Skipping.")
+                    logger.warning("'seek_and_play' requires one of: 'start_at_beat', 'start_at_cue_name' in parameters. Skipping.")
                     return
             
             elif command == "stop_at_beat":
@@ -1253,74 +1110,7 @@ class AudioEngine:
                 except ValueError:
                     logger.warning(f"Invalid 'beat_number' value for 'stop_at_beat': {parameters['beat_number']}. Skipping.")
 
-            elif command == "activate_loop":
-                if not deck_id: 
-                    logger.warning("'activate_loop' missing deck_id. Skipping.")
-                    return
                 
-                # Phase 2.2: Use ActionLoopAdapter instead of calling deck directly
-                deck = self._get_or_create_deck(deck_id)
-                
-                if not hasattr(deck, 'action_adapter') or not deck.action_adapter:
-                    logger.error(f"Deck {deck_id} has no ActionLoopAdapter - falling back to legacy method")
-                    # Fall back to old method if adapter not available
-                    return self._handle_legacy_activate_loop(action_dict)
-                
-                # Use ActionLoopAdapter to handle the activate_loop action
-                success = deck.action_adapter.handle_activate_loop_action(action_dict)
-                
-                if success:
-                    logger.info(f"Phase 2.2: Successfully processed activate_loop action via ActionLoopAdapter for deck {deck_id}")
-                else:
-                    logger.error(f"Phase 2.2: Failed to process activate_loop action via ActionLoopAdapter for deck {deck_id}")
-                
-                return False  # Engine convention: False = success
-
-            elif command == "deactivate_loop":
-                if not deck_id: 
-                    logger.warning("'deactivate_loop' missing deck_id. Skipping.")
-                    return False
-                
-                # Phase 2.2: Use ActionLoopAdapter instead of calling deck directly  
-                deck = self._get_or_create_deck(deck_id)
-                
-                if not hasattr(deck, 'action_adapter') or not deck.action_adapter:
-                    logger.warning(f"Deck {deck_id} has no ActionLoopAdapter - falling back to legacy method")
-                    deck.deactivate_loop()
-                    return False
-                
-                # Use ActionLoopAdapter to handle the deactivate_loop action
-                success = deck.action_adapter.handle_deactivate_loop_action(action_dict)
-                
-                if success:
-                    logger.info(f"Phase 2.2: Successfully processed deactivate_loop action via ActionLoopAdapter for deck {deck_id}")
-                else:
-                    logger.error(f"Phase 2.2: Failed to process deactivate_loop action via ActionLoopAdapter for deck {deck_id}")
-                
-                return False  # Engine convention: False = success
-                
-            elif command == "loop_completed":
-                # Legacy loop completion system removed - now handled by musical timing system
-                logger.warning(f"Legacy loop_completed command received for deck {deck_id} - ignoring")
-                return False  # Engine convention: False = success
-                
-            elif command == "loop_repetition_complete":
-                # Handle loop repetition completion events (legacy LoopManager removed)
-                if not deck_id: logger.warning("'loop_repetition_complete' missing deck_id. Skipping."); return False
-                action_id = parameters.get("action_id")
-                repetition = parameters.get("repetition")
-                total_repetitions = parameters.get("total_repetitions")
-                
-                if not action_id: logger.warning("'loop_repetition_complete' missing action_id. Skipping."); return False
-                
-                logger.info(f"AudioEngine - Processing loop repetition completion: deck {deck_id}, action {action_id}, repetition {repetition}/{total_repetitions}")
-                
-                # Legacy LoopManager removed - loop completion handled by frame-accurate system
-                deck = self._get_or_create_deck(deck_id)
-                logger.info(f"AudioEngine - Loop repetition completion handled by frame-accurate system for deck {deck_id}")
-                # Note: Actual completion logic is now handled directly in the deck's audio thread
-                        
-                return False  # Engine convention: False = success
             
             elif command == "set_tempo":
                 deck_id = action_dict.get("deck_id")
@@ -1461,15 +1251,14 @@ class AudioEngine:
                 sample_id = params.get("sample_id")
                 volume = float(params.get("volume", 1.0))
                 key_match_deck = params.get("key_match_deck")
-                repetitions = params.get("repetitions")  # New parameter for looping
                 
                 if not sample_id:
                     logger.warning("'play_sample' missing 'sample_id'. Skipping.")
                     return False
                 
-                # Global playback with optional key matching and looping
-                logger.debug(f"Playing sample globally: {sample_id} (volume: {volume}, key_match: {key_match_deck}, repetitions: {repetitions})")
-                success = self._play_global_sample(sample_id=sample_id, volume=volume, key_match_deck=key_match_deck, repetitions=repetitions)
+                # Global playback with optional key matching
+                logger.debug(f"Playing sample globally: {sample_id} (volume: {volume}, key_match: {key_match_deck})")
+                success = self._play_global_sample(sample_id=sample_id, volume=volume, key_match_deck=key_match_deck)
                 if not success:
                     logger.warning(f"Failed to play global sample: {sample_id}")
                 
@@ -1479,9 +1268,6 @@ class AudioEngine:
                 # Stop any currently playing global samples
                 if hasattr(self, '_global_scratch_sample_active'):
                     self._global_scratch_sample_active = False
-                    self._global_sample_loop_active = False
-                    self._global_sample_loop_repetitions = None
-                    self._global_sample_loop_repetitions_done = 0
                 logger.debug("Stopped global sample playback")
                 return False  # Engine convention: False = success
             
@@ -1755,8 +1541,8 @@ class AudioEngine:
         logger.info(f"Global synchronization complete: {results['decks_synchronized']} decks synchronized, {results['decks_failed']} failed")
         return results
 
-    def _play_global_sample(self, sample_id, volume=1.0, key_match_deck=None, repetitions=None):
-        """Play a pre-processed global sample with optional key matching and looping"""
+    def _play_global_sample(self, sample_id, volume=1.0, key_match_deck=None):
+        """Play a pre-processed global sample with optional key matching"""
         try:
             # Check if sample exists in cache
             if not hasattr(self, '_global_sample_cache'):
@@ -1792,38 +1578,13 @@ class AudioEngine:
             # Apply volume (no hardcoded reduction)
             sample_audio *= volume
             
-            # Apply looping if specified
-            if repetitions is not None:
-                if repetitions == "infinite":
-                    repetitions = None # essentia's loop_samples expects None for infinite
-                else:
-                    try:
-                        repetitions = int(repetitions)
-                        if repetitions <= 0:
-                            repetitions = None # essentia's loop_samples expects None for non-positive
-                    except ValueError:
-                        logger.warning(f"Invalid 'repetitions' value for 'play_sample': {repetitions}. Defaulting to infinite.")
-                        repetitions = None
-
-            if repetitions is not None:
-                # Store for global playback
-                self._global_scratch_sample_audio = sample_audio
-                self._global_scratch_sample_position = 0
-                self._global_scratch_sample_active = True
-                self._global_sample_loop_active = True
-                self._global_sample_loop_repetitions = repetitions
-                self._global_sample_loop_repetitions_done = 0
-                
-                logger.debug(f"AudioEngine - Playing global sample with loop: {sample_id} (volume: {volume}, key_match: {key_match_deck}, repetitions: {repetitions})")
-                return True
-            else:
-                # Store for global playback
-                self._global_scratch_sample_audio = sample_audio
-                self._global_scratch_sample_position = 0
-                self._global_scratch_sample_active = True
-                
-                logger.debug(f"AudioEngine - Playing global sample: {sample_id} (volume: {volume}, key_match: {key_match_deck})")
-                return True
+            # Store for global playback
+            self._global_scratch_sample_audio = sample_audio
+            self._global_scratch_sample_position = 0
+            self._global_scratch_sample_active = True
+            
+            logger.debug(f"AudioEngine - Playing global sample: {sample_id} (volume: {volume}, key_match: {key_match_deck})")
+            return True
             
         except Exception as e:
             logger.error(f"AudioEngine - Error playing global sample '{sample_id}': {e}")
@@ -1861,60 +1622,10 @@ class AudioEngine:
             logger.error(f"AudioEngine - Error loading global scratch sample: {e}")
             return False
     
-    def _handle_legacy_activate_loop(self, action_dict: dict) -> bool:
-        """
-        Legacy fallback method for activate_loop when ActionLoopAdapter is not available.
-        This preserves the old behavior for compatibility.
-        """
-        try:
-            deck_id = action_dict.get("deck_id")
-            parameters = action_dict.get("parameters", {})
-            
-            # Parameters from JSON (using .get for safety)
-            start_beat_from_json = parameters.get("start_at_beat")
-            length_beats_from_json = parameters.get("length_beats")
-            repetitions_param_from_json = parameters.get("repetitions") 
-
-            if start_beat_from_json is None or length_beats_from_json is None: 
-                logger.warning("'activate_loop' requires 'start_at_beat' and 'length_beats' in parameters. Skipping.")
-                return False
-                
-            start_beat_val = float(start_beat_from_json)
-            length_beats_val = float(length_beats_from_json)
-            
-            repetitions_val = None 
-            if repetitions_param_from_json is not None:
-                if isinstance(repetitions_param_from_json, str) and repetitions_param_from_json.lower() == "infinite": 
-                    repetitions_val = None 
-                else:
-                    try: 
-                        repetitions_val = int(repetitions_param_from_json)
-                        if repetitions_val <= 0: 
-                            logger.warning("'repetitions' for 'activate_loop' must be positive int or 'infinite'. Defaulting to infinite.")
-                            repetitions_val = None
-                    except ValueError: 
-                        logger.warning("Invalid 'repetitions' value for 'activate_loop'. Must be int or 'infinite'. Defaulting to infinite.")
-                        repetitions_val = None
-            
-            if length_beats_val <= 0:
-                logger.warning("'length_beats' for 'activate_loop' must be positive. Skipping.")
-                return False
-                
-            deck = self._get_or_create_deck(deck_id)
-            # Pass the action ID to the deck (legacy method)
-            deck.activate_loop(start_beat=start_beat_val, 
-                               length_beats=length_beats_val, 
-                               repetitions=repetitions_val,
-                               action_id=action_dict.get('action_id'))
-            return True  # Success
-            
-        except Exception as e: 
-            logger.error(f"Legacy activate_loop failed: {e}")
-            return False
 
 
 if __name__ == '__main__':
-    logger.info("--- AudioEngine Standalone Test (v5.1 - Corrected activate_loop call) ---")
+    logger.info("--- AudioEngine Standalone Test (v5.1) ---")
     
     CURRENT_DIR_OF_ENGINE_PY = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT_FOR_ENGINE_TEST = os.path.dirname(CURRENT_DIR_OF_ENGINE_PY) 
@@ -1957,15 +1668,10 @@ if __name__ == '__main__':
 
     # Using the simplified test JSON that worked for deck.py to isolate engine logic
     test_json_content = {
-        "script_name": "Engine Simplified Loop Test v5.1",
+        "script_name": "Engine Simplified Test v5.1",
         "actions": [
             {"id": "loadA", "command": "load_track", "deck_id": "deckA", "track_id": "track1"},
             {"id": "playA", "command": "play", "deck_id": "deckA", "parameters": {"start_at_beat": 1}},
-            { 
-                "id": "loopA_at_beat_5", "command": "activate_loop", "deck_id": "deckA",
-                "parameters": {"start_at_beat": 5, "length_beats": 2, "repetitions": 3},
-                "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 5}
-            },
             { 
                 "id": "stop_A_at_beat_15", "command": "stop", "deck_id": "deckA",
                 "trigger": {"type": "on_deck_beat", "source_deck_id": "deckA", "beat_number": 15} 
@@ -2016,7 +1722,7 @@ if __name__ == '__main__':
                             logger.debug(f"Event scheduler stats: {scheduler_stats}")
                     break
                 time.sleep(0.5)
-            logger.info("Engine Test - Monitoring loop finished or timed out.")
+            logger.info("Engine Test - Monitoring finished or timed out.")
         except KeyboardInterrupt:
             logger.info("Engine Test - KeyboardInterrupt received by test runner.")
         finally:

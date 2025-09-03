@@ -61,30 +61,15 @@ class MixConfigLoader:
             # Separate actions by trigger type
             immediate_actions = [action for action in actions if self._is_immediate_action(action)]
             beat_actions = [action for action in actions if self._is_beat_triggered_action(action)]
-            loop_complete_actions = [action for action in actions if self._is_loop_complete_action(action)]
             other_actions = [action for action in actions if not self._is_immediate_action(action) and 
-                           not self._is_beat_triggered_action(action) and not self._is_loop_complete_action(action)]
+                           not self._is_beat_triggered_action(action)]
             
             logger.info(f"Found {len(immediate_actions)} immediate actions, {len(beat_actions)} beat-triggered actions, "
-                       f"{len(loop_complete_actions)} loop-complete actions, and {len(other_actions)} other actions")
-            
-            if loop_complete_actions:
-                logger.info("🔗 Loop completion actions found:")
-                for action in loop_complete_actions:
-                    trigger = action.get('trigger', {})
-                    loop_id = trigger.get('loop_action_id')
-                    source_deck = trigger.get('source_deck_id') 
-                    action_id = action.get('action_id')
-                    command = action.get('command')
-                    target_deck = action.get('deck_id', 'same')
-                    logger.info(f"🔗   {action_id}: {command} on {target_deck} when {loop_id} completes on {source_deck}")
-            else:
-                logger.warning("🚨 No loop completion actions found in mix configuration!")
+                       f"and {len(other_actions)} other actions")
             
             # DEBUG: Show exactly which actions are in each category
             logger.info(f"Immediate actions: {[action.get('action_id') for action in immediate_actions]}")
             logger.info(f"Beat actions: {[action.get('action_id') for action in beat_actions]}")
-            logger.info(f"Loop-complete actions: {[action.get('action_id') for action in loop_complete_actions]}")
             logger.info(f"Other actions: {[action.get('action_id') for action in other_actions]}")
             
             # Execute immediate actions in proper order: load_track first, then play actions
@@ -115,9 +100,6 @@ class MixConfigLoader:
             # Pre-schedule all beat-triggered actions 
             self._schedule_beat_actions(beat_actions)
             
-            # Register loop completion actions with the musical timing system
-            self._register_loop_completion_actions(loop_complete_actions)
-            
             # Handle other trigger types (for now, just log them)
             for action in other_actions:
                 trigger = action.get('trigger', {})
@@ -140,10 +122,6 @@ class MixConfigLoader:
         trigger = action.get('trigger', {})
         return trigger.get('type') == 'on_deck_beat'
     
-    def _is_loop_complete_action(self, action: dict) -> bool:
-        """Check if action is triggered by loop completion"""
-        trigger = action.get('trigger', {})
-        return trigger.get('type') == 'on_loop_complete'
     
     def _execute_immediate_action(self, action: dict) -> None:
         """Execute actions that should happen immediately at startup"""
@@ -266,50 +244,6 @@ class MixConfigLoader:
             except Exception as e:
                 logger.error(f"Error scheduling beat action {action.get('action_id')}: {e}")
     
-    def _register_loop_completion_actions(self, loop_complete_actions: List[dict]) -> None:
-        """Register all loop completion actions with the musical timing system"""
-        
-        for action in loop_complete_actions:
-            try:
-                trigger = action.get('trigger', {})
-                loop_action_id = trigger.get('loop_action_id')  # The loop we're waiting for
-                source_deck_id = trigger.get('source_deck_id')  # Deck that has the loop
-                
-                if not loop_action_id or not source_deck_id:
-                    logger.warning(f"Skipping action {action.get('action_id')} - missing loop_action_id or source_deck_id")
-                    continue
-                
-                # Get the deck that will trigger the loop completion
-                source_deck = self.engine._get_or_create_deck(source_deck_id)
-                if not source_deck:
-                    logger.error(f"Source deck not found: {source_deck_id}")
-                    continue
-                
-                if not hasattr(source_deck, 'musical_timing_system') or not source_deck.musical_timing_system:
-                    logger.error(f"Source deck {source_deck_id} does not have musical timing system")
-                    continue
-                
-                # Get the target deck (where the action will execute)
-                target_deck_id = action.get('deck_id', source_deck_id)
-                
-                # Register the completion action with the source deck's musical timing system
-                action_type = action.get('command')
-                parameters = action.get('parameters', {})
-                action_id = action.get('action_id')
-                
-                source_deck.musical_timing_system.register_loop_completion_action(
-                    loop_action_id=loop_action_id,
-                    action_type=action_type,
-                    parameters=parameters,
-                    action_id=action_id,
-                    target_deck_id=target_deck_id,
-                    priority=0
-                )
-                
-                logger.info(f"Registered loop completion action: {action_id} -> {action_type} when {loop_action_id} completes on {source_deck_id}")
-                
-            except Exception as e:
-                logger.error(f"Error registering loop completion action {action.get('action_id')}: {e}")
     
     def get_scheduled_actions(self) -> Dict[str, Any]:
         """Get information about all scheduled actions"""

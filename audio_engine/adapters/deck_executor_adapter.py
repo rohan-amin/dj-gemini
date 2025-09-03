@@ -36,8 +36,6 @@ class DeckExecutorAdapter(ActionExecutor):
             'pause': self._execute_pause, 
             'stop': self._execute_stop,
             'seek': self._execute_seek,
-            'activate_loop': self._execute_activate_loop,
-            'deactivate_loop': self._execute_deactivate_loop,
             'set_volume': self._execute_set_volume,
             'set_tempo': self._execute_set_tempo
         }
@@ -201,67 +199,6 @@ class DeckExecutorAdapter(ActionExecutor):
             logger.error(f"Deck {self._deck_id}: Error in seek action: {e}")
             return False
     
-    def _execute_activate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """Execute loop activation via centralized ActionLoopAdapter system"""
-        try:
-            # Use centralized loop management system (ActionLoopAdapter required)
-            if not (hasattr(self._deck, 'action_adapter') and self._deck.action_adapter):
-                logger.error(f"❌ Deck {self._deck_id}: ActionLoopAdapter not available - cannot activate loops")
-                return False
-            
-            action = {
-                'action_id': context.get('action_id', 'deck_executor_loop'),
-                'command': 'activate_loop',
-                'deck_id': self._deck_id,
-                'parameters': params
-            }
-            
-            logger.info(f"🔄 Deck {self._deck_id}: Using centralized ActionLoopAdapter for loop management")
-            success = self._deck.action_adapter.handle_activate_loop_action(action)
-            
-            if success:
-                logger.info(f"✅ Deck {self._deck_id}: Loop activation successful via ActionLoopAdapter")
-            else:
-                logger.error(f"❌ Deck {self._deck_id}: Loop activation failed via ActionLoopAdapter")
-            
-            return success
-                
-        except Exception as e:
-            logger.error(f"Deck {self._deck_id}: Error in loop activation: {e}")
-            return False
-    
-# Legacy loop activation method removed - now uses centralized ActionLoopAdapter only
-    
-    def _execute_deactivate_loop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
-        """Execute loop deactivation via centralized ActionLoopAdapter system"""
-        try:
-            # Use centralized loop management system (ActionLoopAdapter required)
-            if not (hasattr(self._deck, 'action_adapter') and self._deck.action_adapter):
-                logger.error(f"❌ Deck {self._deck_id}: ActionLoopAdapter not available - cannot deactivate loops")
-                return False
-            
-            action = {
-                'action_id': context.get('action_id', 'deck_executor_deactivate'),
-                'command': 'deactivate_loop',
-                'deck_id': self._deck_id,
-                'parameters': params
-            }
-            
-            logger.info(f"🔄 Deck {self._deck_id}: Using centralized ActionLoopAdapter for loop deactivation")
-            success = self._deck.action_adapter.handle_deactivate_loop_action(action)
-            
-            if success:
-                logger.info(f"✅ Deck {self._deck_id}: Loop deactivation successful via ActionLoopAdapter")
-            else:
-                logger.error(f"❌ Deck {self._deck_id}: Loop deactivation failed via ActionLoopAdapter")
-            
-            return success
-                
-        except Exception as e:
-            logger.error(f"Deck {self._deck_id}: Error in loop deactivation: {e}")
-            return False
-    
-# Legacy loop deactivation method removed - now uses centralized ActionLoopAdapter only
     
     def _execute_set_volume(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
         """Execute volume change"""
@@ -378,8 +315,6 @@ class DeckExecutorAdapter(ActionExecutor):
             
             if hasattr(self._deck, 'play'):
                 capabilities.append('playback')
-            if hasattr(self._deck, '_frame_accurate_loop'):
-                capabilities.append('loops')
             if hasattr(self._deck, 'beat_manager'):
                 capabilities.append('beat_tracking')
             if hasattr(self._deck, 'seek_to_frame'):
@@ -403,18 +338,6 @@ class DeckExecutorAdapter(ActionExecutor):
                 except:
                     pass
             
-            if hasattr(self._deck, '_frame_accurate_loop') and self._deck._frame_accurate_loop:
-                try:
-                    if self._deck._frame_accurate_loop.get('active'):
-                        deck_state['active_loop'] = {
-                            'start_frame': self._deck._frame_accurate_loop.get('start_frame'),
-                            'end_frame': self._deck._frame_accurate_loop.get('end_frame'),
-                            'repetitions': self._deck._frame_accurate_loop.get('repetitions'),
-                            'current_repetition': self._deck._frame_accurate_loop.get('current_repetition'),
-                            'action_id': self._deck._frame_accurate_loop.get('action_id')
-                        }
-                except:
-                    pass
             
             info['deck_state'] = deck_state
             
