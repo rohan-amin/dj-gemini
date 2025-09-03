@@ -1248,12 +1248,12 @@ class Deck:
             self._user_wants_to_play = False
         self.command_queue.put((DECK_CMD_PAUSE, None))
 
-    def stop(self): 
+    def stop(self, flush: bool = True):
         logger.debug(f"Deck {self.deck_id} - Engine requests STOP.")
         with self._stream_lock:
             self._user_wants_to_play = False
-            self._current_playback_frame_for_display = 0 
-        self.command_queue.put((DECK_CMD_STOP, None))
+            self._current_playback_frame_for_display = 0
+        self.command_queue.put((DECK_CMD_STOP, {"flush": flush}))
 
     def seek(self, target_frame): 
         logger.debug(f"Deck {self.deck_id} - Engine requests SEEK to frame: {target_frame}")
@@ -1987,12 +1987,21 @@ class Deck:
 
                 elif command == DECK_CMD_STOP:
                     logger.debug(f"Deck {self.deck_id} AudioThread - Processing STOP")
+                    flush = True
+                    if data is not None and isinstance(data, dict):
+                        flush = data.get("flush", True)
+
                     # Stop producer thread
                     self._producer_stop_event.set()
                     self._producer_running = False
 
                     # Clear any buffered audio so playback stops immediately
                     self._clear_ring_buffer_for_position_jump("stop command")
+
+
+                    # Clear any buffered audio so playback stops immediately
+                    if flush:
+                        self._clear_ring_buffer_for_position_jump("stop command")
 
                     # Clean up RubberBand resources
                     self._cleanup_rubberband_on_stop()
@@ -2597,12 +2606,24 @@ class Deck:
                 if self._loop_repetitions_total and self._loop_repetitions_done >= self._loop_repetitions_total:
                     self._loop_active = False
                     if self.engine:
-                        logger.info(f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished")
+                        logger.info(
+                            f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished"
+                        )
                         self.engine.handle_loop_complete(self.deck_id, self._current_loop_action_id)
+                    # Fill any remaining frames with silence and exit to avoid
+                    # generating audio beyond the loop boundary
+                    if frames_remaining > 0:
+                        output[out_pos:out_pos + frames_remaining] = 0
+                        self.audio_thread_current_frame = self._loop_end_frame
+                        self._current_playback_frame_for_display = self.audio_thread_current_frame
+                    break
                 if self._loop_active:
-                    logger.info(f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start")
+                    logger.info(
+                        f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start"
+                    )
                     self.audio_thread_current_frame = self._loop_start_frame
                     self._current_playback_frame_for_display = self._loop_start_frame
+                    continue
 
             start_frame = int(self.audio_thread_current_frame)
             part_frames = frames_remaining
