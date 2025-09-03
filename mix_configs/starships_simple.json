@@ -61,6 +61,16 @@
         "length_beats": 4,
         "repetitions": 3
       }
+    },
+    {
+      "action_id": "stop_after_loops",
+      "command": "stop",
+      "deck_id": "deckA",
+      "trigger": {
+        "type": "on_loop_complete",
+        "source_deck_id": "deckA",
+        "loop_action_id": "first_loop"
+      }
     }
   ]
 } 
