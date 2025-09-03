@@ -2288,10 +2288,30 @@ class Deck:
             # Initialize RubberBand stretcher if needed
             if not hasattr(self, 'rubberband_stretcher') or not self.rubberband_stretcher:
                 self._init_rubberband_stretcher()
-            
+
+            # Handle loop iterations similar to _build_stem_mix_chunk
+            if self._loop_active and self.audio_thread_current_frame >= self._loop_end_frame:
+                self._loop_repetitions_done += 1
+                logger.info(
+                    f"🔄 LOOP ITERATION: {self._current_loop_action_id} on {self.deck_id} - iteration {self._loop_repetitions_done}/{self._loop_repetitions_total or '∞'} complete"
+                )
+                if self._loop_repetitions_total and self._loop_repetitions_done >= self._loop_repetitions_total:
+                    self._loop_active = False
+                    if self.engine:
+                        logger.info(
+                            f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished"
+                        )
+                        self.engine.handle_loop_complete(self.deck_id, self._current_loop_action_id)
+                if self._loop_active:
+                    logger.info(
+                        f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start"
+                    )
+                    self.audio_thread_current_frame = self._loop_start_frame
+                    self._current_playback_frame_for_display = self._loop_start_frame
+
             # Get current playback position
             start_frame = int(self.audio_thread_current_frame)
-            
+
             # === REMOVED: Legacy CENTRALIZED LOOP MANAGEMENT ===
             # Now using frame-accurate system only - no dual system conflicts
             
