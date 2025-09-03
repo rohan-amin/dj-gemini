@@ -182,20 +182,24 @@ class AudioEngine:
             del self._loop_completion_actions[deck_id]
         for action in actions:
             try:
-                # Use scheduler when running; execute immediately otherwise
+                # Prefer scheduling via EventScheduler so actions run on the main
+                # dispatch thread. However, the scheduler may exist but not be
+                # running (e.g. when operating in frame-accurate mode). In that
+                # case the queued action would never execute, so fall back to
+                # direct execution.
                 if self.event_scheduler and self.event_scheduler.is_running():
                     self.event_scheduler.schedule_immediate_action(action)
-                    logger.debug(
-                        "Scheduled loop completion action %s via EventScheduler",
+                    logger.info(
+                        "handle_loop_complete: scheduled action %s via EventScheduler",
                         action.get("action_id"),
                     )
                 else:
                     # Fallback: execute directly if scheduler unavailable or stopped
-                    self._execute_action(action)
-                    logger.debug(
-                        "Executed loop completion action %s directly (scheduler inactive)",
+                    logger.info(
+                        "handle_loop_complete: executing action %s directly (scheduler inactive)",
                         action.get("action_id"),
                     )
+                    self._execute_action(action)
             except Exception as e:
                 logger.error(
                     f"Error executing loop completion action {action.get('action_id')}: {e}"
