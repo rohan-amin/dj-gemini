@@ -189,12 +189,12 @@ class AudioEngine:
                 # direct execution.
                 if self.event_scheduler and self.event_scheduler.is_running():
                     self.event_scheduler.schedule_immediate_action(action)
-                    logger.debug(
+                    logger.info(
                         "handle_loop_complete: scheduled action %s via EventScheduler",
                         action.get("action_id"),
                     )
                 else:
-                    logger.debug(
+                    logger.info(
                         "handle_loop_complete: executing action %s directly (scheduler inactive)",
                         action.get("action_id"),
                     )
