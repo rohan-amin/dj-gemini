@@ -153,7 +153,8 @@ class DeckExecutorAdapter(ActionExecutor):
     def _execute_stop(self, params: Dict[str, Any], context: Dict[str, Any]) -> bool:
         """Execute stop action"""
         try:
-            self._deck.stop()
+            flush = params.get('flush', True)
+            self._deck.stop(flush=flush)
             return True
         except Exception as e:
             logger.error(f"Deck {self._deck_id}: Error in stop action: {e}")
