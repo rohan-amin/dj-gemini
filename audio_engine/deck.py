@@ -301,8 +301,13 @@ class Deck:
         self._loop_repetitions_total = 0
         self._loop_repetitions_done = 0
         self._current_loop_action_id = None
+        # Playback tracking counters
+        self._frames_played = 0
+        self._frames_played_since_loop_start = 0
+        self._loop_total_frames_expected = None
+        self._loop_completion_pending = False
+        self._pending_loop_action_id = None
 
-        
         # === CENTRALIZED BEAT MANAGEMENT ===
         self.beat_manager = BeatManager(self)
         
@@ -1326,6 +1331,14 @@ class Deck:
             self._loop_repetitions_total = repetitions or 0
             self._loop_repetitions_done = 0
             self._current_loop_action_id = action_id
+            self._frames_played_since_loop_start = 0
+            loop_len = self._loop_end_frame - self._loop_start_frame
+            self._loop_total_frames_expected = (
+                loop_len * self._loop_repetitions_total
+                if self._loop_repetitions_total else None
+            )
+            self._loop_completion_pending = False
+            self._pending_loop_action_id = None
 
             if self.audio_thread_current_frame < self._loop_start_frame or self.audio_thread_current_frame > self._loop_end_frame:
                 self.audio_thread_current_frame = self._loop_start_frame
@@ -1339,6 +1352,10 @@ class Deck:
         with self._stream_lock:
             self._loop_active = False
             self._current_loop_action_id = None
+            self._loop_completion_pending = False
+            self._pending_loop_action_id = None
+            self._loop_total_frames_expected = None
+            self._frames_played_since_loop_start = 0
         logger.info(f"Deck {self.deck_id} - Loop deactivated")
 
     # === MUSICAL TIMING SYSTEM API ===
@@ -2344,7 +2361,8 @@ class Deck:
                         logger.info(
                             f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished"
                         )
-                        self.engine.handle_loop_complete(self.deck_id, self._current_loop_action_id)
+                    self._loop_completion_pending = True
+                    self._pending_loop_action_id = self._current_loop_action_id
                 if self._loop_active:
                     logger.info(
                         f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start"
@@ -2642,7 +2660,8 @@ class Deck:
                         logger.info(
                             f"🔄 LOOP COMPLETE: {self._current_loop_action_id} on {self.deck_id} - {self._loop_repetitions_done} iterations finished"
                         )
-                        self.engine.handle_loop_complete(self.deck_id, self._current_loop_action_id)
+                    self._loop_completion_pending = True
+                    self._pending_loop_action_id = self._current_loop_action_id
                     # Fill any remaining frames with silence and exit to avoid
                     # generating audio beyond the loop boundary
                     if frames_remaining > 0:
@@ -2751,6 +2770,23 @@ class Deck:
                 outdata[:frames, 0] = out[:, 0]  # Left
                 if self.device_output_channels == 2:
                     outdata[:frames, 1] = out[:, 0]  # Right (duplicate left)
+            # Update playback counters and handle loop completion when audible
+            action_id_to_call = None
+            with self._stream_lock:
+                self._frames_played += frames
+                if self._loop_active or self._loop_completion_pending:
+                    self._frames_played_since_loop_start += frames
+                    if (self._loop_completion_pending and
+                        self._loop_total_frames_expected is not None and
+                        self._frames_played_since_loop_start >= self._loop_total_frames_expected):
+                        action_id_to_call = self._pending_loop_action_id
+                        self._loop_completion_pending = False
+                        self._pending_loop_action_id = None
+                        self._loop_total_frames_expected = None
+                        self._current_loop_action_id = None
+                        self._frames_played_since_loop_start = 0
+            if action_id_to_call and self.engine:
+                self.engine.handle_loop_complete(self.deck_id, action_id_to_call)
 
             # If a graceful stop was requested, check whether all buffered
             # audio has been played. Once the ring buffer is empty we stop the
