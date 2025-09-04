@@ -1256,12 +1256,18 @@ class Deck:
     def stop(self, flush: bool = True):
         logger.debug(f"Deck {self.deck_id} - Engine requests STOP.")
         with self._stream_lock:
-            self._user_wants_to_play = False
             if flush:
-                # For immediate stops we reset the display frame right away.
-                # For graceful stops we leave the frame so status reflects the
-                # deck is still playing until buffers drain.
+                # Immediate stop: mark deck as not wanting to play and reset
+                # displayed playback position so UIs immediately reflect the
+                # stopped state.
+                self._user_wants_to_play = False
                 self._current_playback_frame_for_display = 0
+            else:
+                # Graceful stop: keep the "wants_to_play" flag true so the
+                # producer thread continues generating audio until the stop
+                # command is processed on the audio thread.  This prevents
+                # premature cut‑offs when stopping after a loop completes.
+                pass
         self.command_queue.put((DECK_CMD_STOP, {"flush": flush}))
 
     def seek(self, target_frame): 
@@ -2030,6 +2036,9 @@ class Deck:
                     self._cleanup_rubberband_on_stop()
 
                     with self._stream_lock:
+                        # Regardless of flush, update intent flag so the deck no
+                        # longer reports that it wants to play.
+                        self._user_wants_to_play = False
                         if flush:
                             self.audio_thread_current_frame = 0
                             self._current_playback_frame_for_display = 0
