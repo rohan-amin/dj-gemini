@@ -17,11 +17,10 @@ except ImportError:
 from .audio_analyzer import AudioAnalyzer
 from .deck import Deck
 from .audio_clock import AudioClock
-from .event_scheduler import EventScheduler
 # Loop system removed
 # LoopConfigurationManager removed - using existing action-based format
 
-# Event-driven architecture replaces old polling system 
+# Event-driven architecture replaces old polling system
 
 class AudioEngine:
     def __init__(self, app_config_module): 
@@ -44,15 +43,10 @@ class AudioEngine:
         # NEW: Event-driven architecture
         self.audio_clock = AudioClock()
         logger.debug(f"AudioEngine - Created audio clock instance {id(self.audio_clock)}")
-        self.event_scheduler = EventScheduler(self.audio_clock)
-        
+
         # Phase 2: BeatManager references for deck-specific beat operations
         self._deck_beat_managers = {}  # deck_id -> BeatManager
         logger.debug("AudioEngine - Initialized deck BeatManager storage for Phase 2")
-        
-        # Phase 3: Set EventScheduler engine reference for deck-specific beat timing
-        self.event_scheduler.set_engine_reference(self)
-        logger.debug("AudioEngine - Set EventScheduler engine reference for Phase 3")
         
         
         # Debug: log engine instance ID
@@ -68,9 +62,6 @@ class AudioEngine:
         self._loop_completion_actions = {}
         
         logger.debug("AudioEngine - Initialized.")
-        
-        # Register event handlers for different action types
-        self._register_event_handlers()
 
     def _get_or_create_deck(self, deck_id):
         """Get existing deck or create new one"""
@@ -91,90 +82,13 @@ class AudioEngine:
             # Add deck to dictionary FIRST
             self.decks[deck_id] = deck
             
-            # THEN register beat callback with EventScheduler if it's running
-            if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
-                print(f"DEBUG: Registering callback for deck {deck_id} during creation")
-                self.event_scheduler.register_deck_callback(deck_id)
             print(f"DEBUG: Deck {deck_id} created. Total decks: {len(self.decks)}")
         return self.decks[deck_id]
     
     def get_beat_manager_for_deck(self, deck_id: str):
-        """
-        Get BeatManager for a specific deck.
-        Phase 2: Helper method for EventScheduler to access deck-specific beat timing.
-        """
+        """Get BeatManager for a specific deck."""
         return self._deck_beat_managers.get(deck_id)
     
-    def _register_event_handlers(self):
-        """Register handlers for different action types with the event scheduler"""
-        logger.debug("AudioEngine - Registering event handlers")
-        
-        # Register handlers for deck-specific commands
-        deck_commands = [
-            "load_track", "play", "pause", "stop", "seek_and_play",
-            "stop_at_beat", "set_tempo", "set_pitch", "set_volume", "fade_volume",
-            "set_eq", "fade_eq", "ramp_tempo", "play_scratch_sample",
-            "set_stem_eq", "enable_stem_eq", "set_stem_volume",
-            "set_master_eq", "set_all_stem_eq",
-            "activate_loop", "deactivate_loop"
-        ]
-        
-        for command in deck_commands:
-            self.event_scheduler.register_handler(command, self._execute_deck_action)
-        
-        # Register handlers for engine-level commands
-        engine_commands = ["crossfade", "bpm_match"]
-        for command in engine_commands:
-            self.event_scheduler.register_handler(command, self._execute_engine_action)
-        
-        # Register default handler for unknown commands
-        self.event_scheduler.register_default_handler(self._execute_unknown_action)
-        
-        # Register error callback
-        self.event_scheduler.register_error_callback(self._handle_scheduler_error)
-        
-        logger.debug("AudioEngine - Event handlers registered")
-    
-    def _execute_deck_action(self, action: dict):
-        """Execute a deck-specific action"""
-        try:
-            deck_id = action.get("deck_id")
-            if not deck_id:
-                logger.error(f"Deck action missing deck_id: {action}")
-                return False
-            
-            deck = self._get_or_create_deck(deck_id)
-            if not deck:
-                logger.error(f"Could not get or create deck: {deck_id}")
-                return False
-            
-            # Execute the action using existing deck methods
-            return self._execute_action(action)
-            
-        except Exception as e:
-            logger.error(f"Error executing deck action: {e}")
-            return False
-    
-    def _execute_engine_action(self, action: dict):
-        """Execute an engine-level action"""
-        try:
-            # Execute the action using existing engine methods
-            return self._execute_action(action)
-            
-        except Exception as e:
-            logger.error(f"Error executing engine action: {e}")
-            return False
-    
-    def _execute_unknown_action(self, action: dict):
-        """Handle unknown action types"""
-        logger.warning(f"Unknown action type: {action.get('command', 'unknown')}")
-        return False
-    
-    def _handle_scheduler_error(self, error: Exception):
-        """Handle errors from the event scheduler"""
-        logger.error(f"Event scheduler error: {error}")
-        # Could implement error recovery logic here
-
     def handle_loop_complete(self, deck_id: str, loop_action_id: str):
         """Execute actions registered for a completed loop"""
         actions = self._loop_completion_actions.get(deck_id, {}).pop(loop_action_id, [])
@@ -182,23 +96,14 @@ class AudioEngine:
             del self._loop_completion_actions[deck_id]
         for action in actions:
             try:
-                # Prefer scheduling via EventScheduler so actions run on the main
-                # dispatch thread. However, the scheduler may exist but not be
-                # running (e.g. when operating in frame-accurate mode). In that
-                # case the queued action would never execute, so fall back to
-                # direct execution.
-                if self.event_scheduler and self.event_scheduler.is_running():
-                    self.event_scheduler.schedule_immediate_action(action)
-                    logger.info(
-                        "handle_loop_complete: scheduled action %s via EventScheduler",
-                        action.get("action_id"),
-                    )
-                else:
-                    logger.info(
-                        "handle_loop_complete: executing action %s directly (scheduler inactive)",
-                        action.get("action_id"),
-                    )
-                    self._execute_action(action)
+                if action.get("command") == "stop":
+                    params = action.setdefault("parameters", {})
+                    params.setdefault("flush", False)
+                logger.info(
+                    "handle_loop_complete: executing action %s directly",
+                    action.get("action_id"),
+                )
+                self._execute_action(action)
             except Exception as e:
                 logger.error(f"Error executing loop completion action {action.get('action_id')}: {e}")
 
@@ -863,49 +768,18 @@ class AudioEngine:
 
         print(f"DEBUG: Starting script processing with {len(self._all_actions_from_script)} actions")
         
-        # Check if we're using the new frame-accurate timing system
-        if getattr(self, '_using_frame_accurate_timing', False):
-            logger.info(f"🎯 Starting frame-accurate script processing: '{self.script_name}' - OLD EVENT SCHEDULER BYPASSED")
-            self.is_processing_script_actions = True 
-            self._script_start_time = time.time() 
-            
-            # Start the audio clock
-            self.audio_clock.start()
-            
-            # The mix loader has already pre-scheduled all actions with frame-accurate timing
-            # No need to start the old event scheduler or register beat callbacks
-            logger.info("🚀 All actions pre-scheduled with sample-accurate timing")
-            
-        else:
-            # Fallback to old event scheduler system
-            logger.info(f"Starting event-driven script processing: '{self.script_name}'")
-            self.is_processing_script_actions = True 
-            self._script_start_time = time.time() 
-            
-            # Start the audio clock
-            self.audio_clock.start()
-            
-            # Start the event scheduler FIRST so it's running when decks are created
-            self.event_scheduler.start()
-            
-            # Schedule all actions using the event scheduler (this creates decks)
-            self._schedule_all_actions()
-            
-            # FORCE register beat callbacks with all existing decks
-            for deck_id, deck in self.decks.items():
-                if hasattr(deck, 'beat_manager'):
-                    deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
-                    print(f"FORCE REGISTERED: Beat callback for deck {deck_id}")
-        
-        # Also ensure EventScheduler has registered callbacks
-        if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
-            self.event_scheduler._register_beat_callbacks()
-            print("DEBUG: Re-registered all beat callbacks with EventScheduler")
-        
-        print(f"TOTAL CALLBACKS REGISTERED: {sum(len(deck.beat_manager._beat_callbacks) for deck in self.decks.values() if hasattr(deck, 'beat_manager'))}")
-        
+        logger.info(f"🎯 Starting frame-accurate script processing: '{self.script_name}'")
+        self.is_processing_script_actions = True
+        self._script_start_time = time.time()
+
+        # Start the audio clock
+        self.audio_clock.start()
+
+        # The mix loader has already pre-scheduled all actions with frame-accurate timing
+        logger.info("🚀 All actions pre-scheduled with sample-accurate timing")
+
         logger.info("AudioEngine - Event-driven script processing started")
-        
+
         # Debug: Check if callbacks were actually registered
         total_callbacks = 0
         for deck_id, deck in self.decks.items():
@@ -914,93 +788,6 @@ class AudioEngine:
                 total_callbacks += callback_count
                 logger.info(f"AudioEngine: Deck {deck_id} has {callback_count} beat callbacks")
         logger.info(f"AudioEngine: Total beat callbacks registered: {total_callbacks}")
-    
-    def _register_all_beat_callbacks(self):
-        """Register beat callbacks with all existing decks after EventScheduler starts"""
-        logger.info(f"AudioEngine: _register_all_beat_callbacks called")
-        logger.info(f"AudioEngine: Has event_scheduler: {hasattr(self, 'event_scheduler')}")
-        logger.info(f"AudioEngine: EventScheduler running: {hasattr(self, 'event_scheduler') and self.event_scheduler.is_running()}")
-        logger.info(f"AudioEngine: Number of decks: {len(self.decks)}")
-        
-        if hasattr(self, 'event_scheduler') and self.event_scheduler.is_running():
-            registered_count = 0
-            for deck_id, deck in self.decks.items():
-                logger.info(f"AudioEngine: Processing deck {deck_id}")
-                if hasattr(deck, 'beat_manager'):
-                    deck.beat_manager.add_beat_callback(self.event_scheduler._on_beat_boundary)
-                    registered_count += 1
-                    logger.info(f"AudioEngine: Registered beat callback with deck {deck_id}")
-                else:
-                    logger.warning(f"AudioEngine: Deck {deck_id} has no beat_manager")
-            logger.info(f"AudioEngine: Registered beat callbacks with {registered_count} decks")
-        else:
-            logger.warning("AudioEngine: EventScheduler not running, cannot register beat callbacks")
-    
-    def _schedule_all_actions(self):
-        """Schedule all script actions using the event scheduler"""
-        print(f"DEBUG: _schedule_all_actions called with {len(self._all_actions_from_script)} actions")
-        logger.debug("AudioEngine - Scheduling all script actions")
-        
-        for i, action in enumerate(self._all_actions_from_script):
-            try:
-                print(f"DEBUG: Scheduling action {i}: {action.get('command', 'NO_COMMAND')} for deck {action.get('deck_id', 'NO_DECK')}")
-                self._schedule_action(action)
-            except Exception as e:
-                logger.error(f"Failed to schedule action {action.get('action_id', 'unknown')}: {e}")
-        
-        logger.debug("AudioEngine - All actions scheduled")
-    
-    def _schedule_action(self, action: dict):
-        """Schedule a single action based on its trigger type"""
-        trigger = action.get("trigger", {})
-        trigger_type = trigger.get("type")
-        
-        if trigger_type == "script_start":
-            # Phase 5B: Execute on next beat boundary for musical timing
-            # Ensure deck_id is set for beat-based scheduling
-            if 'deck_id' not in action:
-                # For script_start actions without deck_id, use the primary deck
-                primary_deck = list(self.decks.keys())[0] if self.decks else None
-                if primary_deck:
-                    action = action.copy()  # Don't modify original
-                    action['deck_id'] = primary_deck
-                    logger.debug(f"AudioEngine - Added deck_id {primary_deck} to script_start action")
-                else:
-                    logger.error(f"AudioEngine - No decks available for script_start action: {action}")
-                    return
-            
-            event_id = self.event_scheduler.schedule_immediate_action(
-                action, priority=100  # High priority for immediate actions
-            )
-            logger.debug(f"AudioEngine - Scheduled immediate beat action: {event_id}")
-            
-        elif trigger_type == "on_deck_beat":
-            # Beat-triggered actions - store for later execution when deck reaches the beat
-            source_deck_id = trigger.get("source_deck_id")
-            target_beat = trigger.get("beat_number")
-            
-            if source_deck_id and target_beat is not None:
-                # Phase 4: Always use BeatManager system for deck-specific timing
-                event_id = self.event_scheduler.schedule_beat_action(
-                    action, target_beat, deck_id=source_deck_id, priority=50
-                )
-                logger.debug(f"AudioEngine - Scheduled beat action {event_id} for deck {source_deck_id} beat {target_beat} (BeatManager)")
-            else:
-                logger.error(f"Invalid on_deck_beat trigger: {trigger}")
-
-        elif trigger_type == "on_loop_complete":
-            source_deck_id = trigger.get("source_deck_id")
-            loop_action_id = trigger.get("loop_action_id")
-            if source_deck_id and loop_action_id:
-                self._loop_completion_actions.setdefault(source_deck_id, {}).setdefault(loop_action_id, []).append(action)
-                logger.debug(f"AudioEngine - Registered on_loop_complete action for deck {source_deck_id} loop {loop_action_id}")
-            else:
-                logger.error(f"Invalid on_loop_complete trigger: {trigger}")
-
-        else:
-            logger.warning(f"Unknown trigger type: {trigger_type}")
-
-
 
     def stop_script_processing(self): 
         logger.info("Stop event-driven script processing requested externally.")
@@ -1009,11 +796,6 @@ class AudioEngine:
             logger.info("Script processing was not running.")
             return
 
-        # Stop the event scheduler
-        if self.event_scheduler:
-            self.event_scheduler.stop()
-            logger.info("Event scheduler stopped.")
-        
         # Stop the audio clock
         if self.audio_clock:
             self.audio_clock.stop()
@@ -1057,14 +839,8 @@ class AudioEngine:
             
             # Only print if a beat changed
             if current_beat_changed:
-                # Get pending actions count from event scheduler
-                if hasattr(self, 'event_scheduler') and self.event_scheduler is not None:
-                    scheduler_stats = self.event_scheduler.get_stats()
-                    pending_actions = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
-                else:
-                    pending_actions = 0
-                
-                # Print the beat indicator
+                # Print the beat indicator (no legacy scheduler)
+                pending_actions = 0
                 deck_info = " | ".join(deck_statuses)
                 print(f"[BEAT] {deck_info} | Time: {time_str} | Actions: {pending_actions} pending")
             
@@ -1472,12 +1248,6 @@ class AudioEngine:
             if deck.is_active(): return True
         return False
     
-    def get_event_scheduler_stats(self):
-        """Get statistics from the event scheduler"""
-        if hasattr(self, 'event_scheduler'):
-            return self.event_scheduler.get_stats()
-        return {}
-    
     def get_audio_clock_state(self):
         """Get current audio clock state"""
         if hasattr(self, 'audio_clock'):
@@ -1780,26 +1550,11 @@ if __name__ == '__main__':
                 decks_are_active = engine.any_deck_active()
 
                 if not engine_is_processing and not decks_are_active:
-                    # Check if event scheduler has any pending events
-                    if hasattr(engine, 'event_scheduler') and engine.event_scheduler:
-                        scheduler_stats = engine.event_scheduler.get_stats()
-                        pending_events = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
-                        if pending_events == 0:
-                            logger.info("Engine Test - Engine done, no pending events, and no decks active.")
-                            break
-                    else:
-                        logger.info("Engine Test - Engine done, no event scheduler, and no decks active.")
-                        break 
+                    logger.info("Engine Test - Engine done and no decks active.")
+                    break
                 
                 if (time.time() - start_wait_time) > max_script_duration_estimate:
                     logger.warning(f"Engine Test - Max wait time of {max_script_duration_estimate}s reached.")
-                    # Log event scheduler status on timeout
-                    if hasattr(engine, 'event_scheduler') and engine.event_scheduler:
-                        scheduler_stats = engine.event_scheduler.get_stats()
-                        pending_events = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0) - scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
-                        if pending_events > 0:
-                            logger.debug(f"Engine Test - Still {pending_events} pending events on timeout")
-                            logger.debug(f"Event scheduler stats: {scheduler_stats}")
                     break
                 time.sleep(0.5)
             logger.info("Engine Test - Monitoring finished or timed out.")

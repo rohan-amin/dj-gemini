@@ -141,26 +141,10 @@ def run_dj_gemini():
             current_time = time.time()
             
             # Get current status
-            engine_is_dispatching_actions = audio_engine.is_processing_script_actions 
+            engine_is_dispatching_actions = audio_engine.is_processing_script_actions
             decks_are_active = audio_engine.any_deck_active()
-            
-            # Get event scheduler status
-            scheduler_status = "unknown"
+            scheduler_status = "n/a"
             pending_events = 0
-            if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler is not None:
-                try:
-                    scheduler_stats = audio_engine.event_scheduler.get_stats()
-                    total_scheduled = scheduler_stats.get('queue', {}).get('total', {}).get('total_scheduled', 0)
-                    total_executed = scheduler_stats.get('queue', {}).get('total', {}).get('total_executed', 0)
-                    pending_events = total_scheduled - total_executed
-                    
-                    if pending_events > 0:
-                        scheduler_status = f"{pending_events} pending"
-                    else:
-                        scheduler_status = "idle"
-                except Exception as e:
-                    scheduler_status = f"error: {e}"
-                    pending_events = 0
             
             # Status change detection and logging
             status_changed = (engine_is_dispatching_actions != last_engine_status or 
@@ -179,14 +163,9 @@ def run_dj_gemini():
 
             # Exit condition: Check if everything is complete
             if not engine_is_dispatching_actions and not decks_are_active:
-                if pending_events == 0:
-                    logger.info("🎉 All actions completed successfully!")
-                    logger.info(f"Total execution time: {current_time - wait_start_time:.1f}s")
-                    break
-                else:
-                    # Still have pending events but engine stopped - this might indicate an issue
-                    logger.warning(f"Engine stopped but {pending_events} events still pending. This might indicate an issue.")
-                    break
+                logger.info("🎉 All actions completed successfully!")
+                logger.info(f"Total execution time: {current_time - wait_start_time:.1f}s")
+                break
             
             # Timeout check
             if args.max_wait_after_script > 0 and (current_time - wait_start_time) > args.max_wait_after_script:
@@ -205,13 +184,8 @@ def run_dj_gemini():
         traceback.print_exc()
     finally:
         logger.info("🔄 Initiating shutdown of audio engine and decks...")
-        if audio_engine: 
+        if audio_engine:
             try:
-                # Get final status before shutdown
-                if hasattr(audio_engine, 'event_scheduler') and audio_engine.event_scheduler is not None:
-                    final_stats = audio_engine.event_scheduler.get_stats()
-                    logger.info(f"Final event scheduler stats: {final_stats}")
-                
                 audio_engine.stop_script_processing()
                 logger.info("✅ Audio engine shutdown completed successfully")
             except Exception as shutdown_error:
