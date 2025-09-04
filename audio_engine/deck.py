@@ -2753,8 +2753,14 @@ class Deck:
                     self._graceful_stop_requested = False
                     raise sd.CallbackStop
                 
+        except sd.CallbackStop:
+            # Propagate CallbackStop so sounddevice can terminate the stream
+            # normally without zeroing out the final audio block. This ensures
+            # graceful stops (e.g., after loop completion) play all buffered
+            # audio before halting.
+            raise
         except Exception as e:
-            # Emergency: output silence on any error
+            # Emergency: output silence on any unexpected error
             logger.error(f"🔊 Deck {self.deck_id} - CRITICAL: Audio callback error: {e}")
             outdata[:] = 0.0
         finally:
