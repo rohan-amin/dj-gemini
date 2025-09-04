@@ -284,10 +284,15 @@ class Deck:
         self._processing_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"Deck{deck_id}")
 
         self._stream_lock = threading.Lock() 
-        self._current_playback_frame_for_display = 0 
-        self._user_wants_to_play = False 
-        self._is_actually_playing_stream_state = False 
-        self.seek_in_progress_flag = False 
+        self._current_playback_frame_for_display = 0
+        self._user_wants_to_play = False
+        self._is_actually_playing_stream_state = False
+        self.seek_in_progress_flag = False
+
+        # Indicates that a stop has been requested but the stream should
+        # continue until buffered audio is drained. Set when stop() is called
+        # with flush=False and cleared once the audio callback finishes.
+        self._graceful_stop_requested = False
 
         # === LOOP STATE ===
         self._loop_active = False
@@ -1252,7 +1257,11 @@ class Deck:
         logger.debug(f"Deck {self.deck_id} - Engine requests STOP.")
         with self._stream_lock:
             self._user_wants_to_play = False
-            self._current_playback_frame_for_display = 0
+            if flush:
+                # For immediate stops we reset the display frame right away.
+                # For graceful stops we leave the frame so status reflects the
+                # deck is still playing until buffers drain.
+                self._current_playback_frame_for_display = 0
         self.command_queue.put((DECK_CMD_STOP, {"flush": flush}))
 
     def seek(self, target_frame): 
@@ -1995,15 +2004,17 @@ class Deck:
                     self._producer_stop_event.set()
                     self._producer_running = False
 
-                    # Gracefully handle the current stream depending on flush behavior
                     if _current_stream_in_thread:
                         if flush:
+                            # Immediate stop: abort stream and drop all remaining audio
                             _current_stream_in_thread.abort(ignore_errors=True)
+                            _current_stream_in_thread.close(ignore_errors=True)
+                            _current_stream_in_thread = None
                         else:
-                            if _current_stream_in_thread.active:
-                                _current_stream_in_thread.stop(ignore_errors=True)
-                        _current_stream_in_thread.close(ignore_errors=True)
-                        _current_stream_in_thread = None
+                            # Graceful stop: allow callback to continue until
+                            # ring buffer is empty. The callback will stop the
+                            # stream when draining completes.
+                            self._graceful_stop_requested = True
 
                     # Only clear the ring buffer if caller explicitly requested
                     # an immediate stop. Otherwise allow existing audio to drain
@@ -2019,13 +2030,14 @@ class Deck:
                     self._cleanup_rubberband_on_stop()
 
                     with self._stream_lock:
-                        self.audio_thread_current_frame = 0
-                        self._current_playback_frame_for_display = 0
-                        self._is_actually_playing_stream_state = False
+                        if flush:
+                            self.audio_thread_current_frame = 0
+                            self._current_playback_frame_for_display = 0
+                            self._is_actually_playing_stream_state = False
 
-                        # Reset startup fade
-                        if hasattr(self, '_startup_fade_active'):
-                            self._startup_fade_active = False
+                            # Reset startup fade
+                            if hasattr(self, '_startup_fade_active'):
+                                self._startup_fade_active = False
 
                     logger.debug(f"Deck {self.deck_id} AudioThread - State reset for STOP (immediate).")
 
@@ -2730,6 +2742,16 @@ class Deck:
                 outdata[:frames, 0] = out[:, 0]  # Left
                 if self.device_output_channels == 2:
                     outdata[:frames, 1] = out[:, 0]  # Right (duplicate left)
+
+            # If a graceful stop was requested, check whether all buffered
+            # audio has been played. Once the ring buffer is empty we stop the
+            # stream by raising CallbackStop, which will trigger the finished
+            # callback on the audio thread.
+            if getattr(self, '_graceful_stop_requested', False):
+                remaining = self.out_ring.available_read() if self.out_ring else 0
+                if remaining == 0:
+                    self._graceful_stop_requested = False
+                    raise sd.CallbackStop
                 
         except Exception as e:
             # Emergency: output silence on any error
@@ -2742,12 +2764,17 @@ class Deck:
         logger.info(f"🎵 DEBUG: Deck {self.deck_id} AudioThread - Stream finished_callback triggered.")
         was_seek = False 
         with self._stream_lock:
-            self._is_actually_playing_stream_state = False 
-            # It's crucial that the audio thread's local _current_stream_in_thread is set to None
-            # when this callback is for *that* stream. We also update self.playback_stream_obj.
-            if self.playback_stream_obj and (self.playback_stream_obj.stopped or self.playback_stream_obj.closed):
+            self._is_actually_playing_stream_state = False
+            # Always close and clear the playback stream when playback ends.
+            if self.playback_stream_obj:
+                try:
+                    self.playback_stream_obj.close()
+                except Exception:
+                    pass
                 logger.debug(f"DEBUG: Deck {self.deck_id} finished_callback - Clearing self.playback_stream_obj.")
                 self.playback_stream_obj = None
+                self.audio_thread_current_frame = 0
+                self._current_playback_frame_for_display = 0
 
             was_seek = self.seek_in_progress_flag 
             self.seek_in_progress_flag = False    
