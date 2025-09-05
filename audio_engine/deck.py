@@ -1332,9 +1332,9 @@ class Deck:
             self._loop_repetitions_done = 0
             self._current_loop_action_id = action_id
             self._frames_played_since_loop_start = 0
-            loop_len = self._loop_end_frame - self._loop_start_frame
+            effective_loop_len = int((self._loop_end_frame - self._loop_start_frame) / self._playback_tempo)
             self._loop_total_frames_expected = (
-                loop_len * self._loop_repetitions_total
+                effective_loop_len * self._loop_repetitions_total
                 if self._loop_repetitions_total else None
             )
             self._loop_completion_pending = False
@@ -1513,6 +1513,13 @@ class Deck:
                     self._playback_tempo = tempo_ratio
                     # Scale beat timestamps for UI display
                     self._scale_beat_positions(tempo_ratio)
+
+                    if (self._loop_active or self._loop_completion_pending) and self._loop_repetitions_total:
+                        effective_loop_len = int((self._loop_end_frame - self._loop_start_frame) / self._playback_tempo)
+                        remaining_loops = max(self._loop_repetitions_total - self._loop_repetitions_done, 0)
+                        self._loop_total_frames_expected = (
+                            self._frames_played_since_loop_start + effective_loop_len * remaining_loops
+                        )
                 
                 # NEW: Sync BeatManager with the new BPM
                 if hasattr(self, 'beat_manager') and self.beat_manager:
