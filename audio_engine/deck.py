@@ -2375,10 +2375,14 @@ class Deck:
                         f"🔄 LOOP JUMP: {self._current_loop_action_id} on {self.deck_id} - jumped to start"
                     )
                     self.audio_thread_current_frame = self._loop_start_frame
+                    if hasattr(self, '_rb_pending_input_frames'):
+                        self._rb_pending_input_frames = 0
                     self._current_playback_frame_for_display = self._loop_start_frame
 
-            # Get current playback position
-            start_frame = int(self.audio_thread_current_frame)
+            # Get current playback position, accounting for queued RubberBand frames
+            if not hasattr(self, '_rb_pending_input_frames'):
+                self._rb_pending_input_frames = 0
+            start_frame = int(self.audio_thread_current_frame + self._rb_pending_input_frames)
 
             # === REMOVED: Legacy CENTRALIZED LOOP MANAGEMENT ===
             # Now using frame-accurate system only - no dual system conflicts
@@ -2387,21 +2391,36 @@ class Deck:
             if start_frame >= len(self.audio_thread_data):
                 return None
                 
-            # Calculate input chunk size based on tempo ratio from BeatManager
-            # RubberBand streaming needs input chunks to generate output
-            input_chunk_size = int(out_frames * self.beat_manager.get_tempo_ratio()) + 1024  # Extra buffer for RB
-            input_chunk_size = min(input_chunk_size, len(self.audio_thread_data) - start_frame)
-            
+            # Calculate required input size based on tempo ratio
+            tempo_ratio = self.beat_manager.get_tempo_ratio()
+            input_chunk_size = int(out_frames * tempo_ratio)
+
+            # Clamp to loop boundaries when active
+            if self._loop_active:
+                input_chunk_size = min(input_chunk_size, self._loop_end_frame - start_frame)
+
+            available_total = len(self.audio_thread_data) - start_frame
+            if self._loop_active:
+                available_total = min(available_total, self._loop_end_frame - start_frame)
+
+            input_chunk_size = min(input_chunk_size, available_total)
+
             if input_chunk_size <= 0:
                 return None
+
+            # Determine extra frames to queue for RubberBand without advancing playback
+            RB_EXTRA = 1024
+            extra_needed = max(0, RB_EXTRA - self._rb_pending_input_frames)
+            total_input_size = min(input_chunk_size + extra_needed, available_total)
+            extra_needed = total_input_size - input_chunk_size
             
             # Build stem mix with per-stem EQ processing (mono for RubberBand compatibility)
             if self.stems_available and self.stem_data:
-                input_chunk = np.zeros(input_chunk_size, dtype=np.float32)  # Mono
+                input_chunk = np.zeros(total_input_size, dtype=np.float32)  # Mono
                 for stem_name, stem_audio in self.stem_data.items():
-                    if start_frame + input_chunk_size <= len(stem_audio):
+                    if start_frame + total_input_size <= len(stem_audio):
                         # Get raw stem chunk
-                        stem_chunk = stem_audio[start_frame:start_frame + input_chunk_size]
+                        stem_chunk = stem_audio[start_frame:start_frame + total_input_size]
                         
                         # Convert to mono if stereo (average both channels like beat_viewer)
                         if stem_chunk.ndim == 2:
@@ -2424,7 +2443,7 @@ class Deck:
                         input_chunk += stem_chunk * stem_volume
             else:
                 # Use main audio data (convert to mono by averaging like beat_viewer)
-                main_audio = self.audio_thread_data[start_frame:start_frame + input_chunk_size]
+                main_audio = self.audio_thread_data[start_frame:start_frame + total_input_size]
                 if main_audio.ndim == 2:
                     if main_audio.shape[1] == 2:
                         input_chunk = np.mean(main_audio, axis=1)  # Average left + right
@@ -2450,27 +2469,37 @@ class Deck:
                     available = self.rubberband_stretcher.available()
                     if available > 0:
                         output_block = self.rubberband_stretcher.retrieve(min(available, out_frames))
+                        produced_frames = len(output_block) if (output_block is not None and len(output_block) > 0) else 0
                         if output_block is not None and len(output_block) > 0:
                             # Convert back to mono like beat_viewer: average stereo channels
                             if output_block.shape[1] == 2:
                                 processed_mono = np.mean(output_block, axis=1)  # Average left + right
                             else:
                                 processed_mono = output_block[:, 0]
-                            
+
                             # Convert back to stereo for output
                             processed_chunk = np.column_stack([processed_mono, processed_mono])
                         else:
-                            logger.warning(f"Deck {self.deck_id} - RubberBand retrieve returned None/empty - returning silence")
+                            logger.warning(
+                                f"Deck {self.deck_id} - RubberBand retrieve returned None/empty - returning silence"
+                            )
                             processed_chunk = np.zeros((out_frames, 2), dtype=np.float32)
+
+                        # Update frame tracking based on actual consumption
+                        consumed_input_frames = int(produced_frames * tempo_ratio)
+                        consumed_input_frames = min(consumed_input_frames, self._rb_pending_input_frames + total_input_size)
+                        self.audio_thread_current_frame += consumed_input_frames
+                        self._rb_pending_input_frames = (
+                            self._rb_pending_input_frames + total_input_size - consumed_input_frames
+                        )
                     else:
                         # No output available yet, return silence or fall back
                         processed_chunk = np.zeros((out_frames, 2), dtype=np.float32)
+                        # All frames remain queued until output is produced
+                        self._rb_pending_input_frames += total_input_size
                 else:
                     logger.error(f"Deck {self.deck_id} - RubberBand stretcher not available - returning silence")
                     return np.zeros((out_frames, 2), dtype=np.float32)
-                
-                # Update playback position based on actual input consumed
-                self.audio_thread_current_frame += input_chunk_size
                 
                 # Frame-accurate loop management removed - will be reimplemented with new architecture
                 # All loop processing logic has been removed and will be reimplemented with new architecture
